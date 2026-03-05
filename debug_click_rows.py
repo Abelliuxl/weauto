@@ -2,8 +2,28 @@
 from __future__ import annotations
 
 import argparse
+import os
+from pathlib import Path
 import time
 import subprocess
+import sys
+
+
+def _maybe_reexec_with_project_venv() -> None:
+    if sys.version_info < (3, 13):
+        return
+
+    root_dir = Path(__file__).resolve().parent
+    venv_python = root_dir / ".venv312" / "bin" / "python"
+    if not venv_python.exists():
+        return
+
+    if Path(sys.executable).resolve() == venv_python.resolve():
+        return
+    os.execv(str(venv_python), [str(venv_python), str(Path(__file__).resolve()), *sys.argv[1:]])
+
+
+_maybe_reexec_with_project_venv()
 
 import numpy as np
 import pyautogui

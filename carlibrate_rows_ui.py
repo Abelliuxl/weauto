@@ -3,12 +3,39 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
+import sys
 import time
-import tkinter as tk
-from tkinter import messagebox
+
+def _maybe_reexec_with_project_venv() -> None:
+    # Python 3.14 often lacks _tkinter on macOS; prefer the project's tested venv.
+    if sys.version_info < (3, 13):
+        return
+
+    root_dir = Path(__file__).resolve().parent
+    venv_python = root_dir / ".venv312" / "bin" / "python"
+    if not venv_python.exists():
+        return
+
+    if Path(sys.executable).resolve() == venv_python.resolve():
+        return
+    os.execv(str(venv_python), [str(venv_python), str(Path(__file__).resolve()), *sys.argv[1:]])
+
+
+_maybe_reexec_with_project_venv()
+try:
+    import tkinter as tk
+    from tkinter import messagebox
+except ModuleNotFoundError as exc:
+    if exc.name == "_tkinter":
+        raise SystemExit(
+            "Missing tkinter for current Python. Run `./carlibrate_rows.sh config.toml` "
+            "or use `.venv312/bin/python carlibrate_rows_ui.py --config config.toml`."
+        ) from exc
+    raise
 
 import numpy as np
 from PIL import Image, ImageTk
@@ -24,7 +51,14 @@ def parse_args() -> argparse.Namespace:
         description="Visual calibrator for WeChat conversation row boxes."
     )
     parser.add_argument(
+        "config_positional",
+        nargs="?",
+        default="",
+        help="Config path (positional alias of --config).",
+    )
+    parser.add_argument(
         "--config",
+        dest="config",
         default="config.toml",
         help="Path to TOML config file (default: ./config.toml)",
     )
@@ -39,7 +73,10 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Override initial row box count (0 means auto-detect)",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.config_positional:
+        args.config = args.config_positional
+    return args
 
 
 def _activate_wechat(app_name: str) -> None:

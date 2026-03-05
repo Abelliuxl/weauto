@@ -20,7 +20,7 @@
 - `wechat_rpa/ocr.py`：OCR 识别
 - `wechat_rpa/detector.py`：新消息/`@` 检测
 - `wechat_rpa/bot.py`：自动点击与自动回复
-- `calibrate_rows_ui.py`：会话行框可视化校准工具（拖拽/缩放）
+- `carlibrate_rows_ui.py`：会话行框可视化校准工具（拖拽/缩放）
 
 ## 依赖安装
 
@@ -50,6 +50,7 @@ cp config.toml.example config.toml
 - `log_verbose = true`：每轮打印会话快照（row/group/unread/mention）和事件路径
 - `group_title_prefixes = ["群"]`：把群名改为 `群***` 可稳定识别群聊
 - `group_only_reply_when_mentioned = true`：群里默认只在被@/命中关键词时回复
+- `row_title_region_enabled / row_title_region`：行内标题 OCR 独立区域（修正“会话标题识别不全”）
 - `memory_enabled = true`：开启会话记忆持久化（短期+长期摘要）
 - `memory_store_path = "data/session_memory.json"`：记忆文件路径
 - `admin_session_titles = ["real刘晓亮"]`：管理员会话标题（支持多项）
@@ -62,7 +63,7 @@ cp config.toml.example config.toml
 当自动行高/起点有偏移时，用这个工具一次校准：
 
 ```bash
-./start_calibrator.sh config.toml
+./carlibrate_rows.sh config.toml
 ```
 
 流程：
@@ -79,12 +80,56 @@ cp config.toml.example config.toml
 ### 标题栏 OCR 区域校准（用于点击后二次确认）
 
 ```bash
-bash start_title_calibrator.sh config.toml
+bash carlibrate_title.sh config.toml
 ```
 
 用途：
 - 点击会话后，程序会 OCR 右侧标题栏判断是否真的进入目标会话。
 - 这个工具用于校准标题 OCR 区域，避免“点第二次把会话收起/状态反转”。
+
+### 红点数字区域校准（推荐）
+
+```bash
+./carlibrate_unread.sh config.toml
+```
+
+用途：
+- 在“单行会话截图”上拖一个圆，圈住未读数字角标位置。
+- 程序会优先用该圆内 OCR 识别数字判断未读（比纯颜色检测更稳）。
+
+保存后会更新 `config.toml`：
+- `[unread_badge_circle] enabled/x/y/r`
+- 坐标锚点是“单行框左下角”：`x` 从左向右，`y` 从下向上。
+
+### Preview 文本区域校准（推荐）
+
+```bash
+./carlibrate_preview.sh config.toml
+```
+
+用途：
+- 在“单行会话截图”上拖框，限定 preview 文本 OCR 区域。
+- 新消息判定里的 preview 变化将优先使用该区域文本，减少误触发。
+
+保存后会更新 `config.toml`：
+- `preview_region_enabled = true`
+- `[preview_text_region] x/y/w/h`
+- 坐标锚点是“单行框左下角”：`x` 从左向右，`y` 从下向上。
+
+### Row Title 文本区域校准（修正列表标题识别）
+
+```bash
+./carlibrate_row_title.sh config.toml
+```
+
+用途：
+- 在“单行会话截图”上拖框，限定“行内标题（preview 上方）”的 OCR 区域。
+- 扫描新消息时会优先使用该区域识别每行 title，减少标题截断/识别错位。
+
+保存后会更新 `config.toml`：
+- `row_title_region_enabled = true`
+- `[row_title_region] x/y/w/h`
+- 坐标锚点是“单行框左下角”：`x` 从左向右，`y` 从下向上。
 
 ## 运行
 
@@ -101,7 +146,27 @@ python run.py --config config.toml
 仅调试“从上到下点击每个会话”：
 
 ```bash
-./start_click_debug.sh config.toml --cycles 1 --click-delay-sec 1.0
+./debug_click.sh config.toml --cycles 1 --click-delay-sec 1.0
+```
+
+调试“从上到下点击每个会话条的红点坐标”：
+
+```bash
+./debug_unread.sh config.toml --cycles 1 --click-delay-sec 1.0
+```
+
+默认只移动鼠标到红点位置，不会点击（避免把红点点没）。
+如需强制点击，追加 `--do-click`。
+
+会在每次移动/点击后打印该行红点区域红色占比：
+- `red_ratio=...`：圆形区域内红色像素占比
+- `threshold=0.333`：当前命中阈值（1/3）
+- `hit=True/False`：是否命中未读
+
+调试“从上到下点击每个会话条的 preview 区域中心”：
+
+```bash
+./debug_preview.sh config.toml --cycles 1 --click-delay-sec 1.0
 ```
 
 查看调试日志：

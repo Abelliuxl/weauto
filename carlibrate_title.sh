@@ -13,6 +13,7 @@ if [[ -z "${PYTHON_BIN:-}" ]]; then
   fi
 fi
 CONFIG_PATH="${1:-config.toml}"
+shift || true
 DEPS_MARKER="$VENV_DIR/.deps_installed"
 LOG_DIR="$ROOT_DIR/logs"
 
@@ -36,16 +37,8 @@ if [[ ! -f "$CONFIG_PATH" ]]; then
 fi
 
 mkdir -p "$LOG_DIR"
-LOG_FILE="$LOG_DIR/rpa_$(date +%Y%m%d_%H%M%S).log"
+LOG_FILE="$LOG_DIR/calibrate_title_$(date +%Y%m%d_%H%M%S).log"
 
-# Preserve interactive terminal width for aligned logs even when piped to tee.
-if [[ -t 1 ]]; then
-  LOG_WIDTH="$(tput cols 2>/dev/null || echo 140)"
-  if [[ "$LOG_WIDTH" =~ ^[0-9]+$ ]]; then
-    export WEAUTO_LOG_WIDTH="$LOG_WIDTH"
-  fi
-fi
-
-echo "[run] python run.py --config $CONFIG_PATH"
+echo "[run] python carlibrate_title_ui.py --config $CONFIG_PATH $*"
 echo "[log] $LOG_FILE"
-python -u run.py --config "$CONFIG_PATH" 2>&1 | tee -a "$LOG_FILE"
+python -u carlibrate_title_ui.py --config "$CONFIG_PATH" "$@" 2>&1 | tee -a "$LOG_FILE"

@@ -13,6 +13,7 @@ if [[ -z "${PYTHON_BIN:-}" ]]; then
   fi
 fi
 CONFIG_PATH="${1:-config.toml}"
+shift || true
 DEPS_MARKER="$VENV_DIR/.deps_installed"
 LOG_DIR="$ROOT_DIR/logs"
 
@@ -30,22 +31,9 @@ if [[ ! -f "$DEPS_MARKER" || requirements.txt -nt "$DEPS_MARKER" ]]; then
   date > "$DEPS_MARKER"
 fi
 
-if [[ ! -f "$CONFIG_PATH" ]]; then
-  echo "[setup] $CONFIG_PATH not found, creating from config.toml.example"
-  cp config.toml.example "$CONFIG_PATH"
-fi
-
 mkdir -p "$LOG_DIR"
-LOG_FILE="$LOG_DIR/rpa_$(date +%Y%m%d_%H%M%S).log"
+LOG_FILE="$LOG_DIR/debug_unread_$(date +%Y%m%d_%H%M%S).log"
 
-# Preserve interactive terminal width for aligned logs even when piped to tee.
-if [[ -t 1 ]]; then
-  LOG_WIDTH="$(tput cols 2>/dev/null || echo 140)"
-  if [[ "$LOG_WIDTH" =~ ^[0-9]+$ ]]; then
-    export WEAUTO_LOG_WIDTH="$LOG_WIDTH"
-  fi
-fi
-
-echo "[run] python run.py --config $CONFIG_PATH"
+echo "[run] python debug_click_unread.py --config $CONFIG_PATH $*"
 echo "[log] $LOG_FILE"
-python -u run.py --config "$CONFIG_PATH" 2>&1 | tee -a "$LOG_FILE"
+python -u debug_click_unread.py --config "$CONFIG_PATH" "$@" 2>&1 | tee -a "$LOG_FILE"

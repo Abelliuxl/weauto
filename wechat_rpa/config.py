@@ -29,6 +29,15 @@ class UnreadBadgeConfig:
 
 
 @dataclass
+class UnreadBadgeCircleConfig:
+    enabled: bool = False
+    # Row-local ratios with left-bottom anchor: x from left, y from bottom.
+    x: float = 0.86
+    y: float = 0.66
+    r: float = 0.18
+
+
+@dataclass
 class LlmConfig:
     enabled: bool = False
     base_url: str = "https://api.openai.com/v1"
@@ -133,6 +142,16 @@ class AppConfig:
     ignore_title_keywords: list[str] = field(default_factory=lambda: ["折叠的聊天"])
     use_manual_row_boxes: bool = False
     manual_row_boxes_path: str = "data/manual_row_boxes.json"
+    row_title_region_enabled: bool = False
+    # Row-local ratios with left-bottom anchor: x from left, y from bottom.
+    row_title_region: RegionRatio = field(
+        default_factory=lambda: RegionRatio(x=0.24, y=0.52, w=0.58, h=0.42)
+    )
+    preview_region_enabled: bool = False
+    # Row-local ratios with left-bottom anchor: x from left, y from bottom.
+    preview_text_region: RegionRatio = field(
+        default_factory=lambda: RegionRatio(x=0.24, y=0.10, w=0.72, h=0.52)
+    )
 
     list_region: RegionRatio = field(
         default_factory=lambda: RegionRatio(x=0.065, y=0.12, w=0.325, h=0.82)
@@ -151,6 +170,9 @@ class AppConfig:
 
     input_point: PointRatio = field(default_factory=lambda: PointRatio(x=0.73, y=0.92))
     unread_badge: UnreadBadgeConfig = field(default_factory=UnreadBadgeConfig)
+    unread_badge_circle: UnreadBadgeCircleConfig = field(
+        default_factory=UnreadBadgeCircleConfig
+    )
     llm: LlmConfig = field(default_factory=LlmConfig)
     vision: VisionConfig = field(default_factory=VisionConfig)
 
@@ -274,6 +296,18 @@ def load_config(path: str | Path | None) -> AppConfig:
     cfg.manual_row_boxes_path = str(
         data.get("manual_row_boxes_path", cfg.manual_row_boxes_path)
     )
+    cfg.row_title_region_enabled = bool(
+        data.get("row_title_region_enabled", cfg.row_title_region_enabled)
+    )
+    cfg.row_title_region = _load_region(
+        data, "row_title_region", cfg.row_title_region
+    )
+    cfg.preview_region_enabled = bool(
+        data.get("preview_region_enabled", cfg.preview_region_enabled)
+    )
+    cfg.preview_text_region = _load_region(
+        data, "preview_text_region", cfg.preview_text_region
+    )
 
     cfg.list_region = _load_region(data, "list_region", cfg.list_region)
     cfg.rows_max = int(data.get("rows_max", cfg.rows_max))
@@ -291,6 +325,13 @@ def load_config(path: str | Path | None) -> AppConfig:
     badge = data.get("unread_badge", {})
     cfg.unread_badge = UnreadBadgeConfig(
         min_blob_pixels=int(badge.get("min_blob_pixels", cfg.unread_badge.min_blob_pixels))
+    )
+    badge_circle = data.get("unread_badge_circle", {})
+    cfg.unread_badge_circle = UnreadBadgeCircleConfig(
+        enabled=bool(badge_circle.get("enabled", cfg.unread_badge_circle.enabled)),
+        x=float(badge_circle.get("x", cfg.unread_badge_circle.x)),
+        y=float(badge_circle.get("y", cfg.unread_badge_circle.y)),
+        r=float(badge_circle.get("r", cfg.unread_badge_circle.r)),
     )
 
     llm_raw = data.get("llm", {})
