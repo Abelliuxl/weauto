@@ -468,11 +468,19 @@ class WeChatGuiRpaBot:
         raw = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff\-_]", "", raw)
         return raw.lower()
 
-    def _extract_chat_header_text(self, bounds: "WindowBounds") -> str:
-        x = bounds.x + int(bounds.width * self.cfg.chat_title_region.x)
-        y = bounds.y + int(bounds.height * self.cfg.chat_title_region.y)
-        w = int(bounds.width * self.cfg.chat_title_region.w)
-        h = int(bounds.height * self.cfg.chat_title_region.h)
+    def _pick_chat_title_region(self, is_group: bool | None) -> "RegionRatio":
+        if is_group is True and self.cfg.chat_title_region_group_enabled:
+            return self.cfg.chat_title_region_group
+        if is_group is False and self.cfg.chat_title_region_private_enabled:
+            return self.cfg.chat_title_region_private
+        return self.cfg.chat_title_region
+
+    def _extract_chat_header_text(self, bounds: "WindowBounds", is_group: bool | None = None) -> str:
+        region = self._pick_chat_title_region(is_group)
+        x = bounds.x + int(bounds.width * region.x)
+        y = bounds.y + int(bounds.height * region.y)
+        w = int(bounds.width * region.w)
+        h = int(bounds.height * region.h)
         if w <= 0 or h <= 0:
             return ""
         shot = screenshot_region(x, y, w, h)
@@ -746,6 +754,7 @@ class WeChatGuiRpaBot:
         bounds = get_front_window_bounds(self.cfg.app_name)
         row_x = bounds.x + int(bounds.width * row.click_x_ratio)
         row_y = bounds.y + int(bounds.height * row.click_y_ratio)
+        is_group = self._is_group_chat(row)
         tries = max(1, self.cfg.focus_verify_max_clicks)
         latest = bounds
         for i in range(1, tries + 1):
@@ -754,7 +763,7 @@ class WeChatGuiRpaBot:
             latest = get_front_window_bounds(self.cfg.app_name)
             if not self.cfg.focus_verify_enabled:
                 return latest
-            header = self._extract_chat_header_text(latest)
+            header = self._extract_chat_header_text(latest, is_group=is_group)
             if self._is_chat_header_matched(row.title, header):
                 if self.cfg.log_verbose:
                     seen_w = max(20, self._term_width() - 22)
@@ -1301,7 +1310,9 @@ class WeChatGuiRpaBot:
 
         bounds = focused_bounds if focused_bounds is not None else self._focus_chat(row)
         if self.cfg.focus_verify_enabled:
-            seen = self._extract_chat_header_text(bounds)
+            seen = self._extract_chat_header_text(
+                bounds, is_group=self._is_group_chat(row)
+            )
             if not self._is_chat_header_matched(row.title, seen):
                 seen_w = max(24, self._term_width() - 17)
                 print(

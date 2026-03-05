@@ -37,8 +37,14 @@ if [[ ! -f "$CONFIG_PATH" ]]; then
 fi
 
 mkdir -p "$LOG_DIR"
-LOG_FILE="$LOG_DIR/calibrate_title_$(date +%Y%m%d_%H%M%S).log"
+LOG_FILE="$LOG_DIR/calibrate_title_private_$(date +%Y%m%d_%H%M%S).log"
 
-echo "[run] python carlibrate_title_ui.py --config $CONFIG_PATH $*"
+echo "[run] python carlibrate_title_ui.py --config $CONFIG_PATH --section chat_title_region_private --enable-key chat_title_region_private_enabled $*"
 echo "[log] $LOG_FILE"
-python -u carlibrate_title_ui.py --config "$CONFIG_PATH" "$@" 2>&1 | tee -a "$LOG_FILE"
+python -u carlibrate_title_ui.py \
+  --config "$CONFIG_PATH" \
+  --section "chat_title_region_private" \
+  --enable-key "chat_title_region_private_enabled" \
+  --ui-title "WeChat 私聊标题区域校准" \
+  --label "PRIVATE" \
+  "$@" 2>&1 | tee -a "$LOG_FILE"

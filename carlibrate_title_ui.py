@@ -58,6 +58,27 @@ def parse_args() -> argparse.Namespace:
         default="config.toml",
         help="Path to TOML config file (default: ./config.toml)",
     )
+    parser.add_argument(
+        "--section",
+        default="chat_title_region",
+        help="TOML section to write (default: chat_title_region).",
+    )
+    parser.add_argument(
+        "--enable-key",
+        action="append",
+        default=[],
+        help="Top-level bool key to set true after save. Can be passed multiple times.",
+    )
+    parser.add_argument(
+        "--ui-title",
+        default="WeChat 标题栏区域校准",
+        help="Window title shown in calibrator UI.",
+    )
+    parser.add_argument(
+        "--label",
+        default="TITLE",
+        help="Overlay label text in calibrator UI.",
+    )
     args = parser.parse_args()
     if args.config_positional:
         args.config = args.config_positional
@@ -134,13 +155,14 @@ def _upsert_top_level_key(text: str, key: str, value: str) -> str:
 
 
 class TitleCalibratorUI:
-    def __init__(self, image, box: dict, on_save) -> None:
+    def __init__(self, image, box: dict, on_save, *, window_title: str, overlay_label: str) -> None:
         self.image = image
         self.img_w, self.img_h = image.size
         self.box = box
         self.on_save = on_save
+        self.overlay_label = overlay_label
         self.root = tk.Tk()
-        self.root.title("WeChat 标题栏区域校准")
+        self.root.title(window_title)
 
         max_w = self.root.winfo_screenwidth() - 80
         max_h = self.root.winfo_screenheight() - 180
@@ -200,7 +222,12 @@ class TitleCalibratorUI:
             x1, y1, x2, y2, outline=color, width=2, tags=("overlay",)
         )
         self.canvas.create_text(
-            x1 + 50, y1 + 16, text="TITLE", fill=color, font=("Helvetica", 13, "bold"), tags=("overlay",)
+            x1 + 50,
+            y1 + 16,
+            text=self.overlay_label,
+            fill=color,
+            font=("Helvetica", 13, "bold"),
+            tags=("overlay",),
         )
         self.canvas.create_rectangle(
             x2 - 7, y2 - 7, x2 + 7, y2 + 7, fill=color, outline=color, tags=("overlay",)
@@ -262,11 +289,12 @@ def main() -> None:
         raise SystemExit(1)
 
     shot = screenshot_region(bounds.x, bounds.y, bounds.width, bounds.height)
+    region = getattr(cfg, args.section, cfg.chat_title_region)
     box = {
-        "x": int(bounds.width * cfg.chat_title_region.x),
-        "y": int(bounds.height * cfg.chat_title_region.y),
-        "w": int(bounds.width * cfg.chat_title_region.w),
-        "h": int(bounds.height * cfg.chat_title_region.h),
+        "x": int(bounds.width * region.x),
+        "y": int(bounds.height * region.y),
+        "w": int(bounds.width * region.w),
+        "h": int(bounds.height * region.h),
     }
 
     print(
@@ -281,15 +309,25 @@ def main() -> None:
         rh = max(0.0, min(1.0, b["h"] / h))
 
         text = config_path.read_text(encoding="utf-8")
-        text = _upsert_region_section(text, "chat_title_region", rx, ry, rw, rh)
+        text = _upsert_region_section(text, args.section, rx, ry, rw, rh)
         text = _upsert_top_level_key(text, "focus_verify_enabled", "true")
+        for key in args.enable_key:
+            clean_key = (key or "").strip()
+            if clean_key:
+                text = _upsert_top_level_key(text, clean_key, "true")
         config_path.write_text(text, encoding="utf-8")
         print(
-            f"[saved] chat_title_region="
+            f"[saved] {args.section}="
             f"({rx:.4f},{ry:.4f},{rw:.4f},{rh:.4f}) in {config_path}"
         )
 
-    ui = TitleCalibratorUI(image=shot, box=box, on_save=_save)
+    ui = TitleCalibratorUI(
+        image=shot,
+        box=box,
+        on_save=_save,
+        window_title=args.ui_title,
+        overlay_label=args.label,
+    )
     ui.run()
 
 

@@ -50,7 +50,8 @@ python run.py --config config.toml
 
 - 启动主程序：`./start_rpa.sh config.toml`
 - 行框校准：`./carlibrate_rows.sh config.toml`
-- 右侧标题栏校准：`./carlibrate_title.sh config.toml`
+- 群聊右侧标题栏校准：`./carlibrate_title_group.sh config.toml`
+- 私聊右侧标题栏校准：`./carlibrate_title_private.sh config.toml`
 - 行标题区域校准：`./carlibrate_row_title.sh config.toml`
 - 行预览区域校准：`./carlibrate_preview.sh config.toml`
 - 未读红点圆形区域校准：`./carlibrate_unread.sh config.toml`
@@ -79,4 +80,3 @@ python run.py --config config.toml
 - `wechat_rpa/detector.py`：聊天行检测与触发信息提取
 - `wechat_rpa/llm.py`：LLM/Vision 调用
 - `wechat_rpa/bot.py`：主循环、事件判定、回复执行
-

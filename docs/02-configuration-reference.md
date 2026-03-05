@@ -51,6 +51,8 @@
 | `process_existing_unread_on_start` | `true` | 启动时已存在未读是否进入待处理集合 |
 | `skip_first_action_on_start` | `true` | 首次触发事件是否跳过执行（仅记录） |
 | `skip_if_latest_chat_from_self` | `true` | 若聊天区最后一条是我方消息则跳过回复 |
+| `chat_title_region_group_enabled` | `false` | 焦点校验时是否对群聊使用独立标题区域 |
+| `chat_title_region_private_enabled` | `false` | 焦点校验时是否对私聊使用独立标题区域 |
 
 ### 3.2 回复与群聊策略
 
@@ -113,6 +115,8 @@
 | `[list_region]` | `x=0.065 y=0.12 w=0.325 h=0.82` | 左侧会话列表区域 |
 | `[chat_context_region]` | `x=0.40 y=0.16 w=0.57 h=0.63` | 右侧聊天内容截图区域 |
 | `[chat_title_region]` | `x=0.40 y=0.01 w=0.57 h=0.10` | 右侧顶部标题区域 |
+| `[chat_title_region_group]` | 同 `chat_title_region` | 群聊焦点校验标题区域（启用开关后生效） |
+| `[chat_title_region_private]` | 同 `chat_title_region` | 私聊焦点校验标题区域（启用开关后生效） |
 | `[input_point]` | `x=0.73 y=0.92` | 输入框点击点 |
 
 ### 4.2 单行局部区域（左下锚点）
@@ -204,4 +208,3 @@
 - `OPENAI_API_KEY`（或你在 `api_key_env` 里配置的名字）
 - `WEAUTO_OCR_ENHANCE=1`：开启 OCR 预处理增强
 - `WEAUTO_LOG_WIDTH`：覆盖日志排版宽度
-

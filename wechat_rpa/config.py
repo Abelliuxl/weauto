@@ -164,6 +164,14 @@ class AppConfig:
     chat_title_region: RegionRatio = field(
         default_factory=lambda: RegionRatio(x=0.40, y=0.01, w=0.57, h=0.10)
     )
+    chat_title_region_group_enabled: bool = False
+    chat_title_region_private_enabled: bool = False
+    chat_title_region_group: RegionRatio = field(
+        default_factory=lambda: RegionRatio(x=0.40, y=0.01, w=0.57, h=0.10)
+    )
+    chat_title_region_private: RegionRatio = field(
+        default_factory=lambda: RegionRatio(x=0.40, y=0.01, w=0.57, h=0.10)
+    )
     chat_context_max_lines: int = 14
     chat_self_x_ratio: float = 0.62
     skip_if_latest_chat_from_self: bool = True
@@ -314,6 +322,24 @@ def load_config(path: str | Path | None) -> AppConfig:
     cfg.row_height_ratio = float(data.get("row_height_ratio", cfg.row_height_ratio))
     cfg.chat_context_region = _load_region(data, "chat_context_region", cfg.chat_context_region)
     cfg.chat_title_region = _load_region(data, "chat_title_region", cfg.chat_title_region)
+    cfg.chat_title_region_group_enabled = bool(
+        data.get("chat_title_region_group_enabled", cfg.chat_title_region_group_enabled)
+    )
+    cfg.chat_title_region_private_enabled = bool(
+        data.get("chat_title_region_private_enabled", cfg.chat_title_region_private_enabled)
+    )
+    if "chat_title_region_group" in data:
+        cfg.chat_title_region_group = _load_region(
+            data, "chat_title_region_group", cfg.chat_title_region_group
+        )
+    else:
+        cfg.chat_title_region_group = cfg.chat_title_region
+    if "chat_title_region_private" in data:
+        cfg.chat_title_region_private = _load_region(
+            data, "chat_title_region_private", cfg.chat_title_region_private
+        )
+    else:
+        cfg.chat_title_region_private = cfg.chat_title_region
     cfg.chat_context_max_lines = int(data.get("chat_context_max_lines", cfg.chat_context_max_lines))
     cfg.chat_self_x_ratio = float(data.get("chat_self_x_ratio", cfg.chat_self_x_ratio))
     cfg.skip_if_latest_chat_from_self = bool(

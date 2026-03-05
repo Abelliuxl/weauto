@@ -97,7 +97,7 @@
 
 处理：
 
-1. 重跑 `./carlibrate_title.sh config.toml`
+1. 重跑 `./carlibrate_title_group.sh config.toml` 与 `./carlibrate_title_private.sh config.toml`
 2. 调大 `focus_verify_max_clicks`
 3. 适当增加 `focus_verify_wait_sec` 和 `post_select_wait_sec`
 
@@ -153,4 +153,3 @@
 2. 调试脚本先加 `--dry-run`
 3. 只在确认坐标准确后再去掉 `dry_run`
 4. 保持微信窗口大小稳定，减少重新校准频率
-

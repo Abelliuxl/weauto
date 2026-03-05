@@ -49,13 +49,14 @@ cp config.toml.example config.toml
 命令：
 
 ```bash
-./carlibrate_title.sh config.toml
+./carlibrate_title_group.sh config.toml
+./carlibrate_title_private.sh config.toml
 ```
 
 作用：
 
-- 校准 `[chat_title_region]`
 - 主流程点击会话后，会 OCR 这个区域判断“是否已切到目标会话”
+- 分别写入 `[chat_title_region_group]` / `[chat_title_region_private]`
 
 界面操作：
 
@@ -64,7 +65,8 @@ cp config.toml.example config.toml
 
 保存结果：
 
-- 更新 `[chat_title_region]`
+- 更新 `[chat_title_region_group]`、`[chat_title_region_private]`
+- 打开 `chat_title_region_group_enabled = true`、`chat_title_region_private_enabled = true`
 - 将 `focus_verify_enabled = true`
 
 ## 3. 校准行内标题 OCR 区域（可提升标题识别稳定性）
@@ -173,4 +175,3 @@ cp config.toml.example config.toml
 - preview 与 row title OCR 文本基本可读
 - 未读红点区域 `red_ratio` 与视觉感知一致
 - `debug_* --dry-run` 坐标无明显偏移
-
