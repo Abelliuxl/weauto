@@ -2,6 +2,26 @@
 from __future__ import annotations
 
 import argparse
+import os
+from pathlib import Path
+import sys
+
+
+def _maybe_reexec_with_project_venv() -> None:
+    if sys.version_info < (3, 13):
+        return
+
+    root_dir = Path(__file__).resolve().parent
+    venv_python = root_dir / ".venv312" / "bin" / "python"
+    if not venv_python.exists():
+        return
+
+    if Path(sys.executable).resolve() == venv_python.resolve():
+        return
+    os.execv(str(venv_python), [str(venv_python), str(Path(__file__).resolve()), *sys.argv[1:]])
+
+
+_maybe_reexec_with_project_venv()
 
 from wechat_rpa.bot import WeChatGuiRpaBot
 from wechat_rpa.config import load_config

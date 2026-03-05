@@ -4,10 +4,13 @@ from collections import defaultdict
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 import json
+import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import time
+import unicodedata
 
 import numpy as np
 import pyautogui
@@ -26,6 +29,7 @@ _TIME_RE = re.compile(r"^\d{1,2}:\d{2}$")
 
 @dataclass
 class RowMemory:
+    session_key: str
     fingerprint: str
     preview_norm: str
     last_sent_norm: str
@@ -81,6 +85,77 @@ class WeChatGuiRpaBot:
         # Suppress OCR jitter from punctuation/ellipsis differences.
         s = re.sub(r"[.…·•,，:：;；\-—_]+", "", s)
         return s
+
+    def _strip_preview_decorations(self, text: str) -> str:
+        raw = (text or "").strip()
+        if not raw:
+            return ""
+        # Remove marker prefixes like [有人@我] / [Photo] / [You were mentioned]
+        for _ in range(3):
+            m = re.match(r"^\s*[\[【][^\]】]{1,28}[\]】]\s*", raw)
+            if not m:
+                break
+            raw = raw[m.end() :].strip()
+
+        sep = "：" if "：" in raw else (":" if ":" in raw else "")
+        if not sep:
+            return raw
+
+        left, right = raw.split(sep, 1)
+        sender = left.strip(" []【】()（）")
+        if 1 <= len(sender) <= 24:
+            return right.strip()
+        return raw
+
+    def _display_width(self, text: str) -> int:
+        width = 0
+        for ch in str(text):
+            if ch == "\t":
+                width += 4
+                continue
+            if unicodedata.east_asian_width(ch) in {"W", "F"}:
+                width += 2
+            else:
+                width += 1
+        return width
+
+    def _fit_col(self, text: str, width: int) -> str:
+        clean = re.sub(r"\s+", " ", str(text or "")).strip()
+        if width <= 0:
+            return clean
+        cur_w = self._display_width(clean)
+        if cur_w <= width:
+            return clean + (" " * (width - cur_w))
+
+        suffix = "..."
+        suffix_w = self._display_width(suffix)
+        out = ""
+        out_w = 0
+        for ch in clean:
+            ch_w = 2 if unicodedata.east_asian_width(ch) in {"W", "F"} else 1
+            if out_w + ch_w + suffix_w > width:
+                break
+            out += ch
+            out_w += ch_w
+        out += suffix
+        out_w += suffix_w
+        return out + (" " * max(0, width - out_w))
+
+    @staticmethod
+    def _yn(value: bool) -> str:
+        return "Y" if value else "N"
+
+    def _term_width(self) -> int:
+        forced = (os.getenv("WEAUTO_LOG_WIDTH", "") or "").strip()
+        if forced.isdigit():
+            return max(60, int(forced))
+        cols_env = (os.getenv("COLUMNS", "") or "").strip()
+        if cols_env.isdigit():
+            return max(60, int(cols_env))
+        try:
+            return max(60, int(shutil.get_terminal_size((140, 24)).columns))
+        except Exception:
+            return 140
 
     def _title_key(self, title: str) -> str:
         t = self._normalize_preview(title)
@@ -287,6 +362,48 @@ class WeChatGuiRpaBot:
             ratio = SequenceMatcher(a=preview_norm[:n], b=sent_norm[:n]).ratio()
             if ratio >= 0.78:
                 return True
+
+        # Full-string fuzzy match for reordered/truncated OCR fragments.
+        full_ratio = SequenceMatcher(a=preview_norm, b=sent_norm).ratio()
+        if full_ratio >= 0.62:
+            return True
+        block = SequenceMatcher(a=preview_norm, b=sent_norm).find_longest_match(
+            0, len(preview_norm), 0, len(sent_norm)
+        )
+        common = block.size
+        min_len = min(len(preview_norm), len(sent_norm))
+        if min_len >= 8 and common >= 8 and (common / max(1, min_len)) >= 0.45:
+            return True
+        return False
+
+    def _is_preview_refresh_from_self(
+        self,
+        row: ChatRowState,
+        preview_norm: str,
+        prev_sent_norm: str,
+        recent_sent_norm: str,
+    ) -> bool:
+        # Only apply to preview-refresh path to avoid suppressing real unread events.
+        preview_payload_norm = self._normalize_preview(self._strip_preview_decorations(row.preview))
+        preview_norms = [x for x in {preview_norm, preview_payload_norm} if x]
+        if not preview_norms:
+            return False
+
+        sent_norms: list[str] = []
+        for x in (prev_sent_norm, recent_sent_norm):
+            if x:
+                sent_norms.append(x)
+        for txt in self._recent_assistant_replies(row, limit=3):
+            n = self._normalize_preview(txt)
+            if n:
+                sent_norms.append(n)
+        if not sent_norms:
+            return False
+
+        for pn in preview_norms:
+            for sn in sent_norms:
+                if self._is_self_echo(pn, sn):
+                    return True
         return False
 
     def _get_recent_sent_for_row(self, row: ChatRowState, now: float) -> str:
@@ -609,9 +726,11 @@ class WeChatGuiRpaBot:
                 chat_context=chat_context,
                 session_context=session_context,
             )
+            reason_w = max(24, self._term_width() - 46)
             print(
-                f"[llm-decision] row={row.row_idx} group={is_group} "
-                f"decision={'reply' if should_reply else 'skip'} reason={why}"
+                f"[llm] row={row.row_idx:>2} | grp={self._yn(is_group)} | "
+                f"decision={('reply' if should_reply else 'skip'):<5} | "
+                f"reason={self._fit_col(why, reason_w)}"
             )
             return should_reply
         except Exception as exc:
@@ -638,17 +757,23 @@ class WeChatGuiRpaBot:
             header = self._extract_chat_header_text(latest)
             if self._is_chat_header_matched(row.title, header):
                 if self.cfg.log_verbose:
+                    seen_w = max(20, self._term_width() - 22)
                     print(
-                        f"[focus-ok] row={row.row_idx} try={i}/{tries} "
-                        f"expect={row.title!r} seen={header!r}"
+                        f"[focus-ok] row={row.row_idx:>2} | try={i:>2}/{tries:<2} | "
+                        f"expect={self._fit_col(row.title, 14)}"
                     )
+                    print(f"           seen={self._fit_col(header, seen_w)}")
                 return latest
             if self.cfg.log_verbose:
+                seen_w = max(20, self._term_width() - 22)
                 print(
-                    f"[focus-retry] row={row.row_idx} try={i}/{tries} "
-                    f"expect={row.title!r} seen={header!r}"
+                    f"[focus-retry] row={row.row_idx:>2} | try={i:>2}/{tries:<2} | "
+                    f"expect={self._fit_col(row.title, 14)}"
                 )
+                print(f"              seen={self._fit_col(header, seen_w)}")
             time.sleep(max(0.02, self.cfg.focus_verify_wait_sec))
+        if self.cfg.log_verbose:
+            print(f"[focus-fail] row={row.row_idx:>2} | expect={self._fit_col(row.title, 14)}")
         return latest
 
     def _extract_chat_context(self, bounds: "WindowBounds", title: str = "") -> ChatContextSnapshot:
@@ -719,10 +844,11 @@ class WeChatGuiRpaBot:
             if not text:
                 text = last_message[:900]
             if self.cfg.log_verbose:
+                last_w = max(24, self._term_width() - 15)
                 print(
-                    f"[vision-context] speaker={last_speaker} "
-                    f"last={last_message!r} recent={len(recent_messages)}"
+                    f"[vision] speaker={last_speaker:<7} | recent={len(recent_messages):>2}"
                 )
+                print(f"         last={self._fit_col(last_message, last_w)}")
             return ChatContextSnapshot(
                 text=text,
                 last_side=last_speaker,
@@ -742,23 +868,27 @@ class WeChatGuiRpaBot:
     def _log_cycle_snapshot(self, rows: list[ChatRowState], now: float) -> None:
         if not self.cfg.log_verbose:
             return
+        print("")
         print(
-            f"[cycle] id={self._cycle} ts={int(now)} rows={len(rows)} "
-            f"baseline={len(self._baseline)}"
+            f"[cycle] id={self._cycle:>4} | ts={int(now):>10} | "
+            f"rows={len(rows):>2} | baseline={len(self._baseline):>2}"
         )
         limit = max(1, self.cfg.log_snapshot_rows)
         for row in rows[:limit]:
             group = self._is_group_chat(row)
             key = self._session_key_for_row(row)
+            preview_w = max(16, self._term_width() - 76)
             print(
-                f"[row] idx={row.row_idx} group={group} unread={row.has_unread_badge} "
-                f"mention={row.has_mention} key={key!r} title={row.title!r} "
-                f"preview={row.preview!r}"
+                f"[row]   idx={row.row_idx:>2} | grp={self._yn(group)} | "
+                f"unrd={self._yn(row.has_unread_badge)} | @={self._yn(row.has_mention)} | "
+                f"key={self._fit_col(key, 10)} | title={self._fit_col(row.title, 14)} | "
+                f"preview={self._fit_col(row.preview, preview_w)}"
             )
 
     def _set_baseline(self, rows: list[ChatRowState], now: float) -> None:
         self._baseline = {
             row.row_idx: RowMemory(
+                session_key=self._session_key_for_row(row),
                 fingerprint=row.fingerprint,
                 preview_norm=self._normalize_preview(row.preview),
                 last_sent_norm="",
@@ -771,7 +901,7 @@ class WeChatGuiRpaBot:
             )
             for row in rows
         }
-        print(f"[init] baseline rows={len(rows)} at={now:.0f}")
+        print(f"[init] baseline rows={len(rows):>2} at={now:.0f}")
 
     def _pick_event(self, rows: list[ChatRowState], now: float) -> tuple[ChatRowState, str] | None:
         mention_candidates: list[ChatRowState] = []
@@ -787,6 +917,7 @@ class WeChatGuiRpaBot:
             prev = self._baseline.get(row.row_idx)
             if prev is None:
                 self._baseline[row.row_idx] = RowMemory(
+                    session_key=self._session_key_for_row(row),
                     fingerprint=row.fingerprint,
                     preview_norm=self._normalize_preview(row.preview),
                     last_sent_norm="",
@@ -797,7 +928,27 @@ class WeChatGuiRpaBot:
                 )
                 continue
 
-            changed = row.fingerprint != prev.fingerprint
+            row_key = self._session_key_for_row(row)
+            if prev.session_key != row_key:
+                # Row index got rebound to another session after list reordering.
+                # Reset row memory to avoid carrying unread/pending state across chats.
+                self._baseline[row.row_idx] = RowMemory(
+                    session_key=row_key,
+                    fingerprint=row.fingerprint,
+                    preview_norm=self._normalize_preview(row.preview),
+                    last_sent_norm="",
+                    has_unread_badge=row.has_unread_badge,
+                    pending_unread=False,
+                    has_mention=row.has_mention,
+                    last_replied_at=prev.last_replied_at,
+                )
+                if self.cfg.log_verbose or self.cfg.debug_scan:
+                    print(
+                        f"[row-rebind] row={row.row_idx:>2} | "
+                        f"key={self._fit_col(row_key, 14)}"
+                    )
+                continue
+
             preview_norm = self._normalize_preview(row.preview)
             preview_changed = self._is_preview_meaningfully_changed(
                 prev.preview_norm, preview_norm
@@ -807,6 +958,7 @@ class WeChatGuiRpaBot:
             mention_rise = row.has_mention and not prev.has_mention
 
             prev.fingerprint = row.fingerprint
+            prev.session_key = row_key
             prev.preview_norm = preview_norm
             prev.has_unread_badge = row.has_unread_badge
             if unread_rise:
@@ -819,29 +971,53 @@ class WeChatGuiRpaBot:
             self_echo = self._is_self_echo(preview_norm, prev.last_sent_norm) or self._is_self_echo(
                 preview_norm, recent_sent_norm
             )
+            self_preview_refresh = preview_changed and self._is_preview_refresh_from_self(
+                row=row,
+                preview_norm=preview_norm,
+                prev_sent_norm=prev.last_sent_norm,
+                recent_sent_norm=recent_sent_norm,
+            )
 
-            if self.cfg.debug_scan and (changed or preview_changed or unread_rise or mention_rise):
+            if self.cfg.debug_scan and (preview_changed or unread_rise or mention_rise):
                 print(
                     "[scan] "
                     f"row={row.row_idx} title={row.title!r} preview={row.preview!r} "
-                    f"changed={changed} preview_changed={preview_changed} "
+                    f"preview_changed={preview_changed} "
                     f"unread={row.has_unread_badge} mention={row.has_mention} "
                     f"self_echo={self_echo} pending_unread={unread_pending or unread_rise}"
                 )
 
-            if not (changed or preview_changed or unread_rise or unread_pending or mention_rise):
+            unread_active = row.has_unread_badge
+
+            if not (preview_changed or unread_rise or unread_pending or mention_rise or unread_active):
                 continue
 
             # Prevent reply loops when the preview is our own last sent text.
             if self_echo:
                 continue
-
-            if now - prev.last_replied_at < self.cfg.action_cooldown_sec:
+            if self_preview_refresh:
+                if self.cfg.log_verbose or self.cfg.debug_scan:
+                    print(
+                        f"[skip-self-preview] row={row.row_idx:>2} | "
+                        f"title={self._fit_col(row.title, 14)}"
+                    )
+                    print(
+                        f"                  preview={self._fit_col(row.preview, max(24, self._term_width() - 27))}"
+                    )
                 continue
 
-            if row.has_mention and (changed or mention_rise):
+            if now - prev.last_replied_at < self.cfg.action_cooldown_sec:
+                if self.cfg.log_verbose or self.cfg.debug_scan:
+                    remain = self.cfg.action_cooldown_sec - (now - prev.last_replied_at)
+                    print(
+                        f"[skip-cooldown] row={row.row_idx:>2} title={row.title!r} "
+                        f"remain={max(0.0, remain):.1f}s"
+                    )
+                continue
+
+            if row.has_mention and mention_rise:
                 mention_candidates.append(row)
-            elif row.has_unread_badge and (changed or unread_rise or unread_pending):
+            elif row.has_unread_badge:
                 unread_candidates.append(row)
             elif self.cfg.trigger_on_preview_change and preview_changed:
                 preview_candidates.append(row)
@@ -1111,16 +1287,29 @@ class WeChatGuiRpaBot:
         session_context: str = "",
         force_message: str = "",
     ) -> str:
+        preview_w = max(24, self._term_width() - 18)
         print(
-            f"[action] reason={reason} row={row.row_idx} title={row.title!r} "
-            f"preview={row.preview!r}"
+            f"[action] row={row.row_idx:>2} | reason={reason:<14} | "
+            f"title={self._fit_col(row.title, 14)}"
         )
+        print(f"         preview={self._fit_col(row.preview, preview_w)}")
         message = force_message or self._reply_text(row, reason, chat_context, session_context)
         if self.cfg.dry_run:
-            print(f"[dry-run] would send: {message}")
+            msg_w = max(24, self._term_width() - 16)
+            print(f"[dry-run] msg={self._fit_col(message, msg_w)}")
             return message
 
         bounds = focused_bounds if focused_bounds is not None else self._focus_chat(row)
+        if self.cfg.focus_verify_enabled:
+            seen = self._extract_chat_header_text(bounds)
+            if not self._is_chat_header_matched(row.title, seen):
+                seen_w = max(24, self._term_width() - 17)
+                print(
+                    f"[skip-focus] row={row.row_idx:>2} | "
+                    f"expect={self._fit_col(row.title, 14)}"
+                )
+                print(f"            seen={self._fit_col(seen, seen_w)}")
+                return ""
 
         input_x = bounds.x + int(bounds.width * self.cfg.input_point.x)
         input_y = bounds.y + int(bounds.height * self.cfg.input_point.y)
@@ -1130,28 +1319,27 @@ class WeChatGuiRpaBot:
         time.sleep(0.08)
 
         self._paste_and_send(message)
-        print(f"[sent] {message}")
+        msg_w = max(24, self._term_width() - 12)
+        print(f"[sent] msg={self._fit_col(message, msg_w)}")
         return message
 
     def run_forever(self) -> None:
         print("[start] WeChat GUI RPA started")
+        print("[start] perms: Accessibility + Screen Recording")
         print(
-            "[start] Make sure macOS permissions are granted: "
-            "Accessibility + Screen Recording"
+            f"[start] decision: enabled={self.cfg.llm.decision_enabled} "
+            f"grp={self.cfg.llm.decision_on_group} "
+            f"priv={self.cfg.llm.decision_on_private} "
+            f"mention_only={self.cfg.group_only_reply_when_mentioned}"
         )
+        admin_titles = ",".join(self.cfg.admin_session_titles) if self.cfg.admin_session_titles else "-"
+        admin_w = max(24, self._term_width() - 17)
+        path_w = max(20, self._term_width() - 35)
         print(
-            "[start] "
-            f"group_only_reply_when_mentioned={self.cfg.group_only_reply_when_mentioned} "
-            f"decision_enabled={self.cfg.llm.decision_enabled} "
-            f"decision_on_group={self.cfg.llm.decision_on_group} "
-            f"decision_on_private={self.cfg.llm.decision_on_private}"
+            f"[start] memory: enabled={self.cfg.memory_enabled} "
+            f"path={self._fit_col(str(self._memory_path), path_w)}"
         )
-        print(
-            "[start] "
-            f"memory_enabled={self.cfg.memory_enabled} "
-            f"memory_path={self._memory_path} "
-            f"admin_titles={self.cfg.admin_session_titles}"
-        )
+        print(f"        admin={self._fit_col(admin_titles, admin_w)}")
         while True:
             self._cycle += 1
             now = time.time()
@@ -1183,8 +1371,8 @@ class WeChatGuiRpaBot:
                         mem.last_replied_at = now
                         mem.pending_unread = False
                     print(
-                        f"[skip-startup-first-action] row={row.row_idx} "
-                        f"reason={reason} title={row.title!r}"
+                        f"[skip-startup] row={row.row_idx:>2} | "
+                        f"reason={reason:<14} | title={self._fit_col(row.title, 14)}"
                     )
                     time.sleep(self.cfg.poll_interval_sec)
                     continue
@@ -1199,8 +1387,8 @@ class WeChatGuiRpaBot:
                     continue
                 if self.cfg.log_verbose:
                     print(
-                        f"[event] id={self._cycle} row={row.row_idx} reason={reason} "
-                        f"title={row.title!r}"
+                        f"[event] id={self._cycle:>4} | row={row.row_idx:>2} | "
+                        f"reason={reason:<14} | title={self._fit_col(row.title, 14)}"
                     )
                 is_group = self._is_group_chat(row)
                 is_admin = self._is_admin_session(row)
@@ -1222,11 +1410,15 @@ class WeChatGuiRpaBot:
                     if self.cfg.debug_scan:
                         print(f"[context] row={row.row_idx} text={chat_context!r}")
                     if self.cfg.log_verbose:
+                        line_w = max(24, self._term_width() - 12)
                         print(
-                            f"[context-meta] row={row.row_idx} source={context_snapshot.source} "
-                            f"schema={context_snapshot.schema or '-'} "
-                            f"last_side={context_snapshot.last_side} "
-                            f"last_line={context_snapshot.last_line!r}"
+                            f"[ctx] row={row.row_idx:>2} | "
+                            f"src={self._fit_col(context_snapshot.source, 6)} | "
+                            f"schema={self._fit_col(context_snapshot.schema or '-', 14)} | "
+                            f"side={self._fit_col(context_snapshot.last_side, 7)}"
+                        )
+                        print(
+                            f"      last={self._fit_col(context_snapshot.last_line, line_w)}"
                         )
 
                 if (

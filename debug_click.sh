@@ -4,8 +4,14 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT_DIR"
 
-VENV_DIR="${VENV_DIR:-.venv38}"
-PYTHON_BIN="${PYTHON_BIN:-python3}"
+VENV_DIR="${VENV_DIR:-.venv312}"
+if [[ -z "${PYTHON_BIN:-}" ]]; then
+  if command -v python3.12 >/dev/null 2>&1; then
+    PYTHON_BIN="python3.12"
+  else
+    PYTHON_BIN="python3"
+  fi
+fi
 CONFIG_PATH="${1:-config.toml}"
 shift || true
 DEPS_MARKER="$VENV_DIR/.deps_installed"
@@ -31,8 +37,8 @@ if [[ ! -f "$CONFIG_PATH" ]]; then
 fi
 
 mkdir -p "$LOG_DIR"
-LOG_FILE="$LOG_DIR/calibrate_title_$(date +%Y%m%d_%H%M%S).log"
+LOG_FILE="$LOG_DIR/debug_click_$(date +%Y%m%d_%H%M%S).log"
 
-echo "[run] python calibrate_title_ui.py --config $CONFIG_PATH $*"
+echo "[run] python debug_click_rows.py --config $CONFIG_PATH $*"
 echo "[log] $LOG_FILE"
-python -u calibrate_title_ui.py --config "$CONFIG_PATH" "$@" 2>&1 | tee -a "$LOG_FILE"
+python -u debug_click_rows.py --config "$CONFIG_PATH" "$@" 2>&1 | tee -a "$LOG_FILE"

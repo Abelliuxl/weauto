@@ -28,6 +28,11 @@ def get_front_window_bounds(app_name: str) -> WindowBounds:
     window_list = Quartz.CGWindowListCopyWindowInfo(
         Quartz.kCGWindowListOptionOnScreenOnly, Quartz.kCGNullWindowID
     )
+    if window_list is None:
+        raise WindowNotFoundError(
+            "Unable to query macOS window list. "
+            "Please run in a logged-in desktop session and grant Screen Recording/Accessibility permissions."
+        )
 
     candidates: list[WindowBounds] = []
     for window in window_list:
