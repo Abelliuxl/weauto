@@ -1,0 +1,7 @@
+.venv/
+.venv38/
+__pycache__/
+*.pyc
+.DS_Store
+config.toml
+logs/

@@ -1,0 +1,134 @@
+# WeChat app name shown by macOS window server
+app_name = "WeChat"
+
+# Poll interval for detecting new messages
+poll_interval_sec = 0.9
+
+# Avoid repeated triggering on the same row in short time
+action_cooldown_sec = 8.0
+
+# If true: detect only and print logs, no click/type/send
+# Change to false when you finish coordinate tuning
+# and granted Accessibility + Screen Recording permissions.
+dry_run = true
+activate_wait_sec = 0.6
+click_move_duration_sec = 0.18
+mouse_down_hold_sec = 0.03
+post_select_wait_sec = 0.35
+focus_verify_enabled = true
+focus_verify_max_clicks = 3
+focus_verify_wait_sec = 0.20
+trigger_on_preview_change = true
+debug_scan = false
+log_verbose = true
+log_snapshot_rows = 6
+process_existing_unread_on_start = true
+skip_first_action_on_start = true
+memory_enabled = true
+memory_store_path = "data/session_memory.json"
+memory_short_max_items = 12
+memory_short_context_items = 8
+memory_summary_update_every = 4
+memory_summary_recent_items = 10
+memory_summary_max_chars = 500
+admin_commands_enabled = true
+admin_session_titles = ["real刘晓亮"]
+admin_command_prefix = "/"
+
+# Reply templates
+reply_on_new_message = "已收到消息，我稍后回复你。"
+reply_on_mention = "收到@，我看到了，稍后处理。"
+
+# Words that identify mention events in conversation preview text
+mention_keywords = ["@我", "有人@我", "[有人@我]", "［有人@我］"]
+mention_any_at = false
+group_title_prefixes = ["群"]
+group_detect_sender_prefix = true
+group_require_sender_prefix_for_new_message = true
+group_only_reply_when_mentioned = true
+group_reply_keywords = ["@助手", "@机器人", "机器人", "bot", "小助手"]
+ignore_title_keywords = ["折叠的聊天"]
+use_manual_row_boxes = false
+manual_row_boxes_path = "data/manual_row_boxes.json"
+
+# Conversation row heuristics for grouping OCR lines
+rows_max = 9
+row_height_ratio = 0.118
+chat_context_max_lines = 14
+chat_self_x_ratio = 0.62
+skip_if_latest_chat_from_self = true
+
+# Region ratios are relative to WeChat window bounds.
+# Tuned from your screenshot layout (left nav + conversation list + chat panel).
+[list_region]
+x = 0.065
+# starts below search bar
+y = 0.12
+w = 0.325
+h = 0.82
+
+[chat_context_region]
+x = 0.40
+y = 0.16
+w = 0.57
+h = 0.63
+
+[chat_title_region]
+x = 0.40
+y = 0.01
+w = 0.57
+h = 0.10
+
+# Input click point in the right chat panel
+[input_point]
+x = 0.73
+y = 0.92
+
+# Red badge detection heuristics (HSV)
+[unread_badge]
+min_blob_pixels = 70
+
+[llm]
+# OpenAI-compatible API switch
+enabled = false
+base_url = "https://api.openai.com/v1"
+api_key = ""
+api_key_env = "OPENAI_API_KEY"
+model = "gpt-4o-mini"
+temperature = 0.3
+presence_penalty = 0.2
+frequency_penalty = 0.2
+max_tokens = 4096
+timeout_sec = 8.0
+interest_hint = ""
+system_prompt = "你是微信助手。请基于给定会话标题和预览内容生成简短、礼貌、自然的中文回复，长度控制在1-2句，不要编造事实。"
+decision_enabled = true
+decision_on_group = true
+decision_on_private = false
+decision_fail_open = false
+decision_max_tokens = 32
+decision_read_chat_context = true
+decision_system_prompt = "你是消息分流器。给定会话标题、预览和触发原因，判断是否值得自动回复。仅输出JSON，格式为: {\"decision\":\"reply|skip\",\"reason\":\"<=20字\"}。"
+summary_enabled = true
+summary_max_tokens = 160
+summary_system_prompt = "你是会话摘要器。给定历史摘要和最近对话，输出新的简短中文摘要，覆盖关键信息、事实、偏好和待办。只输出摘要正文。"
+anti_repeat_enabled = true
+anti_repeat_window = 4
+anti_repeat_similarity = 0.82
+anti_repeat_retry = 1
+reasoning_exclude = true
+reasoning_effort = "low"
+
+[vision]
+# 聊天截图解析模型（可与 llm 不同）
+enabled = false
+base_url = "https://api.openai.com/v1"
+api_key = ""
+api_key_env = "OPENAI_API_KEY"
+model = "google/gemini-3.1-flash-lite-preview"
+timeout_sec = 12.0
+max_tokens = 512
+fail_open = true
+reasoning_exclude = true
+reasoning_effort = "low"
+system_prompt = "你是微信聊天截图解析器。请严格输出 JSON，schema=wechat_vision_v1；不要输出 markdown，不要输出额外解释。"
