@@ -10,7 +10,7 @@ action_cooldown_sec = 8.0
 # If true: detect only and print logs, no click/type/send
 # Change to false when you finish coordinate tuning
 # and granted Accessibility + Screen Recording permissions.
-dry_run = true
+dry_run = false
 activate_wait_sec = 0.6
 click_move_duration_sec = 0.18
 mouse_down_hold_sec = 0.03
@@ -45,10 +45,10 @@ mention_any_at = false
 group_title_prefixes = ["群"]
 group_detect_sender_prefix = true
 group_require_sender_prefix_for_new_message = true
-group_only_reply_when_mentioned = true
+group_only_reply_when_mentioned = false
 group_reply_keywords = ["@助手", "@机器人", "机器人", "bot", "小助手"]
 ignore_title_keywords = ["折叠的聊天"]
-use_manual_row_boxes = false
+use_manual_row_boxes = true
 manual_row_boxes_path = "data/manual_row_boxes.json"
 
 # Conversation row heuristics for grouping OCR lines
@@ -74,12 +74,10 @@ w = 0.57
 h = 0.63
 
 [chat_title_region]
-x = 0.40
-y = 0.01
-w = 0.57
-h = 0.10
-
-# Input click point in the right chat panel
+x = 0.386494
+y = 0.005767
+w = 0.195402
+h = 0.058824
 [input_point]
 x = 0.73
 y = 0.92
@@ -89,21 +87,20 @@ y = 0.92
 min_blob_pixels = 70
 
 [llm]
-# OpenAI-compatible API switch
-enabled = false
-base_url = "https://api.openai.com/v1"
-api_key = ""
+enabled = true
+base_url = "https://openrouter.ai/api/v1"
+api_key = "YOUR_API_KEY_HERE"
 api_key_env = "OPENAI_API_KEY"
-model = "gpt-4o-mini"
-temperature = 0.3
+model = "qwen/qwen3-30b-a3b-instruct-2507"
+temperature = 0.8
 presence_penalty = 0.2
 frequency_penalty = 0.2
 max_tokens = 4096
 timeout_sec = 8.0
-interest_hint = ""
-system_prompt = "你是微信助手。请基于给定会话标题和预览内容生成简短、礼貌、自然的中文回复，长度控制在1-2句，不要编造事实。"
+interest_hint = "纯闲聊、表情刷屏、别人互相聊天可以跳过，我比较关心：1.直接问我、让我做决定、涉及工作安排、明确提问的消息；2.游戏相关，尤其是魔兽世界"
+system_prompt = "你是微信bot。名字叫做"邪恶王子时之砂"，角色是一个爱玩魔兽世界的嘴毒的 ai，请基于给定会话标题和预览内容生成简短、自然附带一些毒舌的中文回复，长度控制在1-2句，不要编造事实。"
 decision_enabled = true
-decision_on_group = true
+decision_on_group = false
 decision_on_private = false
 decision_fail_open = false
 decision_max_tokens = 32
@@ -121,11 +118,11 @@ reasoning_effort = "low"
 
 [vision]
 # 聊天截图解析模型（可与 llm 不同）
-enabled = false
-base_url = "https://api.openai.com/v1"
-api_key = ""
+enabled = true
+base_url = "https://openrouter.ai/api/v1"
+api_key = "YOUR_API_KEY_HERE"
 api_key_env = "OPENAI_API_KEY"
-model = "google/gemini-3.1-flash-lite-preview"
+model = "google/gemini-2.5-flash-lite"
 timeout_sec = 12.0
 max_tokens = 512
 fail_open = true
