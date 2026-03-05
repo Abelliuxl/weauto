@@ -2,7 +2,7 @@
 app_name = "WeChat"
 
 # Poll interval for detecting new messages
-poll_interval_sec = 0.9
+poll_interval_sec = 1.0
 
 # Avoid repeated triggering on the same row in short time
 action_cooldown_sec = 8.0
@@ -44,7 +44,7 @@ mention_keywords = ["@我", "有人@我", "[有人@我]", "［有人@我］"]
 mention_any_at = false
 group_title_prefixes = ["群"]
 group_detect_sender_prefix = true
-group_require_sender_prefix_for_new_message = true
+group_require_sender_prefix_for_new_message = false
 group_only_reply_when_mentioned = false
 group_reply_keywords = ["@助手", "@机器人", "机器人", "bot", "小助手"]
 ignore_title_keywords = ["折叠的聊天"]
@@ -60,6 +60,8 @@ skip_if_latest_chat_from_self = true
 
 # Region ratios are relative to WeChat window bounds.
 # Tuned from your screenshot layout (left nav + conversation list + chat panel).
+preview_region_enabled = true
+row_title_region_enabled = true
 [list_region]
 x = 0.065
 # starts below search bar
@@ -74,10 +76,10 @@ w = 0.57
 h = 0.63
 
 [chat_title_region]
-x = 0.386494
-y = 0.005767
-w = 0.195402
-h = 0.058824
+x = 0.424679
+y = 0.006198
+w = 0.342949
+h = 0.028926
 [input_point]
 x = 0.73
 y = 0.92
@@ -88,17 +90,17 @@ min_blob_pixels = 70
 
 [llm]
 enabled = true
-base_url = "https://openrouter.ai/api/v1"
+base_url = "https://api.moonshot.cn/v1"
 api_key = "YOUR_API_KEY_HERE"
 api_key_env = "OPENAI_API_KEY"
-model = "qwen/qwen3-30b-a3b-instruct-2507"
+model = "kimi-k2-turbo-preview"
 temperature = 0.8
 presence_penalty = 0.2
 frequency_penalty = 0.2
 max_tokens = 4096
 timeout_sec = 8.0
 interest_hint = "纯闲聊、表情刷屏、别人互相聊天可以跳过，我比较关心：1.直接问我、让我做决定、涉及工作安排、明确提问的消息；2.游戏相关，尤其是魔兽世界"
-system_prompt = "你是微信bot。名字叫做"邪恶王子时之砂"，角色是一个爱玩魔兽世界的嘴毒的 ai，请基于给定会话标题和预览内容生成简短、自然附带一些毒舌的中文回复，长度控制在1-2句，不要编造事实。"
+system_prompt = '你是微信bot。名字叫做"邪恶王子时之砂"，角色是一个爱玩魔兽世界的嘴毒的 ai，请基于给定会话标题和预览内容生成简短、自然附带一些毒舌的中文回复，长度控制在1-2句，不要编造事实。'
 decision_enabled = true
 decision_on_group = false
 decision_on_private = false
@@ -122,10 +124,27 @@ enabled = true
 base_url = "https://openrouter.ai/api/v1"
 api_key = "YOUR_API_KEY_HERE"
 api_key_env = "OPENAI_API_KEY"
-model = "google/gemini-2.5-flash-lite"
+model = "google/gemini-3.1-flash-lite-preview"
 timeout_sec = 12.0
 max_tokens = 512
 fail_open = true
 reasoning_exclude = true
 reasoning_effort = "low"
 system_prompt = "你是微信聊天截图解析器。请严格输出 JSON，schema=wechat_vision_v1；不要输出 markdown，不要输出额外解释。"
+
+[preview_text_region]
+x = 0.211111
+y = 0.000000
+w = 0.788889
+h = 0.347826
+[unread_badge_circle]
+enabled = true
+x = 0.200000
+y = 0.760870
+r = 0.195652
+
+[row_title_region]
+x = 0.227778
+y = 0.369565
+w = 0.583333
+h = 0.413043
