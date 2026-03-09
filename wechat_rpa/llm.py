@@ -1858,7 +1858,6 @@ class LlmReplyGenerator:
             "model": self.cfg.model,
             "temperature": 0.0,
             "max_tokens": max(120, min(520, self.cfg.max_tokens)),
-            "response_format": {"type": "json_object"},
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},

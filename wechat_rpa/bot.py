@@ -3499,6 +3499,50 @@ class WeChatGuiRpaBot:
                         except Exception as exc:
                             if self.cfg.agent_actions_fail_open:
                                 print(f"[warn] agent action planner failed, fail-open: {exc}")
+                                if lookup_intent and lookup_query:
+                                    fallback_actions: list[dict] = []
+                                    if "search_memory" in tools:
+                                        fallback_actions.append(
+                                            {
+                                                "tool": "search_memory",
+                                                "args": {"query": lookup_query},
+                                                "reason": "planner fail fallback",
+                                            }
+                                        )
+                                    if self._has_web_search_tool() and ("web_search" in tools):
+                                        fallback_actions.append(
+                                            {
+                                                "tool": "web_search",
+                                                "args": {"query": lookup_query},
+                                                "reason": "planner fail fallback",
+                                            }
+                                        )
+                                    fallback_actions = fallback_actions[
+                                        : max(1, int(self.cfg.agent_actions_max_per_turn))
+                                    ]
+                                    if fallback_actions:
+                                        trace, observations = self._execute_agent_actions(
+                                            row,
+                                            fallback_actions,
+                                            is_admin=is_admin,
+                                        )
+                                        if trace and self.cfg.log_verbose:
+                                            print(
+                                                f"[agent] fallback row={row.row_idx:>2} | "
+                                                f"actions={len(fallback_actions):>2}"
+                                            )
+                                            for ln in trace.split("\n"):
+                                                if ln.strip():
+                                                    print(f"        {ln}")
+                                        if observations:
+                                            memory_recall = (
+                                                f"{memory_recall}\n\n[工具执行结果]\n{observations}".strip()
+                                            )[:3600]
+                                        else:
+                                            planned_reply = (
+                                                "我刚试着查了，但这轮没拿到可用结果（可能检索接口异常）。"
+                                                "要不要我立刻换关键词再查一次？"
+                                            )
                             else:
                                 raise
                 message = self._reply(
