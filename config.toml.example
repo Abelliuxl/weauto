@@ -321,7 +321,7 @@ timeout_sec = 20.0
 enabled = true
 openai_compat_think_mode = "off"
 reasoning_effort = "minimal"
-timeout_sec = 20.0
+timeout_sec = 120.0
 
 [llm_summary]
 enabled = true

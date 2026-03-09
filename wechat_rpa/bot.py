@@ -3399,7 +3399,15 @@ class WeChatGuiRpaBot:
                 if self.cfg.agent_actions_enabled:
                     tools = self._available_agent_tools(is_admin=is_admin)
                     if tools:
+                        plan_started = 0.0
                         try:
+                            plan_started = time.monotonic()
+                            if self.cfg.log_verbose:
+                                print(
+                                    f"[agent-plan] start row={row.row_idx:>2} | "
+                                    f"title={self._fit_col(row.title, 14)} "
+                                    f"tools={len(tools):>2} timeout={float(self.cfg.llm_planner.timeout_sec):.1f}s"
+                                )
                             plan = self.llm_planner.plan_actions(
                                 title=row.title,
                                 is_group=is_group,
@@ -3413,6 +3421,7 @@ class WeChatGuiRpaBot:
                                 available_tools=tools,
                                 max_actions=self.cfg.agent_actions_max_per_turn,
                             )
+                            plan_elapsed = time.monotonic() - plan_started
                             planned_actions = (
                                 plan.get("actions")
                                 if isinstance(plan, dict) and isinstance(plan.get("actions"), list)
@@ -3423,6 +3432,21 @@ class WeChatGuiRpaBot:
                                 if isinstance(plan, dict)
                                 else ""
                             )
+                            if self.cfg.log_verbose:
+                                plan_tools = ",".join(
+                                    str(item.get("tool", "")).strip()
+                                    for item in planned_actions
+                                    if isinstance(item, dict) and str(item.get("tool", "")).strip()
+                                )
+                                print(
+                                    f"[agent-plan] done  row={row.row_idx:>2} | "
+                                    f"elapsed={plan_elapsed:.2f}s actions={len(planned_actions):>2} "
+                                    f"tools={plan_tools or '-'}"
+                                )
+                                if planner_reply_hint:
+                                    print(
+                                        f"             hint={self._fit_col(planner_reply_hint, max(24, self._term_width() - 19))}"
+                                    )
                             if lookup_intent and lookup_query:
                                 enforced_actions: list[dict] = []
                                 if self._has_web_search_tool() and ("web_search" in tools):
@@ -3497,6 +3521,15 @@ class WeChatGuiRpaBot:
                                     fallback=fallback,
                                 )
                         except Exception as exc:
+                            if self.cfg.log_verbose:
+                                if plan_started > 0.0:
+                                    plan_elapsed = time.monotonic() - plan_started
+                                    print(
+                                        f"[agent-plan] fail  row={row.row_idx:>2} | "
+                                        f"elapsed={plan_elapsed:.2f}s"
+                                    )
+                                else:
+                                    print(f"[agent-plan] fail  row={row.row_idx:>2}")
                             if self.cfg.agent_actions_fail_open:
                                 print(f"[warn] agent action planner failed, fail-open: {exc}")
                                 if lookup_intent and lookup_query:
