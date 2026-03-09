@@ -1384,7 +1384,9 @@ class WeChatGuiRpaBot:
         has_verb = any(v in raw for v in verbs)
         has_topic = any(t in raw for t in topics) or any(t in lowered for t in topics)
         has_temporal = any(t in raw for t in temporal)
-        return (has_verb and (has_topic or has_temporal)) or (has_topic and has_temporal)
+        memory_cues = ("记得", "记不记得", "你还记得", "之前说过", "以前提过", "在记忆里")
+        has_memory_cue = any(c in raw for c in memory_cues)
+        return (has_verb and (has_topic or has_temporal)) or (has_topic and has_temporal) or has_memory_cue
 
     @staticmethod
     def _is_deferred_reply_hint(text: str) -> bool:
@@ -1398,6 +1400,8 @@ class WeChatGuiRpaBot:
             "我去查",
             "我先查",
             "这就帮你查",
+            "这就搜",
+            "别催",
             "我去看看",
             "待会",
             "一会",
@@ -3386,6 +3390,12 @@ class WeChatGuiRpaBot:
                     continue
 
                 planned_reply = ""
+                lookup_query = re.sub(
+                    r"\s+",
+                    " ",
+                    (latest_user_message or row.preview or row.text or "").strip(),
+                )[:80]
+                lookup_intent = self._is_web_lookup_intent(lookup_query)
                 if self.cfg.agent_actions_enabled:
                     tools = self._available_agent_tools(is_admin=is_admin)
                     if tools:
@@ -3413,31 +3423,38 @@ class WeChatGuiRpaBot:
                                 if isinstance(plan, dict)
                                 else ""
                             )
-                            if (
-                                self._has_web_search_tool()
-                                and self._is_web_lookup_intent(latest_user_message or row.preview or row.text)
-                                and (not self._plan_has_tool(planned_actions, "web_search"))
-                            ):
-                                auto_query = re.sub(
-                                    r"\s+",
-                                    " ",
-                                    (latest_user_message or row.preview or row.text or "").strip(),
-                                )[:80]
-                                if auto_query:
-                                    planned_actions = [
-                                        {
-                                            "tool": "web_search",
-                                            "args": {"query": auto_query},
-                                            "reason": "auto lookup intent",
-                                        }
-                                    ] + list(planned_actions or [])
+                            if lookup_intent and lookup_query:
+                                enforced_actions: list[dict] = []
+                                if self._has_web_search_tool() and ("web_search" in tools):
+                                    if not self._plan_has_tool(planned_actions, "web_search"):
+                                        enforced_actions.append(
+                                            {
+                                                "tool": "web_search",
+                                                "args": {"query": lookup_query},
+                                                "reason": "auto lookup intent",
+                                            }
+                                        )
+                                if "search_memory" in tools:
+                                    if not self._plan_has_tool(planned_actions, "search_memory"):
+                                        enforced_actions.append(
+                                            {
+                                                "tool": "search_memory",
+                                                "args": {"query": lookup_query},
+                                                "reason": "auto memory lookup",
+                                            }
+                                        )
+                                if enforced_actions:
+                                    planned_actions = enforced_actions + list(planned_actions or [])
                                     planned_actions = planned_actions[
                                         : max(1, int(self.cfg.agent_actions_max_per_turn))
                                     ]
                                     if self.cfg.log_verbose:
+                                        names = ",".join(
+                                            str(x.get("tool", "")).strip() for x in enforced_actions
+                                        )
                                         print(
-                                            f"[agent] auto-add web_search | "
-                                            f"query={self._fit_col(auto_query, max(24, self._term_width() - 38))}"
+                                            f"[agent] auto-add lookup tools={names or '-'} | "
+                                            f"query={self._fit_col(lookup_query, max(24, self._term_width() - 49))}"
                                         )
                             trace, observations = self._execute_agent_actions(
                                 row,
@@ -3453,6 +3470,13 @@ class WeChatGuiRpaBot:
                                 memory_recall = (
                                     f"{memory_recall}\n\n[工具执行结果]\n{observations}".strip()
                                 )[:3600]
+                            if lookup_intent and planner_reply_hint:
+                                if self.cfg.log_verbose:
+                                    print(
+                                        f"[agent] drop lookup reply_hint row={row.row_idx:>2} "
+                                        f"title={self._fit_col(row.title, 14)}"
+                                    )
+                                planner_reply_hint = ""
                             if planner_reply_hint and self._is_deferred_reply_hint(planner_reply_hint):
                                 if self.cfg.log_verbose:
                                     print(
@@ -3460,6 +3484,8 @@ class WeChatGuiRpaBot:
                                         f"title={self._fit_col(row.title, 14)}"
                                     )
                                 planner_reply_hint = ""
+                            if lookup_intent and (not observations):
+                                planned_reply = "我刚试着查了，但这轮没拿到可用结果（可能检索接口异常）。要不要我立刻换关键词再查一次？"
                             if planner_reply_hint and not planned_reply:
                                 fallback = (
                                     self.cfg.reply_on_mention
