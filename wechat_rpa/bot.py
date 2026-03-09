@@ -1346,6 +1346,64 @@ class WeChatGuiRpaBot:
             return f"blocked (missing api key: config.tavily_api_key or env {env_name})"
         return "blocked (missing api key: config.tavily_api_key)"
 
+    @staticmethod
+    def _plan_has_tool(actions: list[dict] | None, tool_name: str) -> bool:
+        if not actions:
+            return False
+        target = str(tool_name or "").strip()
+        if not target:
+            return False
+        for item in actions:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("tool", "")).strip() == target:
+                return True
+        return False
+
+    @staticmethod
+    def _is_web_lookup_intent(text: str) -> bool:
+        raw = re.sub(r"\s+", " ", (text or "").strip())
+        if not raw:
+            return False
+        lowered = raw.lower()
+        if "wowhead" in lowered:
+            return True
+        verbs = ("查", "搜", "检索", "看看", "看下", "看一下", "帮我查", "帮我看", "找一下")
+        topics = (
+            "消息",
+            "更新",
+            "公告",
+            "新闻",
+            "官网",
+            "蓝贴",
+            "hotfix",
+            "patch",
+            "补丁",
+        )
+        temporal = ("今天", "最新", "最近", "刚刚")
+        has_verb = any(v in raw for v in verbs)
+        has_topic = any(t in raw for t in topics) or any(t in lowered for t in topics)
+        has_temporal = any(t in raw for t in temporal)
+        return (has_verb and (has_topic or has_temporal)) or (has_topic and has_temporal)
+
+    @staticmethod
+    def _is_deferred_reply_hint(text: str) -> bool:
+        raw = re.sub(r"\s+", " ", (text or "").strip())
+        if not raw:
+            return False
+        lowered = raw.lower()
+        markers = (
+            "稍等",
+            "等我",
+            "我去查",
+            "我先查",
+            "这就帮你查",
+            "我去看看",
+            "待会",
+            "一会",
+        )
+        return any(m in raw for m in markers) or any(m in lowered for m in markers)
+
     def _tavily_search(self, query: str) -> str:
         clean_query = re.sub(r"\s+", " ", query or "").strip()[:120]
         if not clean_query:
@@ -2215,6 +2273,9 @@ class WeChatGuiRpaBot:
                         f"expect={self._fit_col(row.title, 14)}"
                     )
                     print(f"           seen={self._fit_col(header, seen_w)}")
+                if ensure_unread_clear:
+                    latest = self._click_until_unread_cleared(row, bounds=latest)
+                    time.sleep(self.cfg.post_select_wait_sec)
                 return FocusResult(bounds=latest, matched=True, resolved_row=row, seen_header=header)
 
             swapped = self._match_focus_candidate(header, row, focus_candidates)
@@ -2227,6 +2288,9 @@ class WeChatGuiRpaBot:
                         f"use={self._fit_col(swapped.title, 14)}"
                     )
                     print(f"            seen={self._fit_col(header, seen_w)}")
+                if ensure_unread_clear:
+                    latest = self._click_until_unread_cleared(swapped, bounds=latest)
+                    time.sleep(self.cfg.post_select_wait_sec)
                 return FocusResult(
                     bounds=latest,
                     matched=True,
@@ -2264,6 +2328,9 @@ class WeChatGuiRpaBot:
                         f"use={self._fit_col(swapped.title, 14)}"
                     )
                     print(f"            seen={self._fit_col(header, seen_w)}")
+                if ensure_unread_clear:
+                    latest = self._click_until_unread_cleared(swapped, bounds=latest)
+                    time.sleep(self.cfg.post_select_wait_sec)
                 return FocusResult(
                     bounds=latest,
                     matched=True,
@@ -2966,7 +3033,10 @@ class WeChatGuiRpaBot:
         if focused_bounds is not None:
             bounds = focused_bounds
         else:
-            focus_result = self._focus_chat(row)
+            focus_result = self._focus_chat(
+                row,
+                ensure_unread_clear=(reason == "new_message"),
+            )
             if (not focus_result.matched) or (focus_result.resolved_row is None):
                 seen_w = max(24, self._term_width() - 17)
                 print(
@@ -3343,6 +3413,32 @@ class WeChatGuiRpaBot:
                                 if isinstance(plan, dict)
                                 else ""
                             )
+                            if (
+                                self._has_web_search_tool()
+                                and self._is_web_lookup_intent(latest_user_message or row.preview or row.text)
+                                and (not self._plan_has_tool(planned_actions, "web_search"))
+                            ):
+                                auto_query = re.sub(
+                                    r"\s+",
+                                    " ",
+                                    (latest_user_message or row.preview or row.text or "").strip(),
+                                )[:80]
+                                if auto_query:
+                                    planned_actions = [
+                                        {
+                                            "tool": "web_search",
+                                            "args": {"query": auto_query},
+                                            "reason": "auto lookup intent",
+                                        }
+                                    ] + list(planned_actions or [])
+                                    planned_actions = planned_actions[
+                                        : max(1, int(self.cfg.agent_actions_max_per_turn))
+                                    ]
+                                    if self.cfg.log_verbose:
+                                        print(
+                                            f"[agent] auto-add web_search | "
+                                            f"query={self._fit_col(auto_query, max(24, self._term_width() - 38))}"
+                                        )
                             trace, observations = self._execute_agent_actions(
                                 row,
                                 planned_actions,
@@ -3357,6 +3453,13 @@ class WeChatGuiRpaBot:
                                 memory_recall = (
                                     f"{memory_recall}\n\n[工具执行结果]\n{observations}".strip()
                                 )[:3600]
+                            if planner_reply_hint and self._is_deferred_reply_hint(planner_reply_hint):
+                                if self.cfg.log_verbose:
+                                    print(
+                                        f"[agent] drop deferred reply_hint row={row.row_idx:>2} "
+                                        f"title={self._fit_col(row.title, 14)}"
+                                    )
+                                planner_reply_hint = ""
                             if planner_reply_hint and not planned_reply:
                                 fallback = (
                                     self.cfg.reply_on_mention
