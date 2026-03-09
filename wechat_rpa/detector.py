@@ -382,12 +382,27 @@ def detect_chat_rows(
     cfg: AppConfig,
     ocr_engine: OcrEngine,
 ) -> DetectionResult:
+    img_h, img_w = screenshot_rgb.shape[:2]
+    scale_x = float(img_w) / float(max(1, bounds.width))
+    scale_y = float(img_h) / float(max(1, bounds.height))
+    if scale_x <= 0 or scale_y <= 0:
+        scale_x = 1.0
+        scale_y = 1.0
+
     if cfg.use_manual_row_boxes:
         manual_boxes = _load_manual_row_boxes(cfg, bounds)
         if manual_boxes:
             rows: list[ChatRowState] = []
             for row_idx, (bx, by, bw, bh) in enumerate(manual_boxes):
-                row_rgb = screenshot_rgb[by : by + bh, bx : bx + bw]
+                sx = int(round(bx * scale_x))
+                sy = int(round(by * scale_y))
+                sw = max(1, int(round(bw * scale_x)))
+                sh = max(1, int(round(bh * scale_y)))
+                sx = max(0, min(img_w - 1, sx))
+                sy = max(0, min(img_h - 1, sy))
+                sw = min(sw, img_w - sx)
+                sh = min(sh, img_h - sy)
+                row_rgb = screenshot_rgb[sy : sy + sh, sx : sx + sw]
                 if row_rgb.size == 0:
                     continue
                 row_bgr = cv2.cvtColor(row_rgb, cv2.COLOR_RGB2BGR)
@@ -407,7 +422,12 @@ def detect_chat_rows(
                     )
                     if not unread_badge:
                         unread_badge = any(_UNREAD_NUM_RE.match(v) for v in values[:3])
-                has_mention = _contains_mention(values, cfg.mention_keywords, cfg.mention_any_at)
+                mention_values = list(values)
+                if preview:
+                    mention_values.append(preview)
+                has_mention = _contains_mention(
+                    mention_values, cfg.mention_keywords, cfg.mention_any_at
+                )
                 text = " ".join(values)
                 click_x = bx + int(bw * 0.24)
                 click_y = by + (bh // 2)
@@ -431,10 +451,10 @@ def detect_chat_rows(
                 )
             return DetectionResult(rows=rows)
 
-    x = int(bounds.width * cfg.list_region.x)
-    y = int(bounds.height * cfg.list_region.y)
-    w = int(bounds.width * cfg.list_region.w)
-    h = int(bounds.height * cfg.list_region.h)
+    x = int(bounds.width * cfg.list_region.x * scale_x)
+    y = int(bounds.height * cfg.list_region.y * scale_y)
+    w = int(bounds.width * cfg.list_region.w * scale_x)
+    h = int(bounds.height * cfg.list_region.h * scale_y)
 
     list_rgb = screenshot_rgb[y : y + h, x : x + w]
     if list_rgb.size == 0:
@@ -495,7 +515,12 @@ def detect_chat_rows(
             # OCR fallback: some badges are read as small standalone numbers.
             if not unread_badge:
                 unread_badge = any(_UNREAD_NUM_RE.match(v) for v in values[:2])
-        has_mention = _contains_mention(values, cfg.mention_keywords, cfg.mention_any_at)
+        mention_values = list(values)
+        if preview:
+            mention_values.append(preview)
+        has_mention = _contains_mention(
+            mention_values, cfg.mention_keywords, cfg.mention_any_at
+        )
         text = " ".join(values)
 
         # Use stable ratio click point inside row to avoid OCR-anchor drift.
@@ -504,8 +529,14 @@ def detect_chat_rows(
 
         window_click_x = x + click_x_local
         window_click_y = y + click_y_local
-        click_x_ratio = max(0.0, min(1.0, window_click_x / max(1.0, bounds.width)))
-        click_y_ratio = max(0.0, min(1.0, window_click_y / max(1.0, bounds.height)))
+        click_x_ratio = max(
+            0.0,
+            min(1.0, (window_click_x / max(1.0, scale_x)) / max(1.0, bounds.width)),
+        )
+        click_y_ratio = max(
+            0.0,
+            min(1.0, (window_click_y / max(1.0, scale_y)) / max(1.0, bounds.height)),
+        )
 
         rows.append(
             ChatRowState(

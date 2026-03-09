@@ -80,9 +80,30 @@
 | `memory_summary_update_every` | `4` | 每多少个用户回合触发长期摘要更新 |
 | `memory_summary_recent_items` | `10` | 摘要更新时引用最近短期条数 |
 | `memory_summary_max_chars` | `500` | 长期摘要最大长度 |
+| `memory_history_context_items` | `24` | 给 Vision/LLM 提供的会话历史尾部条数 |
+| `memory_history_max_items` | `0` | 历史持久化上限，`0` 表示不限 |
+| `workspace_enabled` | `true` | 是否启用 OpenClaw 风格文件工作区 |
+| `workspace_dir` | `"agent_workspace"` | 工作区目录，保存规则和 Markdown 记忆 |
+| `workspace_memory_main_only` | `true` | 是否仅管理员会话可读取全局长期记忆 |
+| `workspace_memory_search_limit` | `3` | 每次检索注入多少条相关记忆 |
 | `admin_commands_enabled` | `true` | 是否启用管理员命令 |
 | `admin_session_titles` | `["example_admin"]` | 管理员会话标题白名单 |
 | `admin_command_prefix` | `"/"` | 管理命令前缀 |
+| `agent_actions_enabled` | `true` | 是否启用 LLM 工具规划与执行 |
+| `agent_actions_max_per_turn` | `2` | 每轮最多执行工具动作数 |
+| `agent_actions_fail_open` | `true` | 工具规划失败时是否继续主流程 |
+| `heartbeat_enabled` | `false` | 是否启用心跳（固定间隔自驱任务） |
+| `heartbeat_interval_sec` | `1800.0` | 心跳触发间隔（秒） |
+| `heartbeat_min_idle_sec` | `20.0` | 至少空闲多久后才跑心跳（秒） |
+| `heartbeat_max_actions` | `2` | 心跳每轮最多工具动作数 |
+| `heartbeat_fail_open` | `true` | 心跳失败是否不中断主循环 |
+| `heartbeat_prompt` | 内置提示词 | 心跳规划提示词，会和 `HEARTBEAT.md` 一起注入 |
+| `tavily_enabled` | `false` | 是否启用 Tavily 网页检索工具 |
+| `tavily_base_url` | `https://api.tavily.com` | Tavily API 地址 |
+| `tavily_api_key` | `""` | Tavily key（为空则走环境变量） |
+| `tavily_api_key_env` | `TAVILY_API_KEY` | Tavily 环境变量名 |
+| `tavily_max_results` | `3` | Tavily 每次返回条数上限 |
+| `tavily_timeout_sec` | `8.0` | Tavily 请求超时（秒） |
 
 管理员命令（实际实现）：
 
@@ -92,6 +113,18 @@
 - `/unmute 会话名`
 - `/reset 会话名`
 - `/merge 源会话 -> 目标会话`
+- `/remember 需要长期记住的内容`
+
+文件工作区（`workspace_enabled=true`）启用后，程序会在 `workspace_dir` 下自动维护：
+
+- `AGENTS.md`：总规则
+- `SOUL.md`：人格
+- `IDENTITY.md`：身份说明
+- `USER.md`：用户/管理员说明
+- `TOOLS.md`：当前能力说明
+- `MEMORY.md`：长期记忆
+- `memory/YYYY-MM-DD.md`：每日记忆
+- `memory/sessions/<session>.md`：按聊天窗口标题聚合的会话记忆
 
 ### 3.4 列表检测与区域开关
 
@@ -103,8 +136,8 @@
 | `preview_region_enabled` | `false` | 是否启用 preview 独立 OCR 区域 |
 | `rows_max` | `8` | 自动行模式最多扫描行数 |
 | `row_height_ratio` | `0.145` | 自动行模式单行高度比例 |
-| `chat_context_max_lines` | `14` | 聊天上下文 OCR 最大行数 |
-| `chat_self_x_ratio` | `0.62` | OCR 行左右归属阈值（>= 判定为我方） |
+| `chat_context_max_lines` | `14` | 旧 OCR 上下文字段，现主要保留兼容用途 |
+| `chat_self_x_ratio` | `0.62` | 旧 OCR 左右归属阈值，现主要保留兼容用途 |
 
 ## 4. 区域 section 参数
 
@@ -150,7 +183,7 @@
 | `temperature` | `0.3` | 采样温度 |
 | `presence_penalty` | `0.2` | presence_penalty |
 | `frequency_penalty` | `0.2` | frequency_penalty |
-| `max_tokens` | `180` | 回复最大 token |
+| `max_tokens` | `0` | 回复最大 token（`<=0` 表示不传 `max_tokens`） |
 | `timeout_sec` | `20.0` | 请求超时 |
 | `interest_hint` | `""` | 决策时附加关注偏好 |
 | `system_prompt` | 内置中文提示词 | 生成回复系统提示词 |
@@ -158,11 +191,11 @@
 | `decision_on_group` | `true` | 群聊启用分流 |
 | `decision_on_private` | `false` | 私聊启用分流 |
 | `decision_fail_open` | `false` | 分流失败时是否默认放行回复 |
-| `decision_max_tokens` | `32` | 分流输出 token 上限 |
+| `decision_max_tokens` | `0` | 分流输出 token 上限（`<=0` 表示不传 `max_tokens`） |
 | `decision_read_chat_context` | `true` | 分流前是否读取聊天上下文 |
 | `decision_system_prompt` | 内置提示词 | 分流器系统提示词 |
 | `summary_enabled` | `true` | 是否启用长期摘要更新 |
-| `summary_max_tokens` | `160` | 摘要 token 上限 |
+| `summary_max_tokens` | `0` | 摘要 token 上限（`<=0` 表示不传 `max_tokens`） |
 | `summary_system_prompt` | 内置提示词 | 摘要器系统提示词 |
 | `anti_repeat_enabled` | `true` | 是否启用防复读 |
 | `anti_repeat_window` | `4` | 对比最近回复窗口 |
@@ -170,6 +203,16 @@
 | `anti_repeat_retry` | `1` | 复读时重试次数 |
 | `reasoning_exclude` | `true` | OpenRouter 场景下尝试关闭 reasoning 输出 |
 | `reasoning_effort` | `low` | reasoning 强度（low/medium/high） |
+
+额外 profile：
+
+- `[llm_reply]`：主回复链路
+- `[llm_decision]`：`should_reply` 分流链路
+- `[llm_planner]`：普通消息工具规划链路
+- `[llm_summary]`：会话摘要链路
+- `[llm_heartbeat]`：heartbeat 自驱任务链路
+
+这些 section 未填写的字段会自动继承 `[llm]`，适合把慢模型留给 `heartbeat`，把快模型给 `reply`/`decision`。
 
 ## 6. Vision 参数（`[vision]`）
 
@@ -181,12 +224,18 @@
 | `api_key_env` | `OPENAI_API_KEY` | 环境变量名 |
 | `model` | `""` | 为空时自动继承 `llm.model` |
 | `timeout_sec` | `20.0` | 超时 |
-| `max_tokens` | `512` | 输出 token 上限 |
-| `fail_open` | `true` | Vision 失败时是否回退 OCR |
+| `max_tokens` | `0` | 输出 token 上限（`<=0` 表示不传 `max_tokens`） |
+| `fail_open` | `true` | Vision 失败时是否允许回退到模板或纯文本 LLM |
 | `reasoning_exclude` | `true` | OpenRouter 场景关闭 reasoning |
 | `reasoning_effort` | `low` | reasoning 强度 |
-| `system_prompt` | 内置提示词 | 要求输出 `wechat_vision_v1` JSON |
+| `system_prompt` | 内置提示词 | 要求输出标准化聊天记录 JSON |
 
+说明：
+
+- 右侧聊天区会按 `[chat_context_region]` 截图
+- Vision 会直接输出 `context + environment` JSON（不做 should_reply 判断，也不生成最终 reply）
+- OCR 不再参与聊天正文解析，只保留左侧列表识别
+- 生成和分流前会额外注入 `workspace_dir` 中的人格规则与检索到的记忆片段
 ## 7. 手工行框文件格式（`manual_row_boxes.json`）
 
 ```json

@@ -69,7 +69,31 @@ cp config.toml.example config.toml
 - 打开 `chat_title_region_group_enabled = true`、`chat_title_region_private_enabled = true`
 - 将 `focus_verify_enabled = true`
 
-## 3. 校准行内标题 OCR 区域（可提升标题识别稳定性）
+## 3. 校准聊天记录截图区域（Vision 回复前必做）
+
+命令：
+
+```bash
+./carlibrate_chat_context.sh config.toml
+```
+
+作用：
+
+- 校准 `[chat_context_region]`
+- 右侧聊天消息流会按这个区域截图，交给 Vision 输出标准化 `context + environment` JSON
+- 框内应只覆盖消息流，不要包含顶部标题栏和底部输入框
+
+界面操作：
+
+- 拖动框内部：移动
+- 拖右下角小方块：缩放
+- `保存并启用`：写回 `config.toml`
+
+保存结果：
+
+- 更新 `[chat_context_region]`
+
+## 4. 校准行内标题 OCR 区域（可提升标题识别稳定性）
 
 命令：
 
@@ -87,7 +111,7 @@ cp config.toml.example config.toml
 
 - 这是“单行局部坐标”，锚点是**左下角**（`x` 从左向右，`y` 从下向上）
 
-## 4. 校准行内预览 OCR 区域（减少 preview 误判）
+## 5. 校准行内预览 OCR 区域（减少 preview 误判）
 
 命令：
 
@@ -105,7 +129,7 @@ cp config.toml.example config.toml
 
 - 同样是单行局部左下锚点
 
-## 5. 校准未读红点圆形区域（推荐）
+## 6. 校准未读红点圆形区域（推荐）
 
 命令：
 
@@ -128,7 +152,7 @@ cp config.toml.example config.toml
 
 - 单行局部左下锚点
 
-## 6. 用调试脚本验证点击是否准确
+## 7. 用调试脚本验证点击是否准确
 
 建议先都用 `--dry-run`。
 
@@ -156,7 +180,7 @@ cp config.toml.example config.toml
 - `threshold=0.333`：当前阈值
 - `hit=True/False`：是否命中未读判定
 
-## 7. 校准完成后的最小运行流程
+## 8. 校准完成后的最小运行流程
 
 1. 确保 `dry_run = true`
 2. 启动：
@@ -172,6 +196,7 @@ cp config.toml.example config.toml
 
 - 行框覆盖准确，索引顺序正确
 - 点击后右侧标题能稳定匹配
+- 聊天记录截图区域只包含消息流，Vision 输出稳定
 - preview 与 row title OCR 文本基本可读
 - 未读红点区域 `red_ratio` 与视觉感知一致
 - `debug_* --dry-run` 坐标无明显偏移

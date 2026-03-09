@@ -2,9 +2,13 @@
 
 WeAuto 是一个仅基于 GUI 的微信自动化项目，核心能力是：
 
-- 截图 + OCR 识别聊天列表与聊天区
+- 截图 + OCR 识别左侧聊天列表
 - 基于未读/预览变化/@ 触发自动处理
-- 可选接入 LLM 进行分流决策与回复生成
+- 右侧聊天区截图交给 Vision，输出规范化 `context + environment` JSON，再由文本 LLM 生成最终回复
+- 以聊天窗口标题为 session，持久化完整历史、短期上下文和长期摘要
+- 使用 `agent_workspace/` 文件工作区模拟 OpenClaw 风格 agent：人格、规则、长期记忆、每日记忆、会话记忆都可落盘检索
+- 支持 heartbeat 固定间隔自驱任务（可直接解析 `HEARTBEAT.md` 的工具指令，或回退 LLM 规划后执行）
+- 可选接入 LLM 进行分流决策
 - 鼠标键盘自动化点击并发送消息
 
 项目不使用 Hook、不注入进程、不读取微信数据库。
@@ -46,12 +50,35 @@ WeAuto 是一个仅基于 GUI 的微信自动化项目，核心能力是：
 python run.py --config config.toml
 ```
 
+## OCR 后端切换（可选）
+
+项目默认使用 `rapidocr`。现在支持通过 `config.toml` 的 `[ocr]` 段切换：
+
+- `backend = "rapidocr"`（默认，已在 `requirements.txt`）
+- `backend = "paddleocr"`（精度通常更高，依赖更重）
+- `backend = "cnocr"`（接入简单，中文场景常用）
+
+如果切换到 `paddleocr/cnocr`，需要额外安装依赖：
+
+```bash
+./.venv312/bin/pip install paddleocr
+./.venv312/bin/pip install cnocr
+```
+
+也可以开启 A/B 对比日志（同图双跑）：
+
+- `ab_compare_backend = "paddleocr"`
+- `ab_compare_sample_rate = 0.2`
+
+终端会输出 `[ocr-ab]`，用于对比两种 OCR 文本差异。
+
 ## 常用脚本速查
 
 - 启动主程序：`./start_rpa.sh config.toml`
 - 行框校准：`./carlibrate_rows.sh config.toml`
 - 群聊右侧标题栏校准：`./carlibrate_title_group.sh config.toml`
 - 私聊右侧标题栏校准：`./carlibrate_title_private.sh config.toml`
+- 聊天记录区域校准：`./carlibrate_chat_context.sh config.toml`
 - 行标题区域校准：`./carlibrate_row_title.sh config.toml`
 - 行预览区域校准：`./carlibrate_preview.sh config.toml`
 - 未读红点圆形区域校准：`./carlibrate_unread.sh config.toml`
@@ -79,4 +106,5 @@ python run.py --config config.toml
 - `wechat_rpa/ocr.py`：OCR 引擎封装
 - `wechat_rpa/detector.py`：聊天行检测与触发信息提取
 - `wechat_rpa/llm.py`：LLM/Vision 调用
-- `wechat_rpa/bot.py`：主循环、事件判定、回复执行
+- `wechat_rpa/workspace_context.py`：OpenClaw 风格文件工作区与记忆检索
+- `wechat_rpa/bot.py`：主循环、session 记忆、workspace 记忆注入、Vision 回复执行

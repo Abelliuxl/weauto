@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 
 import Quartz
 import pyautogui
+from PIL import Image
 
 
 @dataclass
@@ -17,6 +19,26 @@ class WindowBounds:
 
 class WindowNotFoundError(RuntimeError):
     pass
+
+
+def _cgimage_to_pil(cg_image) -> Image.Image:
+    width = int(Quartz.CGImageGetWidth(cg_image))
+    height = int(Quartz.CGImageGetHeight(cg_image))
+    if width <= 0 or height <= 0:
+        raise RuntimeError("empty CGImage")
+    bytes_per_row = int(Quartz.CGImageGetBytesPerRow(cg_image))
+    provider = Quartz.CGImageGetDataProvider(cg_image)
+    data = Quartz.CGDataProviderCopyData(provider)
+    # CoreGraphics little-endian 32-bit buffers are typically BGRA.
+    return Image.frombuffer(
+        "RGBA",
+        (width, height),
+        bytes(data),
+        "raw",
+        "BGRA",
+        bytes_per_row,
+        1,
+    )
 
 
 def get_front_window_bounds(app_name: str) -> WindowBounds:
@@ -70,5 +92,29 @@ def get_front_window_bounds(app_name: str) -> WindowBounds:
     return max(candidates, key=lambda w: w.width * w.height)
 
 
-def screenshot_region(left: int, top: int, width: int, height: int):
+def screenshot_region(left: int, top: int, width: int, height: int, *, high_res: bool = False):
+    if width <= 0 or height <= 0:
+        raise ValueError(f"invalid screenshot region: width={width} height={height}")
+
+    use_high_res = bool(high_res)
+    env_force = os.environ.get("WEAUTO_SCREENSHOT_HIGH_RES", "").strip().lower()
+    if env_force in {"1", "true", "yes", "on"}:
+        use_high_res = True
+    if env_force in {"0", "false", "no", "off"}:
+        use_high_res = False
+
+    if use_high_res:
+        try:
+            rect = Quartz.CGRectMake(int(left), int(top), int(width), int(height))
+            cg_img = Quartz.CGWindowListCreateImage(
+                rect,
+                Quartz.kCGWindowListOptionOnScreenOnly,
+                Quartz.kCGNullWindowID,
+                Quartz.kCGWindowImageDefault,
+            )
+            if cg_img is not None:
+                return _cgimage_to_pil(cg_img)
+        except Exception:
+            pass
+
     return pyautogui.screenshot(region=(left, top, width, height))

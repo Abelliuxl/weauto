@@ -5,5 +5,8 @@ __pycache__/
 .DS_Store
 config.toml
 logs/
+.env
+.env.*
+!.env.example
 
 .venv312/

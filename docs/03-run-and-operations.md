@@ -47,11 +47,13 @@ python run.py --config config.toml
 - 群聊发送者前缀要求
 - 冷却时间
 - 自回声抑制
-7. 需要时先聚焦会话并提取聊天上下文
-8. 管理员命令会单独处理
-9. 若启用 LLM 分流，先判定 `reply/skip`
-10. 回复（`dry_run` 仅打印；真实模式会点击输入框并发送）
-11. 更新会话记忆并持久化
+7. 需要时先聚焦会话并截图右侧聊天记录区域
+8. Vision 输出 `context + environment` JSON（只做感知，不做 reply 生成）
+9. 管理员命令会单独处理
+10. 若启用 LLM 分流，会结合聊天 context、environment、会话记忆和工作区检索结果决策
+11. 回复发送（`dry_run` 仅打印；真实模式会点击输入框并发送）
+12. 更新会话完整历史、摘要、每日记忆和持久化文件
+13. 若当前轮没有消息事件，且 `heartbeat_enabled=true`，会按固定间隔执行一次心跳任务规划与工具动作
 
 ## 4. 群聊与私聊判定
 
@@ -74,14 +76,41 @@ python run.py --config config.toml
 - `reason == new_message` 且 `skip_if_latest_chat_from_self = true`
 - 当前为管理员会话
 - 启用了 LLM 分流且 `decision_read_chat_context = true`
+- Vision 感知链路已启用
 
-读取顺序：
+当前策略：
 
-1. OCR 上下文（永远可用）
-2. Vision 解析（`vision.enabled=true` 时尝试）
-3. Vision 失败且 `vision.fail_open=true` 时回退 OCR
+1. OCR 只负责左侧会话列表的新消息检测
+2. 右侧聊天区按 `[chat_context_region]` 截图
+3. Vision 输出标准化 `context + environment` JSON
+4. Vision 失败且 `vision.fail_open=true` 时，不再回退聊天区 OCR，只回退到模板或纯文本 LLM 回复
 
-## 6. 消息发送链路
+## 6. 心跳模式（非消息驱动）
+
+启用条件：
+
+- `heartbeat_enabled = true`
+- 距离上次心跳超过 `heartbeat_interval_sec`
+- 空闲时长超过 `heartbeat_min_idle_sec`
+
+执行行为：
+
+1. 读取 `agent_workspace/HEARTBEAT.md`（忽略注释/空行）
+2. 先尝试解析 `HEARTBEAT.md` 里的显式工具指令（如 `maintain_memory` / `refine_persona_files`）
+3. 若未解析到显式指令，再将 `heartbeat_prompt + HEARTBEAT.md + 当前时间 + 工作区上下文` 喂给 LLM 规划
+4. 执行白名单工具（记忆更新、检索、可选 `web_search` 等）
+
+默认支持的心跳维护动作包括：
+
+- `maintain_memory`：整理近期每日记忆到 `MEMORY.md`（托管块）
+- `refine_persona_files`：整理 `SOUL.md` / `IDENTITY.md` / `USER.md` / `TOOLS.md`（托管块）
+
+注意：
+
+- 心跳不会直接代替正常消息回复链路
+- `HEARTBEAT.md` 为空时会跳过，不会消耗 LLM 调用
+
+## 7. 消息发送链路
 
 真实发送（`dry_run=false`）时：
 
@@ -91,7 +120,7 @@ python run.py --config config.toml
 4. 通过 AppleScript 执行 `Cmd+V` + `Enter`
 5. AppleScript 失败时回退 `pyautogui` 键盘输入
 
-## 7. 管理员命令
+## 8. 管理员命令
 
 启用条件：
 
@@ -107,6 +136,7 @@ python run.py --config config.toml
 - `/unmute 会话名`
 - `/reset 会话名`
 - `/merge 源会话 -> 目标会话`
+- `/remember 需要长期记住的内容`
 
 示例：
 
@@ -117,20 +147,32 @@ python run.py --config config.toml
 /merge 群-上海 -> 上海群
 ```
 
-## 8. 记忆机制
+## 9. 记忆机制
 
-记忆文件默认在 `data/session_memory.json`，包含：
+记忆分两层：
+
+1. `data/session_memory.json`
 
 - 短期消息缓存（`short`）
+- 完整历史（`history`）
 - 长期摘要（`summary`）
 - 会话静音状态（`muted`）
 - 标题别名映射（`aliases`）
+
+2. `agent_workspace/`（或 `workspace_dir` 指定目录）
+
+- `AGENTS.md` / `SOUL.md` / `IDENTITY.md` / `USER.md` / `TOOLS.md`
+- `MEMORY.md` 长期记忆
+- `memory/YYYY-MM-DD.md` 每日记忆
+- `memory/sessions/*.md` 每个聊天窗口对应的会话记忆
 
 记忆在以下时机写盘：
 
 - 每轮空闲时
 - 命令执行后
 - 事件处理后
+
+管理员可以通过 `/remember ...` 直接把稳定事实写入 `MEMORY.md`。
 
 ## 9. 日志建议
 
@@ -143,4 +185,3 @@ python run.py --config config.toml
 ```bash
 tail -f logs/*.log
 ```
-

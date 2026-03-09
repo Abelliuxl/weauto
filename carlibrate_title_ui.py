@@ -79,6 +79,11 @@ def parse_args() -> argparse.Namespace:
         default="TITLE",
         help="Overlay label text in calibrator UI.",
     )
+    parser.add_argument(
+        "--help-text",
+        default="拖动框内部=移动；拖动右下角小方块=缩放。框应覆盖右侧聊天标题文字区域。",
+        help="Instruction text shown above canvas.",
+    )
     args = parser.parse_args()
     if args.config_positional:
         args.config = args.config_positional
@@ -155,7 +160,16 @@ def _upsert_top_level_key(text: str, key: str, value: str) -> str:
 
 
 class TitleCalibratorUI:
-    def __init__(self, image, box: dict, on_save, *, window_title: str, overlay_label: str) -> None:
+    def __init__(
+        self,
+        image,
+        box: dict,
+        on_save,
+        *,
+        window_title: str,
+        overlay_label: str,
+        help_text: str,
+    ) -> None:
         self.image = image
         self.img_w, self.img_h = image.size
         self.box = box
@@ -176,7 +190,7 @@ class TitleCalibratorUI:
         tk.Button(bar, text="取消", command=self.root.destroy).pack(side=tk.RIGHT, padx=(0, 6))
         tk.Label(
             self.root,
-            text="拖动框内部=移动；拖动右下角小方块=缩放。框应覆盖右侧聊天标题文字区域。",
+            text=help_text,
             anchor="w",
         ).pack(fill=tk.X, padx=8, pady=(0, 4))
 
@@ -327,6 +341,7 @@ def main() -> None:
         on_save=_save,
         window_title=args.ui_title,
         overlay_label=args.label,
+        help_text=args.help_text,
     )
     ui.run()
 

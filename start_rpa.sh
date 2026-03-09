@@ -15,6 +15,38 @@ fi
 CONFIG_PATH="${1:-config.toml}"
 DEPS_MARKER="$VENV_DIR/.deps_installed"
 LOG_DIR="$ROOT_DIR/logs"
+LOG_KEEP_MAX_FILES="${LOG_KEEP_MAX_FILES:-40}"
+LOG_KEEP_MAX_TOTAL_MB="${LOG_KEEP_MAX_TOTAL_MB:-512}"
+
+_file_size_bytes() {
+  local file="$1"
+  if stat -f%z "$file" >/dev/null 2>&1; then
+    stat -f%z "$file"
+  else
+    stat -c%s "$file"
+  fi
+}
+
+_prune_old_logs() {
+  local keep_files="$1"
+  local keep_bytes="$2"
+  local idx=0
+  local total=0
+  local size=0
+  local file=""
+  while IFS= read -r file; do
+    [[ -f "$file" ]] || continue
+    idx=$((idx + 1))
+    size="$(_file_size_bytes "$file")"
+    if [[ ! "$size" =~ ^[0-9]+$ ]]; then
+      size=0
+    fi
+    total=$((total + size))
+    if (( idx > keep_files || total > keep_bytes )); then
+      rm -f "$file" || true
+    fi
+  done < <(ls -1t "$LOG_DIR"/rpa_*.log 2>/dev/null || true)
+}
 
 if [[ ! -d "$VENV_DIR" ]]; then
   echo "[setup] creating venv: $VENV_DIR"
@@ -22,6 +54,17 @@ if [[ ! -d "$VENV_DIR" ]]; then
 fi
 
 source "$VENV_DIR/bin/activate"
+
+# Optional local env files (not committed) for secrets/endpoints.
+for env_file in "$ROOT_DIR/.env.weauto" "$ROOT_DIR/.env"; do
+  if [[ -f "$env_file" ]]; then
+    echo "[env] loading $(basename "$env_file")"
+    set -a
+    # shellcheck disable=SC1090
+    source "$env_file"
+    set +a
+  fi
+done
 
 if [[ ! -f "$DEPS_MARKER" || requirements.txt -nt "$DEPS_MARKER" ]]; then
   echo "[setup] installing dependencies"
@@ -36,7 +79,11 @@ if [[ ! -f "$CONFIG_PATH" ]]; then
 fi
 
 mkdir -p "$LOG_DIR"
+if [[ "$LOG_KEEP_MAX_FILES" =~ ^[0-9]+$ && "$LOG_KEEP_MAX_TOTAL_MB" =~ ^[0-9]+$ ]]; then
+  _prune_old_logs "$LOG_KEEP_MAX_FILES" "$((LOG_KEEP_MAX_TOTAL_MB * 1024 * 1024))"
+fi
 LOG_FILE="$LOG_DIR/rpa_$(date +%Y%m%d_%H%M%S).log"
+export WEAUTO_LOG_FILE="$LOG_FILE"
 
 # Preserve interactive terminal width for aligned logs even when piped to tee.
 if [[ -t 1 ]]; then
@@ -48,4 +95,17 @@ fi
 
 echo "[run] python run.py --config $CONFIG_PATH"
 echo "[log] $LOG_FILE"
-python -u run.py --config "$CONFIG_PATH" 2>&1 | tee -a "$LOG_FILE"
+echo "[log] retention: max_files=$LOG_KEEP_MAX_FILES max_total_mb=$LOG_KEEP_MAX_TOTAL_MB"
+
+# Keep terminal colors when running through tee, and store plain logs without ANSI codes.
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+  export FORCE_COLOR="${FORCE_COLOR:-1}"
+  if command -v perl >/dev/null 2>&1; then
+    python -u run.py --config "$CONFIG_PATH" 2>&1 \
+      | tee >(perl -pe 's/\e\[[0-9;]*[A-Za-z]//g' >> "$LOG_FILE")
+  else
+    python -u run.py --config "$CONFIG_PATH" 2>&1 | tee -a "$LOG_FILE"
+  fi
+else
+  python -u run.py --config "$CONFIG_PATH" 2>&1 | tee -a "$LOG_FILE"
+fi
