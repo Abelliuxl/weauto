@@ -219,6 +219,8 @@ class AppConfig:
     group_detect_sender_prefix: bool = True
     group_require_sender_prefix_for_new_message: bool = True
     group_only_reply_when_mentioned: bool = True
+    # Allow reply LLM to explicitly skip sending in group chats via [NO_REPLY].
+    group_allow_llm_no_reply: bool = True
     group_reply_keywords: list[str] = field(
         default_factory=lambda: ["@助手", "@机器人", "机器人", "bot", "小助手"]
     )
@@ -506,6 +508,9 @@ def load_config(path: str | Path | None) -> AppConfig:
     )
     cfg.group_only_reply_when_mentioned = bool(
         data.get("group_only_reply_when_mentioned", cfg.group_only_reply_when_mentioned)
+    )
+    cfg.group_allow_llm_no_reply = bool(
+        data.get("group_allow_llm_no_reply", cfg.group_allow_llm_no_reply)
     )
     group_reply_keywords = data.get("group_reply_keywords", cfg.group_reply_keywords)
     if isinstance(group_reply_keywords, list):

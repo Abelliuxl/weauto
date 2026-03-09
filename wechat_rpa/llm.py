@@ -1730,6 +1730,7 @@ class LlmReplyGenerator:
         workspace_context: str = "",
         memory_recall: str = "",
         avoid_replies: list[str] | None = None,
+        allow_no_reply_signal: bool = True,
     ) -> str:
         avoid_replies = avoid_replies or []
         has_web_search_observation = (
@@ -1769,7 +1770,11 @@ class LlmReplyGenerator:
             "回复风格硬约束：自然口语优先，禁止在句首或整句写括号动作描写（如“（...）”）；"
             "全句最多使用 1 个 emoji，能不用就不用；避免夸张拟人舞台腔。\n"
             "请直接输出回复内容，不要解释。"
-            "如果判断当前不该回复，请仅输出 [NO_REPLY]。"
+            + (
+                "如果判断当前不该回复，请仅输出 [NO_REPLY]。"
+                if allow_no_reply_signal
+                else "必须给出可直接发送的中文回复，不允许输出 [NO_REPLY]、无需回复、不回复。"
+            )
             + source_guard
             + avoid_txt
         )

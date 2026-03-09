@@ -134,6 +134,10 @@ group_title_prefixes = ["群"]
 group_detect_sender_prefix = true
 group_require_sender_prefix_for_new_message = false
 group_only_reply_when_mentioned = false
+# Allow reply LLM to skip a group reply by emitting [NO_REPLY]/no-reply markers.
+# false: always force a sendable fallback if this signal appears.
+# true: permit silent skip in groups.
+group_allow_llm_no_reply = false
 group_reply_keywords = ["@助手", "@机器人", "机器人", "bot", "小助手"]
 ignore_title_keywords = ["折叠的聊天"]
 

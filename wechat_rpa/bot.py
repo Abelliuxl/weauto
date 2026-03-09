@@ -2748,20 +2748,23 @@ class WeChatGuiRpaBot:
                     workspace_context=workspace_context,
                     memory_recall=memory_recall,
                     avoid_replies=(avoid if attempt > 0 else []),
+                    allow_no_reply_signal=(
+                        self.cfg.group_allow_llm_no_reply if self._is_group_chat(row) else False
+                    ),
                 )
                 clean = self._sanitize_generated_reply(text, fallback=fallback)
                 if self._is_no_reply_signal(clean):
-                    if self._is_group_chat(row):
+                    if self._is_group_chat(row) and self.cfg.group_allow_llm_no_reply:
                         if self.cfg.log_verbose:
                             print(
                                 f"[skip-no-reply] row={row.row_idx:>2} | "
                                 f"title={self._fit_col(row.title, 14)}"
                             )
                         return ""
-                    # For private chat, avoid accidental silence from model meta output.
+                    # If disabled (or in private), avoid accidental silence from model meta output.
                     if self.cfg.log_verbose:
                         print(
-                            f"[warn] no-reply signal ignored in private, fallback used "
+                            f"[warn] no-reply signal ignored, fallback used "
                             f"title={row.title!r}"
                         )
                     clean = fallback
@@ -3006,7 +3009,8 @@ class WeChatGuiRpaBot:
             f"[start] decision: enabled={self.cfg.llm_decision.decision_enabled} "
             f"grp={self.cfg.llm_decision.decision_on_group} "
             f"priv={self.cfg.llm_decision.decision_on_private} "
-            f"mention_only={self.cfg.group_only_reply_when_mentioned}"
+            f"mention_only={self.cfg.group_only_reply_when_mentioned} "
+            f"group_no_reply={self.cfg.group_allow_llm_no_reply}"
         )
         print(
             f"[start] cadence: poll={self.cfg.poll_interval_sec:.1f}s "
