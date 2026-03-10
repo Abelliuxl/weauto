@@ -107,6 +107,7 @@ class RowMemory:
     pending_unread: bool
     pending_normal: bool
     has_mention: bool
+    pending_mention: bool
     last_replied_at: float
 
 
@@ -2402,7 +2403,9 @@ class WeChatGuiRpaBot:
             )
             is_active = item.has_unread_badge or pending_unread
             if reason == "mention":
-                is_active = is_active or item.has_mention
+                is_active = is_active or item.has_mention or bool(
+                    prev is not None and prev.pending_mention
+                )
             if is_active:
                 _add_candidate(item)
         return candidates
@@ -2818,6 +2821,7 @@ class WeChatGuiRpaBot:
                 pending_unread=(row.has_unread_badge if self.cfg.process_existing_unread_on_start else False),
                 pending_normal=False,
                 has_mention=(False if self.cfg.process_existing_unread_on_start else row.has_mention),
+                pending_mention=(row.has_mention if self.cfg.process_existing_unread_on_start else False),
                 last_replied_at=0.0,
             )
             for row in rows
@@ -2846,6 +2850,7 @@ class WeChatGuiRpaBot:
                     pending_unread=row.has_unread_badge,
                     pending_normal=False,
                     has_mention=row.has_mention,
+                    pending_mention=row.has_mention,
                     last_replied_at=0.0,
                 )
                 continue
@@ -2863,6 +2868,7 @@ class WeChatGuiRpaBot:
                     pending_unread=False,
                     pending_normal=False,
                     has_mention=row.has_mention,
+                    pending_mention=row.has_mention,
                     last_replied_at=prev.last_replied_at,
                 )
                 if self.cfg.log_verbose or self.cfg.debug_scan:
@@ -2880,6 +2886,7 @@ class WeChatGuiRpaBot:
             unread_pending = prev.pending_unread
             normal_pending = prev.pending_normal
             mention_rise = row.has_mention and not prev.has_mention
+            mention_pending = prev.pending_mention
 
             prev.fingerprint = row.fingerprint
             prev.session_key = row_key
@@ -2890,6 +2897,10 @@ class WeChatGuiRpaBot:
             if not row.has_unread_badge:
                 prev.pending_unread = False
             prev.has_mention = row.has_mention
+            if mention_rise:
+                prev.pending_mention = True
+            elif not row.has_mention:
+                prev.pending_mention = False
 
             recent_sent_norm = self._get_recent_sent_for_row(row, now)
             self_echo = self._is_self_echo(preview_norm, prev.last_sent_norm) or self._is_self_echo(
@@ -2908,7 +2919,8 @@ class WeChatGuiRpaBot:
                     f"row={row.row_idx} title={row.title!r} preview={row.preview!r} "
                     f"preview_changed={preview_changed} "
                     f"unread={row.has_unread_badge} mention={row.has_mention} "
-                    f"self_echo={self_echo} pending_unread={unread_pending or unread_rise}"
+                    f"self_echo={self_echo} pending_unread={unread_pending or unread_rise} "
+                    f"pending_mention={mention_pending or mention_rise}"
                 )
 
             unread_active = row.has_unread_badge
@@ -2919,6 +2931,7 @@ class WeChatGuiRpaBot:
                 or unread_pending
                 or normal_pending
                 or mention_rise
+                or mention_pending
                 or unread_active
             ):
                 continue
@@ -2946,7 +2959,7 @@ class WeChatGuiRpaBot:
                     )
                 continue
 
-            if row.has_mention and mention_rise:
+            if row.has_mention and (mention_rise or mention_pending):
                 mention_candidates.append(row)
             elif row.has_unread_badge or unread_pending or normal_pending:
                 unread_candidates.append(row)
@@ -3619,9 +3632,13 @@ class WeChatGuiRpaBot:
                     self._skip_first_action_pending = False
                     mem = self._baseline.get(row.row_idx)
                     if mem is not None:
-                        mem.last_replied_at = now
-                        mem.pending_unread = False
-                        mem.pending_normal = False
+                        if reason == "mention":
+                            mem.pending_mention = True
+                        else:
+                            mem.last_replied_at = now
+                            mem.pending_unread = False
+                            mem.pending_normal = False
+                            mem.pending_mention = False
                     print(
                         f"[skip-startup] row={row.row_idx:>2} | "
                         f"reason={reason:<14} | title={self._fit_col(row.title, 14)}"
@@ -3636,6 +3653,7 @@ class WeChatGuiRpaBot:
                         mem.last_replied_at = now
                         mem.pending_unread = False
                         mem.pending_normal = False
+                        mem.pending_mention = False
                     time.sleep(self.cfg.poll_interval_sec)
                     continue
                 if self.cfg.log_verbose:
@@ -3767,6 +3785,7 @@ class WeChatGuiRpaBot:
                         mem.last_replied_at = now
                         mem.pending_unread = False
                         mem.pending_normal = False
+                        mem.pending_mention = False
                         self._save_persistent_memory()
                         time.sleep(self.cfg.poll_interval_sec)
                         continue
@@ -3794,6 +3813,7 @@ class WeChatGuiRpaBot:
                             mem.last_sent_norm = self._normalize_preview(reply_text)
                             mem.pending_unread = False
                             mem.pending_normal = False
+                            mem.pending_mention = False
                         self._remember_sent_for_row(
                             row, self._normalize_preview(reply_text), now
                         )
@@ -3852,6 +3872,7 @@ class WeChatGuiRpaBot:
                         mem.last_replied_at = now
                         mem.pending_unread = False
                         mem.pending_normal = False
+                        mem.pending_mention = False
                     self._save_persistent_memory()
                     time.sleep(self.cfg.poll_interval_sec)
                     continue
@@ -4108,6 +4129,7 @@ class WeChatGuiRpaBot:
                     mem.last_sent_norm = sent_norm
                     mem.pending_unread = False
                     mem.pending_normal = False
+                    mem.pending_mention = False
                     self._remember_sent_for_row(row, sent_norm, now)
                     if message and self._is_normal_reply_event(row, reason):
                         self._last_normal_reply_at = now
