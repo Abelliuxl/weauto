@@ -1874,7 +1874,8 @@ class LlmReplyGenerator:
             + "\n动作约束：\n"
             + f"1) actions 最多 {max(1, int(max_actions))} 个。\n"
             + "2) 参数必须简短、可执行，不要空参数对象里塞无关字段。\n"
-            + "3) 对用户可见回复由主回复链路处理，这里只规划动作与 reply_hint。"
+            + "3) 对用户可见回复由主回复链路处理，这里只规划动作与 reply_hint。\n"
+            + "4) reply_hint 不能索要红包/稿费/转账，不能以先给条件为前提拒绝回答。"
         )
         payload = {
             "model": self.cfg.model,

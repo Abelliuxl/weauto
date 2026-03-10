@@ -1409,8 +1409,21 @@ class WeChatGuiRpaBot:
             "我去看看",
             "待会",
             "一会",
+            "先发红包",
+            "先给红包",
+            "发个红包",
+            "稿费",
+            "给钱再说",
+            "先转",
         )
         return any(m in raw for m in markers) or any(m in lowered for m in markers)
+
+    @staticmethod
+    def _has_lookup_observation(text: str) -> bool:
+        raw = re.sub(r"\s+", " ", (text or "").strip())
+        if not raw:
+            return False
+        return ("网页检索[" in raw) or ("记忆检索[" in raw)
 
     def _tavily_search(self, query: str) -> str:
         clean_query = re.sub(r"\s+", " ", query or "").strip()[:120]
@@ -3500,10 +3513,18 @@ class WeChatGuiRpaBot:
                                 memory_recall = (
                                     f"{memory_recall}\n\n[工具执行结果]\n{observations}".strip()
                                 )[:3600]
+                            has_lookup_observation = self._has_lookup_observation(observations)
                             if lookup_intent and planner_reply_hint:
                                 if self.cfg.log_verbose:
                                     print(
                                         f"[agent] drop lookup reply_hint row={row.row_idx:>2} "
+                                        f"title={self._fit_col(row.title, 14)}"
+                                    )
+                                planner_reply_hint = ""
+                            if has_lookup_observation and planner_reply_hint:
+                                if self.cfg.log_verbose:
+                                    print(
+                                        f"[agent] drop post-tool reply_hint row={row.row_idx:>2} "
                                         f"title={self._fit_col(row.title, 14)}"
                                     )
                                 planner_reply_hint = ""
