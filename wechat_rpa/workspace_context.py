@@ -445,9 +445,14 @@ class WorkspaceContextManager:
         if summary:
             parts.append(f"[会话画像]\n- {summary}")
 
+        people_pool = [
+            person for person in (state.get("people") or []) if self._is_valid_person_entry(person)
+        ]
+        roster_query = self._looks_like_group_roster_query(query)
+
         if query.strip():
             people_candidates = self._prepare_rank_candidates(
-                items=state.get("people") or [],
+                items=people_pool,
                 query=query,
                 text_getter=lambda item: " ".join(
                     [
@@ -500,12 +505,13 @@ class WorkspaceContextManager:
                     if candidate.get("text")
                 ],
             )
-            people = self._finalize_rank_candidates(people_candidates, embedding_scores)[:8]
+            people_limit = 16 if roster_query else 8
+            people = self._finalize_rank_candidates(people_candidates, embedding_scores)[:people_limit]
             facts = self._finalize_rank_candidates(facts_candidates, embedding_scores)[:8]
             relations = self._finalize_rank_candidates(relations_candidates, embedding_scores)[:8]
             events = self._finalize_rank_candidates(events_candidates, embedding_scores)[:6]
         else:
-            people = list(state.get("people") or [])[:8]
+            people = list(people_pool)[:8]
             facts = list(state.get("facts") or [])[:8]
             relations = list(state.get("relations") or [])[:8]
             events = list(reversed((state.get("events") or [])[-6:]))
@@ -954,6 +960,8 @@ class WorkspaceContextManager:
         clean_name = self._normalize_name(name)
         if not clean_name:
             return
+        if _looks_like_placeholder_person(clean_name):
+            return
         clean_alias = self._normalize_name(alias)
         clean_note = self._clip_text(note, 80)
         people = state.setdefault("people", [])
@@ -977,6 +985,32 @@ class WorkspaceContextManager:
             target.setdefault("notes", []).append(clean_note)
         target["mentions"] = int(target.get("mentions", 0) or 0) + 1
         target["last_seen"] = stamp
+
+    def _is_valid_person_entry(self, person: dict) -> bool:
+        if not isinstance(person, dict):
+            return False
+        name = self._normalize_name(str(person.get("name", "")))
+        if not name:
+            return False
+        return not _looks_like_placeholder_person(name)
+
+    @staticmethod
+    def _looks_like_group_roster_query(query: str) -> bool:
+        raw = re.sub(r"\s+", " ", (query or "").strip())
+        if not raw:
+            return False
+        markers = (
+            "群成员",
+            "每个人",
+            "大家",
+            "分别",
+            "印象",
+            "特点",
+            "介绍一下",
+            "评价一下",
+            "总结一下",
+        )
+        return any(marker in raw for marker in markers)
 
     def _upsert_fact(self, state: dict, text: str, *, stamp: str) -> None:
         clean = self._clip_text(text, 120)
@@ -1161,7 +1195,7 @@ class WorkspaceContextManager:
 
     def _normalize_name(self, text: str) -> str:
         clean = self._clip_text(text, 24)
-        clean = clean.strip(" []【】()（）,，。.!！?？:：;；")
+        clean = clean.strip(" []【】()（）,，。.!！?？:：;；\"'“”‘’")
         clean = re.sub(r"^(real|test|tmp)[-_ ]*", "", clean, flags=re.IGNORECASE)
         clean = re.sub(r"(也行|都行|就行|可以|呀|啊|呢|吧)$", "", clean)
         if len(clean) < 2:
@@ -1217,6 +1251,7 @@ class WorkspaceContextManager:
         for person in merged_people:
             person["aliases"] = (person.get("aliases") or [])[:8]
             person["notes"] = (person.get("notes") or [])[-4:]
+        merged_people = [person for person in merged_people if self._is_valid_person_entry(person)]
         merged_people.sort(
             key=lambda item: (-int(item.get("mentions", 0) or 0), str(item.get("last_seen", ""))),
             reverse=False,
@@ -1608,3 +1643,44 @@ def _looks_like_noise_name(text: str) -> bool:
     if re.fullmatch(r"[\d_ -]+", lower or ""):
         return True
     return False
+
+
+def _looks_like_placeholder_person(text: str) -> bool:
+    clean = (text or "").strip()
+    if not clean:
+        return True
+    if _looks_like_noise_name(clean):
+        return True
+    exact = {
+        "群成员",
+        "其他群成员",
+        "群聊成员",
+        "其他人",
+        "大家",
+        "有人",
+        "未知人物",
+        "我方",
+    }
+    if clean in exact:
+        return True
+    if "群成员" in clean or "群聊成员" in clean or "群友" in clean:
+        return True
+    suffixes = (
+        "相关消息",
+        "消息",
+        "截图",
+        "图片",
+        "视频",
+        "内容",
+        "讨论",
+        "位置",
+        "方法",
+        "结果",
+        "经历",
+        "活动",
+        "任务",
+        "关卡",
+        "地图",
+        "线索",
+    )
+    return any(clean.endswith(suffix) for suffix in suffixes)

@@ -599,7 +599,11 @@ class WeChatGuiRpaBot:
             del sess.history[:-hist_limit]
 
         short_role = "A" if norm_role == "assistant" else ("U" if norm_role == "user" else "?")
-        item = f"{short_role}:{clean[:140]}"
+        short_sender = (sender or "").strip()[:24]
+        if norm_role == "user" and short_sender:
+            item = f"{short_role}({short_sender}):{clean[:128]}"
+        else:
+            item = f"{short_role}:{clean[:140]}"
         if (not sess.short) or sess.short[-1] != item:
             sess.short.append(item)
             max_items = max(4, self.cfg.memory_short_max_items)
@@ -759,10 +763,14 @@ class WeChatGuiRpaBot:
         for item in sess.history[-limit:]:
             role = str(item.get("role", "unknown"))
             text = re.sub(r"\s+", " ", str(item.get("text", ""))).strip()
+            sender = re.sub(r"\s+", " ", str(item.get("sender", ""))).strip()[:24]
             if not text:
                 continue
             prefix = "A" if role == "assistant" else ("U" if role == "user" else "?")
-            lines.append(f"{prefix}:{text[:140]}")
+            if role == "user" and sender:
+                lines.append(f"{prefix}({sender}):{text[:128]}")
+            else:
+                lines.append(f"{prefix}:{text[:140]}")
         return " | ".join(lines)[:1600]
 
     def _workspace_context_for_row(self, row: ChatRowState, *, is_admin: bool) -> str:
