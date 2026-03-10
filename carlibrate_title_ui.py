@@ -302,17 +302,20 @@ def main() -> None:
         print(f"[error] {exc}")
         raise SystemExit(1)
 
-    shot = screenshot_region(bounds.x, bounds.y, bounds.width, bounds.height)
+    # Keep calibrator capture path consistent with runtime title OCR.
+    shot = screenshot_region(bounds.x, bounds.y, bounds.width, bounds.height, high_res=True)
+    img_w, img_h = shot.size
     region = getattr(cfg, args.section, cfg.chat_title_region)
     box = {
-        "x": int(bounds.width * region.x),
-        "y": int(bounds.height * region.y),
-        "w": int(bounds.width * region.w),
-        "h": int(bounds.height * region.h),
+        "x": int(img_w * region.x),
+        "y": int(img_h * region.y),
+        "w": int(img_w * region.w),
+        "h": int(img_h * region.h),
     }
 
     print(
         f"[start] title-calibrator window=({bounds.width}x{bounds.height}) "
+        f"shot=({img_w}x{img_h}) "
         f"box=({box['x']},{box['y']},{box['w']},{box['h']})"
     )
 

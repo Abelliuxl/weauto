@@ -1339,19 +1339,24 @@ class WeChatGuiRpaBot:
             return self.cfg.chat_title_region_private
         return self.cfg.chat_title_region
 
-    def _extract_chat_header_text(self, bounds: "WindowBounds", is_group: bool | None = None) -> str:
+    def _probe_chat_header_text(
+        self,
+        bounds: "WindowBounds",
+        is_group: bool | None = None,
+    ) -> tuple[str, int, int, tuple[int, int, int, int], "RegionRatio"]:
         region = self._pick_chat_title_region(is_group)
         x = bounds.x + int(bounds.width * region.x)
         y = bounds.y + int(bounds.height * region.y)
         w = int(bounds.width * region.w)
         h = int(bounds.height * region.h)
         if w <= 0 or h <= 0:
-            return ""
+            return "", 0, 0, (x, y, w, h), region
         shot = screenshot_region(x, y, w, h, high_res=True)
         bgr = self._to_np_rgb(shot)[:, :, ::-1]
         lines = self.ocr_engine.detect_lines(bgr)
+        raw_count = len(lines)
         if not lines:
-            return ""
+            return "", raw_count, 0, (x, y, w, h), region
         valid: list[tuple[float, float, str]] = []
         for line in lines:
             txt = (line.text or "").strip()
@@ -1362,9 +1367,41 @@ class WeChatGuiRpaBot:
                 continue
             valid.append((line.y_center, line.x_center, txt))
         if not valid:
-            return ""
+            return "", raw_count, 0, (x, y, w, h), region
         valid.sort(key=lambda it: (it[0], it[1]))
-        return " ".join([x[2] for x in valid])[:120]
+        text = " ".join([x[2] for x in valid])[:120]
+        return text, raw_count, len(valid), (x, y, w, h), region
+
+    def _extract_chat_header_text(self, bounds: "WindowBounds", is_group: bool | None = None) -> str:
+        text, _, _, _, _ = self._probe_chat_header_text(bounds, is_group=is_group)
+        return text
+
+    def _log_recover_title_probe(
+        self,
+        bounds: "WindowBounds",
+        *,
+        mode_tag: str,
+        forced_is_group: bool,
+    ) -> None:
+        probes: list[tuple[str, bool | None]] = [
+            ("forced", forced_is_group),
+            ("default", None),
+            ("group", True),
+            ("private", False),
+        ]
+        for label, hint in probes:
+            text, raw_count, valid_count, box, region = self._probe_chat_header_text(
+                bounds,
+                is_group=hint,
+            )
+            x, y, w, h = box
+            txt = self._fit_col(text, 18) if text else "<empty>"
+            print(
+                f"[{mode_tag}] title-probe {label:<7} | "
+                f"raw={raw_count:>2} valid={valid_count:>2} | "
+                f"ratio=({region.x:.6f},{region.y:.6f},{region.w:.6f},{region.h:.6f}) | "
+                f"px=({x},{y},{w},{h}) | text={txt}"
+            )
 
     def _is_chat_header_matched(self, expected_title: str, actual_header: str) -> bool:
         exp = self._normalize_title_text(expected_title)
@@ -3565,15 +3602,21 @@ class WeChatGuiRpaBot:
             print(f"[recover] start in {remain}")
             time.sleep(1.0)
 
-    def _detect_active_chat_title(self, bounds: "WindowBounds") -> str:
+    def _detect_active_chat_title(
+        self,
+        bounds: "WindowBounds",
+        *,
+        forced_is_group: bool | None = None,
+    ) -> str:
         candidates: list[tuple[int, str]] = []
-        for hint in (None, True, False):
+
+        def _append_candidate(hint: bool | None) -> bool:
             try:
                 text = self._extract_chat_header_text(bounds, is_group=hint).strip()
             except Exception:
                 text = ""
             if not text:
-                continue
+                return False
             norm = self._normalize_title_text(text)
             score = len(norm)
             if hint is None:
@@ -3581,6 +3624,25 @@ class WeChatGuiRpaBot:
             if any("\u4e00" <= ch <= "\u9fff" for ch in text):
                 score += 1
             candidates.append((score, text[:120]))
+            return True
+
+        if forced_is_group is None:
+            for hint in (None, True, False):
+                _append_candidate(hint)
+        else:
+            # Recover mode honors the user's selected chat type first.
+            for _ in range(3):
+                if _append_candidate(forced_is_group):
+                    break
+            if not candidates:
+                _append_candidate(None)
+            if not candidates:
+                # Last-resort fallback: opposite type-specific region.
+                # This helps when one calibrated title region drifts while the other still captures text.
+                opposite = (not forced_is_group)
+                if _append_candidate(opposite):
+                    fallback_name = "group" if opposite else "private"
+                    print(f"[recover-title] fallback region hit: {fallback_name}")
         if not candidates:
             return ""
         candidates.sort(key=lambda it: it[0], reverse=True)
@@ -3606,6 +3668,23 @@ class WeChatGuiRpaBot:
         except EOFError:
             print("[recover] stdin unavailable, auto-continue in 2s")
             time.sleep(2.0)
+
+    def _prompt_recover_chat_type(self, *, mode_tag: str) -> bool:
+        prompt = f"[{mode_tag}] 选择会话类型: 1=群聊 2=私聊，输入数字后回车: "
+        while True:
+            try:
+                answer = input(prompt).strip()
+            except EOFError:
+                print(f"[warn] {mode_tag} stdin unavailable, fallback=群聊")
+                return True
+
+            if answer == "1":
+                print(f"[{mode_tag}] 已选择: 群聊")
+                return True
+            if answer == "2":
+                print(f"[{mode_tag}] 已选择: 私聊")
+                return False
+            print(f"[warn] {mode_tag} 无效输入，请输入 1 或 2")
 
     def _recover_title_match_score(self, left: str, right: str) -> float:
         lhs = self._normalize_title_text(left)
@@ -3669,6 +3748,87 @@ class WeChatGuiRpaBot:
             return best_title
         return ""
 
+    def _recover_resolve_title(
+        self,
+        bounds: "WindowBounds",
+        *,
+        last_title: str = "",
+        mode_tag: str = "recover",
+        forced_is_group: bool | None = None,
+    ) -> str:
+        title_ocr = self._detect_active_chat_title(
+            bounds,
+            forced_is_group=forced_is_group,
+        )
+        sidebar_title = self._recover_sidebar_title(
+            bounds,
+            header_title=title_ocr,
+            last_title=last_title,
+            mode_tag=mode_tag,
+        )
+        if sidebar_title and title_ocr and (not self._is_chat_header_matched(sidebar_title, title_ocr)):
+            print(
+                f"[{mode_tag}] row/header mismatch | "
+                f"row={self._fit_col(sidebar_title, 16)} | header={self._fit_col(title_ocr, 16)}"
+            )
+        title_seed = sidebar_title or title_ocr
+        next_title = self._stabilize_recover_title(
+            title_seed,
+            last_title=last_title,
+            mode_tag=mode_tag,
+        ) or "unknown-session"
+        if not title_seed:
+            print(
+                f"[warn] {mode_tag} title OCR empty, fallback={self._fit_col(next_title, 16)}"
+            )
+        return next_title
+
+    def _prompt_recover_title(
+        self,
+        *,
+        mode_tag: str,
+        forced_is_group: bool,
+    ) -> str:
+        while True:
+            self._activate_wechat()
+            time.sleep(self.cfg.activate_wait_sec)
+            try:
+                bounds = get_front_window_bounds(self.cfg.app_name)
+            except WindowNotFoundError as exc:
+                print(f"[warn] {mode_tag} window not ready: {exc}")
+                continue
+
+            self._log_recover_title_probe(
+                bounds,
+                mode_tag=mode_tag,
+                forced_is_group=forced_is_group,
+            )
+            title = self._recover_resolve_title(
+                bounds,
+                last_title="",
+                mode_tag=mode_tag,
+                forced_is_group=forced_is_group,
+            )
+            if not title or title == "unknown-session":
+                print(f"[warn] {mode_tag} 标题识别失败，正在重新识别")
+                continue
+
+            try:
+                answer = input(
+                    f"[{mode_tag}] 识别标题={self._fit_col(title, 24)} | 1=对 2=不对，输入数字后回车: "
+                ).strip()
+            except EOFError:
+                print(f"[warn] {mode_tag} stdin unavailable, accept={self._fit_col(title, 24)}")
+                return title
+
+            if answer == "1":
+                print(f"[{mode_tag}] 已确认标题: {self._fit_col(title, 24)}")
+                return title
+            if answer == "2":
+                print(f"[{mode_tag}] 重新识别标题")
+                continue
+            print(f"[warn] {mode_tag} 无效输入，请输入 1 或 2")
+
     def _stabilize_recover_title(
         self,
         title_ocr: str,
@@ -3708,40 +3868,30 @@ class WeChatGuiRpaBot:
         page: int,
         last_title: str = "",
         mode_tag: str = "recover",
+        forced_is_group: bool | None = None,
+        fixed_title: str = "",
     ) -> RecoverCaptureResult:
         self._activate_wechat()
         time.sleep(self.cfg.activate_wait_sec)
         bounds = get_front_window_bounds(self.cfg.app_name)
 
-        title_ocr = self._detect_active_chat_title(bounds)
-        sidebar_title = self._recover_sidebar_title(
-            bounds,
-            header_title=title_ocr,
-            last_title=last_title,
-            mode_tag=mode_tag,
-        )
-        if sidebar_title and title_ocr and (not self._is_chat_header_matched(sidebar_title, title_ocr)):
-            print(
-                f"[{mode_tag}] row/header mismatch | "
-                f"row={self._fit_col(sidebar_title, 16)} | header={self._fit_col(title_ocr, 16)}"
+        if fixed_title:
+            title = self._normalize_session_title_display(fixed_title) or fixed_title.strip()
+            next_title = title
+        else:
+            next_title = self._recover_resolve_title(
+                bounds,
+                last_title=last_title,
+                mode_tag=mode_tag,
+                forced_is_group=forced_is_group,
             )
-        title_seed = sidebar_title or title_ocr
-        next_title = self._stabilize_recover_title(
-            title_seed,
-            last_title=last_title,
-            mode_tag=mode_tag,
-        ) or "unknown-session"
-        title = next_title
-        if not title_seed:
-            print(
-                f"[warn] {mode_tag} title OCR empty, fallback={self._fit_col(title, 16)}"
-            )
+            title = next_title
 
         row = self._recover_virtual_row(title, page)
         session_key = self._session_key_for_row(row)
         sess_before = self._get_or_create_session(session_key)
         before_count = len(sess_before.history)
-        is_group = self._is_group_chat(row)
+        is_group = forced_is_group if forced_is_group is not None else self._is_group_chat(row)
 
         session_context = self._build_session_context(row)
         session_history = self._build_session_history_text(row)
@@ -3868,9 +4018,15 @@ class WeChatGuiRpaBot:
         self._last_activity_at = time.time()
         self._last_heartbeat_at = 0.0
         page = 0
-        last_title = ""
+        forced_is_group = self._prompt_recover_chat_type(mode_tag="recover")
+        fixed_title = self._prompt_recover_title(
+            mode_tag="recover",
+            forced_is_group=forced_is_group,
+        )
         print("[start] recover mode started")
-        print("[start] 每页会执行: 标题识别 -> 聊天截图分析 -> 记忆落盘")
+        print(f"[start] fixed title={self._fit_col(fixed_title, 24)}")
+        print("[start] 启动时会执行: 标题识别 -> 人工确认")
+        print("[start] 每页会执行: 聊天截图分析 -> 记忆落盘")
         print("[start] 完成后请手动上滑聊天记录，再按 Enter 开始下一页")
         print("[start] Ctrl-C 可随时退出，已写入的记忆会保留")
 
@@ -3884,8 +4040,9 @@ class WeChatGuiRpaBot:
                 try:
                     result = self._recover_capture_page(
                         page=page,
-                        last_title=last_title,
                         mode_tag="recover",
+                        forced_is_group=forced_is_group,
+                        fixed_title=fixed_title,
                     )
                 except WindowNotFoundError as exc:
                     print(f"[warn] recover window not ready: {exc}")
@@ -3896,7 +4053,6 @@ class WeChatGuiRpaBot:
                     print(f"[warn] recover capture failed: {exc}")
                     self._recover_wait_next_page()
                     continue
-                last_title = result.next_title or last_title
                 self._recover_wait_next_page()
         except KeyboardInterrupt:
             self._save_persistent_memory()
@@ -3907,9 +4063,15 @@ class WeChatGuiRpaBot:
         self._last_activity_at = time.time()
         self._last_heartbeat_at = 0.0
         page = 0
-        last_title = ""
+        forced_is_group = self._prompt_recover_chat_type(mode_tag="recover-auto")
+        fixed_title = self._prompt_recover_title(
+            mode_tag="recover-auto",
+            forced_is_group=forced_is_group,
+        )
         print("[start] recover-auto mode started")
-        print("[start] 每页会执行: 标题识别 -> 聊天截图分析 -> 记忆落盘 -> 安全点击 -> 自动上滑")
+        print(f"[start] fixed title={self._fit_col(fixed_title, 24)}")
+        print("[start] 启动时会执行: 标题识别 -> 人工确认")
+        print("[start] 每页会执行: 聊天截图分析 -> 记忆落盘 -> 安全点击 -> 自动上滑")
         print("[start] 到达最顶且无法继续上滑后会自动停止")
         try:
             while True:
@@ -3920,8 +4082,9 @@ class WeChatGuiRpaBot:
                 try:
                     result = self._recover_capture_page(
                         page=page,
-                        last_title=last_title,
                         mode_tag="recover-auto",
+                        forced_is_group=forced_is_group,
+                        fixed_title=fixed_title,
                     )
                 except WindowNotFoundError as exc:
                     print(f"[warn] recover-auto window not ready: {exc}")
@@ -3930,7 +4093,6 @@ class WeChatGuiRpaBot:
                     print(f"[warn] recover-auto capture failed: {exc}")
                     break
 
-                last_title = result.next_title or last_title
                 try:
                     if not self._recover_auto_scroll_once(result.bounds, page=page):
                         break
