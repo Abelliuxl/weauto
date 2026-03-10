@@ -256,6 +256,24 @@ class WorkspaceContextManager:
     ) -> None:
         if not self.enabled or src_key == dst_key:
             return
+        src_md = self.session_dir / f"{self._slug(src_key)}.md"
+        dst_md = self.session_dir / f"{self._slug(dst_key or dst_title)}.md"
+        src_lines = self._session_memory_lines(src_md)
+        dst_lines = self._session_memory_lines(dst_md)
+        if src_lines:
+            if not dst_md.exists():
+                dst_md.write_text(
+                    "# Session Memory\n\n"
+                    f"- key: {dst_key}\n"
+                    f"- title: {dst_title or dst_key}\n\n",
+                    encoding="utf-8",
+                )
+            seen_lines = set(dst_lines)
+            merged_lines = [line for line in src_lines if line not in seen_lines]
+            if merged_lines:
+                with dst_md.open("a", encoding="utf-8") as fh:
+                    for line in merged_lines:
+                        fh.write(line + "\n")
         src = self._load_session_state(session_key=src_key, title=src_key)
         dst = self._load_session_state(session_key=dst_key, title=dst_title)
         stamp = self._now_iso()
@@ -668,6 +686,22 @@ class WorkspaceContextManager:
                 out.append(memory_file)
             daily_files = sorted(self.memory_dir.glob("*.md"), reverse=True)[:5]
             out.extend([path for path in daily_files if path.is_file()])
+        return out
+
+    def _session_memory_lines(self, path: Path) -> list[str]:
+        if not path.exists():
+            return []
+        text = self._safe_read(path)
+        if not text:
+            return []
+        out: list[str] = []
+        for line in text.splitlines():
+            clean = line.rstrip()
+            if not clean:
+                continue
+            if clean == "# Session Memory" or clean.startswith("- key:") or clean.startswith("- title:"):
+                continue
+            out.append(clean)
         return out
 
     def _score_file(self, path: Path, content: str, query: str) -> list[MemoryHit]:

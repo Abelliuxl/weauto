@@ -195,6 +195,52 @@ class WeChatGuiRpaBot:
         s = re.sub(r"[.…·•,，:：;；\-—_]+", "", s)
         return s
 
+    def _normalize_session_title_display(self, title: str) -> str:
+        raw = unicodedata.normalize("NFKC", str(title or "").strip())
+        if not raw:
+            return ""
+        raw = re.sub(r"[‐‑‒–—―﹣－]+", "-", raw)
+        raw = re.sub(r"\s+", "", raw)
+        lower = raw.lower()
+        for prefix in self.cfg.group_title_prefixes:
+            norm_prefix = unicodedata.normalize("NFKC", str(prefix or "")).strip().lower()
+            if norm_prefix and lower.startswith(norm_prefix):
+                raw = re.sub(r"\(\s*\d+\s*\)$", "", raw)
+                break
+        return raw[:80]
+
+    def _normalize_session_title_token(self, title: str) -> str:
+        raw = self._normalize_session_title_display(title)
+        if not raw:
+            return ""
+        raw = re.sub(r"\d{1,2}:\d{2}", "", raw)
+        raw = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff\-_]+", "", raw).lower()
+        for prefix in self.cfg.group_title_prefixes:
+            norm_prefix = re.sub(
+                r"[^0-9a-z\u4e00-\u9fff]+",
+                "",
+                unicodedata.normalize("NFKC", str(prefix or "")).lower(),
+            )
+            if not norm_prefix or (not raw.startswith(norm_prefix)):
+                continue
+            tail = raw[len(norm_prefix) :].lstrip("-_")
+            raw = norm_prefix + tail
+            break
+        return raw
+
+    def _normalize_session_titles(self, titles: object) -> list[str]:
+        out: list[str] = []
+        seen: set[str] = set()
+        if not isinstance(titles, list):
+            return out
+        for item in titles:
+            clean = self._normalize_session_title_display(str(item))
+            if not clean or clean in seen:
+                continue
+            seen.add(clean)
+            out.append(clean)
+        return out
+
     def _strip_preview_decorations(self, text: str) -> str:
         raw = (text or "").strip()
         if not raw:
@@ -267,8 +313,7 @@ class WeChatGuiRpaBot:
             return 140
 
     def _title_key(self, title: str) -> str:
-        t = self._normalize_preview(title)
-        t = re.sub(r"\d{1,2}:\d{2}", "", t)
+        t = self._normalize_session_title_token(title)
         return t[:24]
 
     def _memory_session_relpath(self, key: str) -> str:
@@ -289,7 +334,7 @@ class WeChatGuiRpaBot:
             history=[],
             summary=str(meta.get("summary", ""))[: max(120, self.cfg.memory_summary_max_chars)],
             muted=bool(meta.get("muted", False)),
-            titles=set(str(x) for x in titles) if isinstance(titles, list) else set(),
+            titles=set(self._normalize_session_titles(titles)),
             loaded=False,
         )
 
@@ -334,9 +379,7 @@ class WeChatGuiRpaBot:
             if not sess.summary:
                 sess.summary = str(payload.get("summary", ""))[: max(120, self.cfg.memory_summary_max_chars)]
             if not sess.titles:
-                titles = payload.get("titles", [])
-                if isinstance(titles, list):
-                    sess.titles = set(str(x) for x in titles)
+                sess.titles = set(self._normalize_session_titles(payload.get("titles", [])))
             if not sess.muted:
                 sess.muted = bool(payload.get("muted", False))
         sess.history = (
@@ -373,13 +416,126 @@ class WeChatGuiRpaBot:
         self._memory_dirty = True
 
     def _remember_session_title(self, key: str, title: str) -> None:
-        clean = (title or "").strip()
+        clean = self._normalize_session_title_display(title)
         if not clean:
             return
         sess = self._get_or_create_session(key, load_history=False)
         if clean not in sess.titles:
             sess.titles.add(clean)
             self._memory_dirty = True
+
+    def _sort_session_history(self, history: list[dict]) -> list[dict]:
+        indexed = list(enumerate(history))
+        indexed.sort(key=lambda it: (int(it[1].get("observed_at", 0) or 0), it[0]))
+        return [item for _, item in indexed]
+
+    def _merge_session_keys(
+        self,
+        *,
+        src_key: str,
+        dst_key: str,
+        dst_title: str = "",
+        sync_workspace: bool = True,
+    ) -> bool:
+        if (not src_key) or (not dst_key) or src_key == dst_key:
+            return False
+        src = self._get_or_create_session(src_key)
+        dst = self._get_or_create_session(dst_key)
+        if dst_title:
+            self._remember_session_title(dst_key, dst_title)
+        src_name = self._display_session_name(src_key)
+        dst_name = dst_title or self._display_session_name(dst_key)
+
+        dst.short = (dst.short + src.short)[-max(4, self.cfg.memory_short_max_items) :]
+        dst.history = self._sort_session_history(dst.history + src.history)
+        hist_limit = max(0, int(self.cfg.memory_history_max_items))
+        if hist_limit > 0 and len(dst.history) > hist_limit:
+            dst.history = dst.history[-hist_limit:]
+        if src.summary and src.summary not in dst.summary:
+            glue = " | " if dst.summary else ""
+            dst.summary = (dst.summary + glue + src.summary)[
+                : max(120, self.cfg.memory_summary_max_chars)
+            ]
+        dst.muted = bool(dst.muted or src.muted)
+        dst.titles.update(src.titles)
+
+        for alias, key in list(self._session_aliases.items()):
+            if key == src_key:
+                self._session_aliases[alias] = dst_key
+        src_alias = self._title_key(src_key)
+        if src_alias:
+            self._session_aliases[src_alias] = dst_key
+
+        self._sessions.pop(src_key, None)
+        self._session_index.pop(src_key, None)
+        self._summary_turn_counter.pop(src_key, None)
+        if sync_workspace:
+            try:
+                self._workspace.merge_session_memory(
+                    src_key=src_key,
+                    dst_key=dst_key,
+                    dst_title=dst_name,
+                )
+            except Exception as exc:
+                if self.cfg.log_verbose:
+                    print(f"[warn] workspace session merge failed: {exc}")
+        self._memory_dirty = True
+        return True
+
+    def _coalesce_loaded_sessions(self) -> None:
+        all_keys = sorted(set(self._session_index.keys()) | set(self._sessions.keys()))
+        grouped: dict[str, dict[str, object]] = {}
+        original_keys: dict[str, set[str]] = {}
+        changed = False
+
+        for key in all_keys:
+            names: list[str] = []
+            clean_key = self._normalize_session_title_display(key)
+            if clean_key:
+                names.append(clean_key)
+            meta = self._session_index.get(key, {})
+            if isinstance(meta, dict):
+                names.extend(self._normalize_session_titles(meta.get("titles", [])))
+            sess = self._sessions.get(key)
+            if sess and sess.titles:
+                names.extend([self._normalize_session_title_display(x) for x in sess.titles])
+            names = [x for x in names if x]
+            canonical = self._title_key(key)
+            if not canonical:
+                for name in names:
+                    canonical = self._title_key(name)
+                    if canonical:
+                        break
+            if not canonical:
+                continue
+            bucket = grouped.setdefault(canonical, {"keys": [], "titles": set()})
+            bucket["keys"].append(key)
+            bucket["titles"].update(names)
+            original_keys.setdefault(canonical, set()).add(key)
+
+        for canonical, bucket in grouped.items():
+            keys = sorted(set(bucket["keys"]))  # type: ignore[index]
+            titles = sorted(set(bucket["titles"]))  # type: ignore[index]
+            if canonical not in self._sessions and canonical not in self._session_index and titles:
+                self._remember_session_title(canonical, titles[0])
+                changed = True
+            for src_key in keys:
+                if src_key == canonical:
+                    continue
+                if self._merge_session_keys(
+                    src_key=src_key,
+                    dst_key=canonical,
+                    dst_title=(titles[0] if titles else canonical),
+                ):
+                    changed = True
+            for alias_source in set(titles) | original_keys.get(canonical, set()):
+                alias = self._title_key(str(alias_source))
+                if alias and self._session_aliases.get(alias) != canonical:
+                    self._session_aliases[alias] = canonical
+                    changed = True
+
+        if changed:
+            print("[memory] coalesced legacy session keys with normalized group titles")
 
     def _canonical_session_key(self, title: str, row_idx: int) -> str:
         key = self._title_key(title)
@@ -791,9 +947,7 @@ class WeChatGuiRpaBot:
                         else [],
                         "summary": str(data.get("summary", ""))[: max(120, self.cfg.memory_summary_max_chars)],
                         "muted": bool(data.get("muted", False)),
-                        "titles": [str(x) for x in (data.get("titles", []) or [])]
-                        if isinstance(data.get("titles", []), list)
-                        else [],
+                        "titles": self._normalize_session_titles(data.get("titles", [])),
                         "history_count": int(data.get("history_count", 0) or 0),
                         "updated_at": int(data.get("updated_at", 0) or 0),
                     }
@@ -833,7 +987,7 @@ class WeChatGuiRpaBot:
                     else history_items,
                     summary=str(data.get("summary", ""))[: max(120, self.cfg.memory_summary_max_chars)],
                     muted=bool(data.get("muted", False)),
-                    titles=set(str(x) for x in titles) if isinstance(titles, list) else set(),
+                    titles=set(self._normalize_session_titles(titles)),
                     loaded=True,
                 )
                 self._sessions[key_str] = sess
@@ -853,8 +1007,9 @@ class WeChatGuiRpaBot:
                 k2 = str(k).strip()
                 v2 = str(v).strip()
                 if k2 and v2:
-                    self._session_aliases[k2] = v2
+                    self._session_aliases[self._title_key(k2) or k2] = self._title_key(v2) or v2
         self._memory_dirty = False
+        self._coalesce_loaded_sessions()
         print(
             f"[memory] loaded sessions={len(self._sessions)} aliases={len(self._session_aliases)} "
             f"path={self._memory_path}"
@@ -1039,14 +1194,7 @@ class WeChatGuiRpaBot:
         return True
 
     def _normalize_title_text(self, text: str) -> str:
-        raw = (text or "").strip()
-        if not raw:
-            return ""
-        # Ignore member count suffix like "(28)" in group headers.
-        raw = re.sub(r"[（(]\d+[)）]", "", raw)
-        raw = re.sub(r"\s+", "", raw)
-        raw = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff\-_]", "", raw)
-        return raw.lower()
+        return self._normalize_session_title_token(text)
 
     def _pick_chat_title_region(self, is_group: bool | None) -> "RegionRatio":
         if is_group is True and self.cfg.chat_title_region_group_enabled:
@@ -1258,41 +1406,9 @@ class WeChatGuiRpaBot:
                 return f"会话未找到: src={src_q}, dst={dst_q}"
             if src_key == dst_key:
                 return "源会话和目标会话相同，无需合并。"
-            src = self._get_or_create_session(src_key)
-            dst = self._get_or_create_session(dst_key)
             src_name = self._display_session_name(src_key)
             dst_name = self._display_session_name(dst_key)
-            merged = (dst.short + src.short)[-max(4, self.cfg.memory_short_max_items) :]
-            dst.short = merged
-            dst.history.extend(src.history)
-            hist_limit = max(0, int(self.cfg.memory_history_max_items))
-            if hist_limit > 0 and len(dst.history) > hist_limit:
-                dst.history = dst.history[-hist_limit:]
-            if src.summary and src.summary not in dst.summary:
-                glue = " | " if dst.summary else ""
-                dst.summary = (dst.summary + glue + src.summary)[
-                    : max(120, self.cfg.memory_summary_max_chars)
-                ]
-            dst.muted = bool(dst.muted or src.muted)
-            dst.titles.update(src.titles)
-
-            for alias, key in list(self._session_aliases.items()):
-                if key == src_key:
-                    self._session_aliases[alias] = dst_key
-            self._session_aliases[src_key] = dst_key
-
-            self._sessions.pop(src_key, None)
-            self._summary_turn_counter.pop(src_key, None)
-            try:
-                self._workspace.merge_session_memory(
-                    src_key=src_key,
-                    dst_key=dst_key,
-                    dst_title=dst_name,
-                )
-            except Exception as exc:
-                if self.cfg.log_verbose:
-                    print(f"[warn] workspace session merge failed: {exc}")
-            self._memory_dirty = True
+            self._merge_session_keys(src_key=src_key, dst_key=dst_key, dst_title=dst_name)
             return f"已合并: {src_name} -> {dst_name}"
 
         if action == "/remember":
@@ -1482,6 +1598,39 @@ class WeChatGuiRpaBot:
         )
         return any(m in raw for m in markers) or any(m in lowered for m in markers)
 
+    @staticmethod
+    def _is_meta_reply_hint(text: str) -> bool:
+        raw = re.sub(r"\s+", " ", (text or "").strip())
+        if not raw:
+            return False
+        lower = raw.lower()
+        meta_patterns = (
+            r"^顺着.+话题",
+            r"^围绕.+话题",
+            r"^针对.+(话题|问题|场景)",
+            r"^延续.+(语气|风格|口吻|氛围)",
+            r"^按.+(语气|风格|口吻|人设|氛围)",
+            r"^用.+(语气|风格|口吻)",
+            r".+符合.+(群聊|聊天|当前).*(氛围|风格|语气)",
+            r".+(调侃|吐槽).+即可$",
+            r".+(回一句|回两句|回复一句|回复两句|简短回复|简单回复)",
+            r".+(不要太|别太).+(正式|生硬|严肃)",
+        )
+        if any(re.search(pat, raw) for pat in meta_patterns):
+            return True
+        meta_markers = (
+            "reply_hint",
+            "主回复链路",
+            "用户可见回复",
+            "直接回",
+            "可以回",
+            "建议回",
+            "适合回",
+            "回复即可",
+            "作为回复",
+        )
+        return any(marker in raw or marker in lower for marker in meta_markers)
+
     def _normalize_planner_reply_hint(
         self,
         hint: str,
@@ -1493,6 +1642,8 @@ class WeChatGuiRpaBot:
         if not raw:
             return ""
         if self._is_payment_gate_reply(raw):
+            return ""
+        if self._is_meta_reply_hint(raw):
             return ""
         if not self._is_deferred_reply_hint(raw):
             return raw
@@ -2297,9 +2448,44 @@ class WeChatGuiRpaBot:
                 if self._title_key(item.title) == expected_key:
                     return item
         for item in rows:
-            if item.row_idx == expected_row.row_idx:
+            if item.row_idx == expected_row.row_idx and self._is_same_snapshot_session(
+                expected_row, item
+            ):
                 return item
         return None
+
+    def _is_same_snapshot_session(
+        self,
+        expected_row: ChatRowState,
+        candidate: ChatRowState,
+    ) -> bool:
+        expected_key = self._title_key(expected_row.title)
+        candidate_key = self._title_key(candidate.title)
+        if expected_key and candidate_key and expected_key == candidate_key:
+            return True
+
+        expected_preview = self._normalize_preview(expected_row.preview)
+        candidate_preview = self._normalize_preview(candidate.preview)
+        if expected_preview and candidate_preview:
+            if expected_preview in candidate_preview or candidate_preview in expected_preview:
+                return True
+            ratio = SequenceMatcher(
+                a=expected_preview[:80],
+                b=candidate_preview[:80],
+            ).ratio()
+            if ratio >= 0.82:
+                return True
+        return False
+
+    def _sync_row_snapshot(self, row: ChatRowState, latest: ChatRowState) -> None:
+        row.text = latest.text
+        row.title = latest.title
+        row.preview = latest.preview
+        row.has_mention = latest.has_mention
+        row.has_unread_badge = latest.has_unread_badge
+        row.fingerprint = latest.fingerprint
+        row.click_x_ratio = latest.click_x_ratio
+        row.click_y_ratio = latest.click_y_ratio
 
     def _click_until_unread_cleared(
         self,
@@ -2331,6 +2517,8 @@ class WeChatGuiRpaBot:
                         f"title={self._fit_col(row.title, 14)} not found"
                     )
                 return latest
+
+            self._sync_row_snapshot(row, matched)
 
             if not matched.has_unread_badge:
                 if self.cfg.log_verbose or self.cfg.debug_scan:
@@ -3826,6 +4014,13 @@ class WeChatGuiRpaBot:
                                     )
                             if lookup_intent and (not observations):
                                 planned_reply = "我刚试着查了，但这轮没拿到可用结果（可能检索接口异常）。要不要我立刻换关键词再查一次？"
+                            if planned_actions and planner_reply_hint:
+                                if self.cfg.log_verbose:
+                                    print(
+                                        f"[agent] drop action reply_hint row={row.row_idx:>2} "
+                                        f"title={self._fit_col(row.title, 14)}"
+                                    )
+                                planner_reply_hint = ""
                             if planner_reply_hint and not planned_reply:
                                 fallback = (
                                     self.cfg.reply_on_mention
