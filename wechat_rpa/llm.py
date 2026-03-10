@@ -1731,6 +1731,23 @@ class LlmReplyGenerator:
             return "阴阳强度=medium：可带一点阴阳味（建议 1 句内），保持活人感。"
         return "阴阳强度=low：可偶尔轻微阴阳（点到即止），以自然交流为主。"
 
+    @staticmethod
+    def _is_payment_gate_text(text: str) -> bool:
+        raw = re.sub(r"\s+", " ", (text or "").strip())
+        if not raw:
+            return False
+        markers = (
+            "红包",
+            "稿费",
+            "茶钱",
+            "转账",
+            "打钱",
+            "给钱",
+            "收费",
+            "付费",
+        )
+        return any(m in raw for m in markers)
+
     def generate(
         self,
         title: str,
@@ -1775,6 +1792,7 @@ class LlmReplyGenerator:
             "执行约束：无论语气是否阴阳，用户明确要求做的事要优先做到；"
             "不要只口头答应“去查/去做”却不给结果。"
             "做不到时要明确说明卡点和下一步。"
+            "严禁索要红包/稿费/转账或把回答设为先付款再说。"
         )
         user_prompt = (
             f"触发原因: {reason}\n"
@@ -1910,6 +1928,8 @@ class LlmReplyGenerator:
             )
 
         reply_hint = re.sub(r"\s+", " ", str(parsed.get("reply_hint", "") or "")).strip()[:180]
+        if self._is_payment_gate_text(reply_hint):
+            reply_hint = ""
 
         normalized: list[dict] = []
         raw_actions = parsed.get("actions")

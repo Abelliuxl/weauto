@@ -32,9 +32,22 @@ def parse_args() -> argparse.Namespace:
         description="WeChat macOS GUI-only RPA (no hook/injection/db access)."
     )
     parser.add_argument(
+        "command",
+        nargs="?",
+        choices=("run", "recover"),
+        default="run",
+        help="run=normal loop; recover=manual page-by-page memory recovery mode",
+    )
+    parser.add_argument(
         "--config",
         default="config.toml",
         help="Path to TOML config file (default: ./config.toml)",
+    )
+    parser.add_argument(
+        "--recover-countdown",
+        type=int,
+        default=3,
+        help="Countdown seconds before each recover page capture (default: 3)",
     )
     return parser.parse_args()
 
@@ -43,6 +56,9 @@ def main() -> None:
     args = parse_args()
     cfg = load_config(args.config)
     bot = WeChatGuiRpaBot(cfg)
+    if args.command == "recover":
+        bot.run_recover_mode(countdown_sec=max(0, int(args.recover_countdown)))
+        return
     bot.run_forever()
 
 

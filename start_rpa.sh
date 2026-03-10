@@ -13,6 +13,10 @@ if [[ -z "${PYTHON_BIN:-}" ]]; then
   fi
 fi
 CONFIG_PATH="${1:-config.toml}"
+EXTRA_ARGS=()
+if (( "$#" > 1 )); then
+  EXTRA_ARGS=("${@:2}")
+fi
 DEPS_MARKER="$VENV_DIR/.deps_installed"
 LOG_DIR="$ROOT_DIR/logs"
 LOG_KEEP_MAX_FILES="${LOG_KEEP_MAX_FILES:-40}"
@@ -93,7 +97,11 @@ if [[ -t 1 ]]; then
   fi
 fi
 
-echo "[run] python run.py --config $CONFIG_PATH"
+EXTRA_DISPLAY=""
+if (( ${#EXTRA_ARGS[@]} > 0 )); then
+  EXTRA_DISPLAY=" ${EXTRA_ARGS[*]}"
+fi
+echo "[run] python run.py --config $CONFIG_PATH$EXTRA_DISPLAY"
 echo "[log] $LOG_FILE"
 echo "[log] retention: max_files=$LOG_KEEP_MAX_FILES max_total_mb=$LOG_KEEP_MAX_TOTAL_MB"
 
@@ -101,11 +109,11 @@ echo "[log] retention: max_files=$LOG_KEEP_MAX_FILES max_total_mb=$LOG_KEEP_MAX_
 if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
   export FORCE_COLOR="${FORCE_COLOR:-1}"
   if command -v perl >/dev/null 2>&1; then
-    python -u run.py --config "$CONFIG_PATH" 2>&1 \
+    python -u run.py --config "$CONFIG_PATH" ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} 2>&1 \
       | tee >(perl -pe 's/\e\[[0-9;]*[A-Za-z]//g' >> "$LOG_FILE")
   else
-    python -u run.py --config "$CONFIG_PATH" 2>&1 | tee -a "$LOG_FILE"
+    python -u run.py --config "$CONFIG_PATH" ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} 2>&1 | tee -a "$LOG_FILE"
   fi
 else
-  python -u run.py --config "$CONFIG_PATH" 2>&1 | tee -a "$LOG_FILE"
+  python -u run.py --config "$CONFIG_PATH" ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} 2>&1 | tee -a "$LOG_FILE"
 fi

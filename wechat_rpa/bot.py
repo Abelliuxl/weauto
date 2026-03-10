@@ -1393,6 +1393,70 @@ class WeChatGuiRpaBot:
         return (has_verb and (has_topic or has_temporal)) or (has_topic and has_temporal) or has_memory_cue
 
     @staticmethod
+    def _is_opinion_prompt(text: str) -> bool:
+        raw = re.sub(r"\s+", " ", (text or "").strip())
+        if not raw:
+            return False
+        markers = (
+            "有何高见",
+            "怎么看",
+            "你怎么看",
+            "看法",
+            "咋看",
+            "怎么评价",
+            "分析一下",
+            "分析下",
+            "说说",
+        )
+        return any(m in raw for m in markers)
+
+    @staticmethod
+    def _extract_lookup_topic_from_context(chat_context: str) -> str:
+        raw = re.sub(r"\s+", " ", (chat_context or "").strip())
+        if not raw:
+            return ""
+        cues = (
+            "新闻",
+            "消息",
+            "分享",
+            "链接",
+            "http",
+            "伊朗",
+            "以色列",
+            "美国",
+            "欧洲",
+            "俄乌",
+            "制裁",
+            "外交",
+            "战争",
+            "公告",
+            "更新",
+        )
+        segments = [seg.strip() for seg in raw.split("|") if seg.strip()]
+        for seg in reversed(segments):
+            clean = re.sub(r"^[A-Za-z]:\s*", "", seg).strip()
+            clean = re.sub(r"^\[[^\]]+\]\s*", "", clean).strip()
+            if not clean:
+                continue
+            if any(c in clean for c in cues):
+                return clean[:80]
+        return ""
+
+    @staticmethod
+    def _is_payment_gate_reply(text: str) -> bool:
+        raw = re.sub(r"\s+", " ", (text or "").strip())
+        if not raw:
+            return False
+        marker_groups = (
+            ("红包", "发个红包", "先发红包"),
+            ("稿费",),
+            ("茶钱",),
+            ("转账", "打钱", "给钱"),
+            ("收费", "付费"),
+        )
+        return any(any(m in raw for m in group) for group in marker_groups)
+
+    @staticmethod
     def _is_deferred_reply_hint(text: str) -> bool:
         raw = re.sub(r"\s+", " ", (text or "").strip())
         if not raw:
@@ -1417,6 +1481,44 @@ class WeChatGuiRpaBot:
             "先转",
         )
         return any(m in raw for m in markers) or any(m in lowered for m in markers)
+
+    def _normalize_planner_reply_hint(
+        self,
+        hint: str,
+        *,
+        reason: str,
+        latest_message: str,
+    ) -> str:
+        raw = re.sub(r"\s+", " ", (hint or "").strip())
+        if not raw:
+            return ""
+        if self._is_payment_gate_reply(raw):
+            return ""
+        if not self._is_deferred_reply_hint(raw):
+            return raw
+
+        latest = re.sub(r"\s+", " ", (latest_message or "").strip())
+        if ("画像" in raw) or ("画像" in latest) or ("bug" in raw.lower()) or ("参数" in raw):
+            return "你说得对，这条是会话画像跑偏了。我按你这条消息重新给结论。"
+        if reason == "mention":
+            return "收到你的@，这条我直接回答，不走延后话术。"
+        return "收到，这条我按正经模式直接处理。"
+
+    @staticmethod
+    def _contextual_fallback_reply(
+        *,
+        reason: str,
+        latest_message: str,
+        fallback: str,
+    ) -> str:
+        latest = re.sub(r"\s+", " ", (latest_message or "").strip())
+        if "画像" in latest:
+            return "你说得对，这里是会话画像跑偏了，我按当前消息重新给结论。"
+        if any(k in latest for k in ("有何高见", "怎么看", "看法", "分析", "为什么", "怎么", "？", "?")):
+            return "这条我不玩梗，按你的问题直接给结论。"
+        if reason == "mention":
+            return "收到你的@，这条我按正经模式直接回复。"
+        return fallback
 
     @staticmethod
     def _has_lookup_observation(text: str) -> bool:
@@ -2841,6 +2943,20 @@ class WeChatGuiRpaBot:
                     ),
                 )
                 clean = self._sanitize_generated_reply(text, fallback=fallback)
+                if self._is_payment_gate_reply(text):
+                    if self.cfg.log_verbose:
+                        print(
+                            f"[reply-filter] payment-gate detected row={row.row_idx:>2} "
+                            f"title={self._fit_col(row.title, 14)} attempt={attempt + 1}/{retries + 1}"
+                        )
+                    avoid.append(re.sub(r"\s+", " ", text).strip()[:90])
+                    if attempt < retries:
+                        continue
+                    clean = self._contextual_fallback_reply(
+                        reason=reason,
+                        latest_message=latest_message or row.preview or row.text or "",
+                        fallback=fallback,
+                    )
                 if self._is_no_reply_signal(clean):
                     if self._is_group_chat(row) and self.cfg.group_allow_llm_no_reply:
                         if self.cfg.log_verbose:
@@ -2958,6 +3074,8 @@ class WeChatGuiRpaBot:
 
         if self._is_no_reply_signal(merged):
             return "[NO_REPLY]"
+        if self._is_payment_gate_reply(merged):
+            return fallback
 
         # If no CJK and no punctuation, treat as low quality.
         if not re.search(r"[\u4e00-\u9fff]", merged):
@@ -3090,6 +3208,148 @@ class WeChatGuiRpaBot:
         msg_w = max(24, self._term_width() - 12)
         print(f"[sent] msg={self._fit_col(message, msg_w)}")
         return message
+
+    def _recover_countdown(self, seconds: int) -> None:
+        total = max(0, int(seconds))
+        if total <= 0:
+            return
+        for remain in range(total, 0, -1):
+            print(f"[recover] start in {remain}")
+            time.sleep(1.0)
+
+    def _detect_active_chat_title(self, bounds: "WindowBounds") -> str:
+        candidates: list[tuple[int, str]] = []
+        for hint in (None, True, False):
+            try:
+                text = self._extract_chat_header_text(bounds, is_group=hint).strip()
+            except Exception:
+                text = ""
+            if not text:
+                continue
+            norm = self._normalize_title_text(text)
+            score = len(norm)
+            if hint is None:
+                score += 2
+            if any("\u4e00" <= ch <= "\u9fff" for ch in text):
+                score += 1
+            candidates.append((score, text[:120]))
+        if not candidates:
+            return ""
+        candidates.sort(key=lambda it: it[0], reverse=True)
+        return candidates[0][1]
+
+    def _recover_virtual_row(self, title: str, page: int) -> ChatRowState:
+        return ChatRowState(
+            row_idx=-1,
+            text="recover",
+            title=(title or "").strip() or "unknown-session",
+            preview="",
+            has_mention=False,
+            has_unread_badge=False,
+            fingerprint=f"recover-{int(time.time())}-{page}",
+            click_x_ratio=0.5,
+            click_y_ratio=0.5,
+        )
+
+    def _recover_wait_next_page(self) -> None:
+        prompt = "[recover] 上滑到更早聊天后按 Enter 继续下一页，Ctrl-C 结束。"
+        try:
+            input(prompt)
+        except EOFError:
+            print("[recover] stdin unavailable, auto-continue in 2s")
+            time.sleep(2.0)
+
+    def run_recover_mode(self, *, countdown_sec: int = 3) -> None:
+        self._last_activity_at = time.time()
+        self._last_heartbeat_at = 0.0
+        page = 0
+        last_title = ""
+        print("[start] recover mode started")
+        print("[start] 每页会执行: 标题识别 -> 聊天截图分析 -> 记忆落盘")
+        print("[start] 完成后请手动上滑聊天记录，再按 Enter 开始下一页")
+        print("[start] Ctrl-C 可随时退出，已写入的记忆会保留")
+
+        try:
+            while True:
+                page += 1
+                print("")
+                print(f"[recover] page={page} ready")
+                self._recover_countdown(countdown_sec)
+
+                try:
+                    self._activate_wechat()
+                    time.sleep(self.cfg.activate_wait_sec)
+                    bounds = get_front_window_bounds(self.cfg.app_name)
+                except Exception as exc:
+                    print(f"[warn] recover window not ready: {exc}")
+                    self._recover_wait_next_page()
+                    page -= 1
+                    continue
+
+                title_ocr = self._detect_active_chat_title(bounds)
+                if title_ocr:
+                    last_title = title_ocr
+                title = title_ocr or last_title or "unknown-session"
+                if not title_ocr:
+                    print(
+                        f"[warn] recover title OCR empty, fallback={self._fit_col(title, 16)}"
+                    )
+
+                row = self._recover_virtual_row(title, page)
+                session_key = self._session_key_for_row(row)
+                sess_before = self._get_or_create_session(session_key)
+                before_count = len(sess_before.history)
+                is_group = self._is_group_chat(row)
+
+                session_context = self._build_session_context(row)
+                session_history = self._build_session_history_text(row)
+                workspace_context = self._workspace_context_for_row(row, is_admin=False)
+                memory_recall = self._workspace_memory_recall_for_row(
+                    row,
+                    title or session_key,
+                    is_admin=False,
+                )
+
+                try:
+                    snapshot = self._extract_chat_context(
+                        bounds,
+                        title=title,
+                        reason="recover",
+                        is_group=is_group,
+                        session_context=session_context,
+                        session_history=session_history,
+                        workspace_context=workspace_context,
+                        memory_recall=memory_recall,
+                        latest_hint="recover_page_scan",
+                        preview="",
+                    )
+                except Exception as exc:
+                    print(f"[warn] recover analyze failed: {exc}")
+                    self._recover_wait_next_page()
+                    continue
+
+                records = list(snapshot.chat_records or [])
+                if records:
+                    self._merge_session_records(row, records, source="recover")
+                if snapshot.memory_summary:
+                    self._apply_session_summary(row, snapshot.memory_summary)
+                self._apply_workspace_memory_update(row, snapshot)
+                self._save_persistent_memory()
+
+                sess_after = self._get_or_create_session(session_key)
+                appended = max(0, len(sess_after.history) - before_count)
+                print(
+                    f"[recover] page={page} done | title={self._fit_col(title, 16)} "
+                    f"| key={self._fit_col(session_key, 12)} | parsed={len(records):>2} | appended={appended:>2}"
+                )
+                if snapshot.last_line:
+                    line_w = max(24, self._term_width() - 18)
+                    print(f"          last={self._fit_col(snapshot.last_line, line_w)}")
+                self._recover_wait_next_page()
+        except KeyboardInterrupt:
+            self._save_persistent_memory()
+            print("")
+            print(f"[recover] stopped | pages={page}")
 
     def run_forever(self) -> None:
         self._last_activity_at = time.time()
@@ -3415,6 +3675,11 @@ class WeChatGuiRpaBot:
                     (latest_user_message or row.preview or row.text or "").strip(),
                 )[:80]
                 lookup_intent = self._is_web_lookup_intent(lookup_query)
+                if not lookup_intent and self._is_opinion_prompt(latest_user_message or row.preview or ""):
+                    topic_query = self._extract_lookup_topic_from_context(chat_context)
+                    if topic_query:
+                        lookup_query = topic_query[:80]
+                        lookup_intent = True
                 if self.cfg.agent_actions_enabled:
                     tools = self._available_agent_tools(is_admin=is_admin)
                     if tools:
@@ -3446,10 +3711,15 @@ class WeChatGuiRpaBot:
                                 if isinstance(plan, dict) and isinstance(plan.get("actions"), list)
                                 else []
                             )
-                            planner_reply_hint = (
+                            planner_reply_hint_raw = (
                                 str(plan.get("reply_hint", "")).strip()
                                 if isinstance(plan, dict)
                                 else ""
+                            )
+                            planner_reply_hint = self._normalize_planner_reply_hint(
+                                planner_reply_hint_raw,
+                                reason=reason,
+                                latest_message=latest_user_message or row.preview or row.text or "",
                             )
                             if self.cfg.log_verbose:
                                 plan_tools = ",".join(
@@ -3466,6 +3736,8 @@ class WeChatGuiRpaBot:
                                     print(
                                         f"             hint={self._fit_col(planner_reply_hint, max(24, self._term_width() - 19))}"
                                     )
+                                elif planner_reply_hint_raw:
+                                    print("             hint=(dropped by normalize)")
                             if lookup_intent and lookup_query:
                                 enforced_actions: list[dict] = []
                                 if self._has_web_search_tool() and ("web_search" in tools):
@@ -3529,12 +3801,29 @@ class WeChatGuiRpaBot:
                                     )
                                 planner_reply_hint = ""
                             if planner_reply_hint and self._is_deferred_reply_hint(planner_reply_hint):
+                                rewritten = self._normalize_planner_reply_hint(
+                                    planner_reply_hint,
+                                    reason=reason,
+                                    latest_message=latest_user_message or row.preview or row.text or "",
+                                )
+                                if rewritten and (not self._is_deferred_reply_hint(rewritten)):
+                                    planner_reply_hint = rewritten
+                                    if self.cfg.log_verbose:
+                                        print(
+                                            f"[agent] normalize deferred reply_hint row={row.row_idx:>2} "
+                                            f"title={self._fit_col(row.title, 14)}"
+                                        )
+                                else:
+                                    planner_reply_hint = self._contextual_fallback_reply(
+                                        reason=reason,
+                                        latest_message=latest_user_message or row.preview or row.text or "",
+                                        fallback="这条我按正经模式处理。",
+                                    )
                                 if self.cfg.log_verbose:
                                     print(
-                                        f"[agent] drop deferred reply_hint row={row.row_idx:>2} "
+                                        f"[agent] rewrite deferred reply_hint row={row.row_idx:>2} "
                                         f"title={self._fit_col(row.title, 14)}"
                                     )
-                                planner_reply_hint = ""
                             if lookup_intent and (not observations):
                                 planned_reply = "我刚试着查了，但这轮没拿到可用结果（可能检索接口异常）。要不要我立刻换关键词再查一次？"
                             if planner_reply_hint and not planned_reply:

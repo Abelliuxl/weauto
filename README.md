@@ -36,6 +36,12 @@ WeAuto 是一个仅基于 GUI 的微信自动化项目，核心能力是：
 ./start_rpa.sh config.toml
 ```
 
+恢复记忆模式（手动翻页，逐页截图分析并写入记忆）：
+
+```bash
+./start_rpa.sh config.toml recover
+```
+
 `start_rpa.sh` 会自动：
 
 - 创建并使用 `.venv312`
