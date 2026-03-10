@@ -1718,6 +1718,19 @@ class LlmReplyGenerator:
         except Exception as exc:
             raise RuntimeError(f"llm decision parse error: {exc}; raw={content}")
 
+    def _sarcasm_style_guard(self) -> str:
+        level = str(getattr(self.cfg, "sarcasm_level", "low")).strip().lower()
+        if level == "off":
+            return "阴阳强度=off：保持自然直接，不用阴阳。"
+        if level == "high":
+            return (
+                "阴阳强度=high：可明显带点阴阳味和轻微犯贱（最多 2 句短句），"
+                "但别低俗、别刷屏。"
+            )
+        if level == "medium":
+            return "阴阳强度=medium：可带一点阴阳味（建议 1 句内），保持活人感。"
+        return "阴阳强度=low：可偶尔轻微阴阳（点到即止），以自然交流为主。"
+
     def generate(
         self,
         title: str,
@@ -1757,6 +1770,12 @@ class LlmReplyGenerator:
                 "最新维护公告、或已联网核实；也不要把记忆检索、截图内容、历史对话包装成"
                 "外部搜索结果。若对方追问你是否用了websearch，必须如实表述这次没有联网核验。"
             )
+        sarcasm_guard = self._sarcasm_style_guard()
+        task_guard = (
+            "执行约束：无论语气是否阴阳，用户明确要求做的事要优先做到；"
+            "不要只口头答应“去查/去做”却不给结果。"
+            "做不到时要明确说明卡点和下一步。"
+        )
         user_prompt = (
             f"触发原因: {reason}\n"
             f"会话标题: {title or '未知'}\n"
@@ -1768,7 +1787,10 @@ class LlmReplyGenerator:
             f"工作区规则与人格: {workspace_context or '无'}\n"
             f"相关记忆检索: {memory_recall or '无'}\n"
             "回复风格硬约束：自然口语优先，禁止在句首或整句写括号动作描写（如“（...）”）；"
-            "全句最多使用 1 个 emoji，能不用就不用；避免夸张拟人舞台腔。\n"
+            "全句最多使用 1 个 emoji，能不用就不用；避免夸张拟人舞台腔。"
+            f"{sarcasm_guard}"
+            "遇到严肃求助或情绪敏感场景时，自动降低阴阳强度，优先清晰结论。\n"
+            f"{task_guard}\n"
             "请直接输出回复内容，不要解释。"
             + (
                 "如果判断当前不该回复，请仅输出 [NO_REPLY]。"

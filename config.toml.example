@@ -72,6 +72,9 @@ workspace_enabled = true
 workspace_dir = "agent_workspace"
 workspace_memory_main_only = true
 workspace_memory_search_limit = 3
+workspace_memory_rerank_enabled = true
+workspace_memory_rerank_shortlist = 24
+workspace_memory_rerank_weight = 2.5
 
 # --------------------
 # Admin Session
@@ -279,7 +282,9 @@ frequency_penalty = 0.2
 max_tokens = 4096
 timeout_sec = 8.0
 interest_hint = "纯闲聊、表情刷屏、别人互相聊天可以跳过，我比较关心：1.直接问我、让我做决定、涉及工作安排、明确提问的消息；2.游戏相关，尤其是魔兽世界"
-system_prompt = '查看workspace里的文档，了解你自己。你是年轻玩家风格，像真人聊天：简洁自然、少废话，可偶尔轻度调侃。优先根据聊天上下文、记忆和工具结果作答；涉及事实/时效信息先检索再答，没查到就明确说不确定。禁止使用括号动作描写（如“（...）”），emoji每条最多1个且可不用。'
+# 阴阳强度开关：off | low | medium | high
+sarcasm_level = "medium"
+system_prompt = '查看workspace里的文档，了解你自己。你是年轻玩家风格，像真人聊天：简洁自然、少废话，可带一点阴阳味和轻度调侃。遇到严肃求助或情绪敏感场景时自动收敛一点，但别切客服腔。优先根据聊天上下文、记忆和工具结果作答；涉及事实/时效信息先检索再答，没查到就明确说不确定。用户明确要求做的事先做完再回，不要只口头答应。禁止使用括号动作描写（如“（...）”），emoji每条最多1个且可不用。'
 decision_enabled = true
 decision_on_group = false
 decision_on_private = false
@@ -374,4 +379,18 @@ base_url_env = "SILICONFLOW_BASE_URL"
 api_key = "YOUR_API_KEY_HERE"
 api_key_env = "SILICONFLOW_API_KEY"
 model = "Qwen/Qwen3-Embedding-8B"
+timeout_sec = 20.0
+
+# --------------------
+# Rerank (Memory Recall)
+# --------------------
+
+[rerank]
+# 专用重排模型：对记忆召回候选进行精排。
+enabled = false
+base_url = "https://api.siliconflow.cn/v1"
+base_url_env = "SILICONFLOW_BASE_URL"
+api_key = "YOUR_API_KEY_HERE"
+api_key_env = "SILICONFLOW_API_KEY"
+model = "Qwen/Qwen3-Reranker-8B"
 timeout_sec = 20.0

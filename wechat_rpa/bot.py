@@ -173,6 +173,10 @@ class WeChatGuiRpaBot:
             self.cfg.workspace_dir,
             enabled=self.cfg.workspace_enabled,
             embedding_cfg=self.cfg.embedding,
+            rerank_cfg=self.cfg.rerank,
+            memory_rerank_enabled=self.cfg.workspace_memory_rerank_enabled,
+            memory_rerank_shortlist=self.cfg.workspace_memory_rerank_shortlist,
+            memory_rerank_weight=self.cfg.workspace_memory_rerank_weight,
         )
         self._workspace.ensure_bootstrap_files()
         self._cycle = 0
@@ -3103,6 +3107,7 @@ class WeChatGuiRpaBot:
             f"summary={self.cfg.llm_summary.model} "
             f"heartbeat={self.cfg.llm_heartbeat.model}"
         )
+        print(f"[start] tone: sarcasm_level={self.cfg.llm_reply.sarcasm_level}")
         admin_titles = ",".join(self.cfg.admin_session_titles) if self.cfg.admin_session_titles else "-"
         admin_w = max(24, self._term_width() - 17)
         path_w = max(20, self._term_width() - 35)
@@ -3122,6 +3127,7 @@ class WeChatGuiRpaBot:
             f"max_actions={self.cfg.heartbeat_max_actions}"
         )
         print(f"[start] web-search: {self._web_search_status_text()}")
+        print(f"[start] rerank: {self._workspace.rerank_status_text()}")
         print(f"        admin={self._fit_col(admin_titles, admin_w)}")
         while True:
             self._cycle += 1

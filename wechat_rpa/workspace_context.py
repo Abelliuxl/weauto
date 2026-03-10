@@ -12,7 +12,7 @@ import time
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 
-from .config import EmbeddingConfig
+from .config import EmbeddingConfig, RerankConfig
 
 
 _DEFAULT_FILES: dict[str, str] = {
@@ -113,6 +113,10 @@ class WorkspaceContextManager:
         *,
         enabled: bool = True,
         embedding_cfg: EmbeddingConfig | None = None,
+        rerank_cfg: RerankConfig | None = None,
+        memory_rerank_enabled: bool = False,
+        memory_rerank_shortlist: int = 24,
+        memory_rerank_weight: float = 2.5,
     ) -> None:
         self.enabled = bool(enabled)
         self.root = Path(root)
@@ -120,8 +124,25 @@ class WorkspaceContextManager:
         self.session_dir = self.memory_dir / "sessions"
         self.session_state_dir = self.memory_dir / "session_state"
         self.embedding_cfg = embedding_cfg or EmbeddingConfig()
+        self.rerank_cfg = rerank_cfg or RerankConfig()
+        self.memory_rerank_enabled = bool(memory_rerank_enabled)
+        self.memory_rerank_shortlist = max(1, int(memory_rerank_shortlist))
+        self.memory_rerank_weight = max(0.0, float(memory_rerank_weight))
         self._embedding_cache: dict[str, list[float] | None] = {}
         self._embedding_warned = False
+        self._rerank_warned = False
+
+    def rerank_status_text(self) -> str:
+        if not self.memory_rerank_enabled:
+            return "disabled (workspace_memory_rerank_enabled=false)"
+        reason = self._rerank_unavailable_reason()
+        if reason:
+            return f"disabled ({reason})"
+        return (
+            f"enabled model={self.rerank_cfg.model} "
+            f"shortlist={self.memory_rerank_shortlist} "
+            f"weight={self.memory_rerank_weight:.2f}"
+        )
 
     def ensure_bootstrap_files(self) -> None:
         if not self.enabled:
@@ -552,6 +573,12 @@ class WorkspaceContextManager:
             hits.extend(self._score_file(path, content, clean_query))
 
         hits.sort(key=lambda item: item.score, reverse=True)
+        if hits and self.memory_rerank_enabled:
+            hits = self._rerank_memory_hits(
+                clean_query,
+                hits,
+                limit=max(1, limit),
+            )
         lines: list[str] = []
         seen: set[str] = set()
         for hit in hits:
@@ -563,6 +590,72 @@ class WorkspaceContextManager:
             if len(lines) >= max(1, limit):
                 break
         return "\n".join(lines)[:2400]
+
+    def _rerank_memory_hits(
+        self,
+        query: str,
+        hits: list[MemoryHit],
+        *,
+        limit: int,
+    ) -> list[MemoryHit]:
+        shortlist_size = max(limit, self.memory_rerank_shortlist)
+        shortlist: list[MemoryHit] = []
+        seen: set[str] = set()
+        for hit in hits:
+            key = f"{hit.path}|{hit.snippet}"
+            if key in seen:
+                continue
+            seen.add(key)
+            shortlist.append(hit)
+            if len(shortlist) >= shortlist_size:
+                break
+        if len(shortlist) < 2:
+            return hits
+
+        started = time.perf_counter()
+        backend = "none"
+        scores_by_index: dict[int, float] = {}
+        if self._rerank_enabled():
+            scores_by_index = self._rerank_index_scores(
+                query,
+                [item.snippet for item in shortlist],
+            )
+            if scores_by_index:
+                backend = "model"
+        if (not scores_by_index) and self._embedding_enabled():
+            embedding_scores = self._embedding_similarity_map(
+                query,
+                [item.snippet for item in shortlist],
+            )
+            if embedding_scores:
+                backend = "embedding"
+                scores_by_index = {
+                    idx: float(embedding_scores.get(item.snippet, 0.0) or 0.0)
+                    for idx, item in enumerate(shortlist)
+                }
+        elapsed = time.perf_counter() - started
+
+        if not scores_by_index:
+            print(
+                f"[memory-rerank] backend={backend} query={self._clip_text(query, 40)!r} "
+                f"candidates={len(shortlist)} scored=0 elapsed={elapsed:.2f}s"
+            )
+            return hits
+
+        weighted: list[tuple[float, MemoryHit]] = []
+        for idx, item in enumerate(shortlist):
+            extra = float(scores_by_index.get(idx, 0.0) or 0.0)
+            weighted.append((float(item.score) + extra * self.memory_rerank_weight, item))
+        weighted.sort(key=lambda pair: pair[0], reverse=True)
+        reordered = [item for _, item in weighted]
+        shortlisted_keys = {f"{item.path}|{item.snippet}" for item in shortlist}
+        tail = [item for item in hits if f"{item.path}|{item.snippet}" not in shortlisted_keys]
+        print(
+            f"[memory-rerank] backend={backend} query={self._clip_text(query, 40)!r} "
+            f"candidates={len(shortlist)} scored={len(scores_by_index)} "
+            f"elapsed={elapsed:.2f}s weight={self.memory_rerank_weight:.2f}"
+        )
+        return reordered + tail
 
     def _candidate_files(self, *, session_key: str, include_global: bool) -> list[Path]:
         out: list[Path] = []
@@ -1174,6 +1267,137 @@ class WorkspaceContextManager:
         if self.embedding_cfg.api_key_env:
             return os.getenv(self.embedding_cfg.api_key_env, "")
         return ""
+
+    def _rerank_api_key(self) -> str:
+        if self.rerank_cfg.api_key:
+            return self.rerank_cfg.api_key
+        if self.rerank_cfg.api_key_env:
+            return os.getenv(self.rerank_cfg.api_key_env, "")
+        return ""
+
+    def _rerank_unavailable_reason(self) -> str:
+        if not self.enabled:
+            return "workspace disabled"
+        if not self.memory_rerank_enabled:
+            return "workspace_memory_rerank_enabled=false"
+        if not self.rerank_cfg.enabled:
+            return "rerank.enabled=false"
+        if not self.rerank_cfg.base_url:
+            return "missing rerank base_url"
+        if not self.rerank_cfg.model:
+            return "missing rerank model"
+        if not self._rerank_api_key():
+            return "missing rerank api_key"
+        return ""
+
+    def _rerank_enabled(self) -> bool:
+        return self._rerank_unavailable_reason() == ""
+
+    def _rerank_index_scores(self, query: str, documents: list[str]) -> dict[int, float]:
+        if not self._rerank_enabled():
+            return {}
+        clean_query = self._clip_text(query, 240)
+        docs: list[str] = []
+        doc_positions: list[int] = []
+        for idx, text in enumerate(documents):
+            clean = self._clip_text(text, 320)
+            if not clean:
+                continue
+            docs.append(clean)
+            doc_positions.append(idx)
+        if not clean_query or (not docs):
+            return {}
+        payload = json.dumps(
+            {
+                "model": self.rerank_cfg.model,
+                "query": clean_query,
+                "documents": docs,
+                "top_n": len(docs),
+                "return_documents": False,
+            },
+            ensure_ascii=False,
+        ).encode("utf-8")
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self._rerank_api_key()}",
+        }
+        url = self.rerank_cfg.base_url.rstrip("/") + "/rerank"
+        timeout_sec = max(2.0, float(self.rerank_cfg.timeout_sec))
+        max_attempts = 2
+        raw = ""
+        last_exc: Exception | None = None
+        last_elapsed = 0.0
+        for attempt in range(1, max_attempts + 1):
+            started = time.perf_counter()
+            req = urllib_request.Request(url, data=payload, headers=headers, method="POST")
+            try:
+                with urllib_request.urlopen(req, timeout=timeout_sec) as resp:
+                    raw = resp.read().decode("utf-8", errors="ignore")
+                last_exc = None
+                break
+            except (urllib_error.URLError, TimeoutError, OSError, ValueError) as exc:
+                last_exc = exc
+                last_elapsed = time.perf_counter() - started
+                if self._is_timeout_error(exc) and attempt < max_attempts:
+                    continue
+                if not self._rerank_warned:
+                    print(
+                        "[warn] memory rerank request failed, fallback: "
+                        f"elapsed={last_elapsed:.2f}s timeout={timeout_sec:.1f}s "
+                        f"inputs={len(docs)} attempt={attempt}/{max_attempts} err={exc}"
+                    )
+                    self._rerank_warned = True
+                return {}
+
+        if last_exc is not None:
+            if not self._rerank_warned:
+                print(
+                    "[warn] memory rerank request failed, fallback: "
+                    f"elapsed={last_elapsed:.2f}s timeout={timeout_sec:.1f}s "
+                    f"inputs={len(docs)} attempts={max_attempts} err={last_exc}"
+                )
+                self._rerank_warned = True
+            return {}
+
+        try:
+            data = json.loads(raw)
+        except Exception:
+            if not self._rerank_warned:
+                print("[warn] memory rerank response invalid, fallback")
+                self._rerank_warned = True
+            return {}
+
+        items: list | None = None
+        if isinstance(data, dict):
+            for key in ("results", "data", "output", "rerank"):
+                value = data.get(key)
+                if isinstance(value, list):
+                    items = value
+                    break
+        elif isinstance(data, list):
+            items = data
+        if not isinstance(items, list):
+            if not self._rerank_warned:
+                print("[warn] memory rerank payload missing results, fallback")
+                self._rerank_warned = True
+            return {}
+
+        out: dict[int, float] = {}
+        for pos, item in enumerate(items):
+            if not isinstance(item, dict):
+                continue
+            try:
+                index = int(item.get("index", pos))
+            except Exception:
+                index = pos
+            raw_score = item.get("relevance_score", item.get("score", item.get("similarity", 0.0)))
+            try:
+                score = float(raw_score)
+            except Exception:
+                score = 0.0
+            if 0 <= index < len(doc_positions):
+                out[doc_positions[index]] = score
+        return out
 
     def _embedding_enabled(self) -> bool:
         return bool(

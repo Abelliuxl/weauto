@@ -79,6 +79,8 @@ class LlmConfig:
     max_tokens: int = 0
     timeout_sec: float = 20.0
     interest_hint: str = ""
+    # Reply sarcasm style: off | low | medium | high
+    sarcasm_level: str = "low"
     system_prompt: str = (
         "你是微信助手。请基于给定会话标题和预览内容生成简短、礼貌、自然的中文回复，"
         "长度控制在1-2句，不要编造事实。"
@@ -153,6 +155,17 @@ class EmbeddingConfig:
 
 
 @dataclass
+class RerankConfig:
+    enabled: bool = False
+    base_url: str = "https://api.siliconflow.cn/v1"
+    base_url_env: str = "SILICONFLOW_BASE_URL"
+    api_key: str = ""
+    api_key_env: str = "SILICONFLOW_API_KEY"
+    model: str = "Qwen/Qwen3-Reranker-8B"
+    timeout_sec: float = 12.0
+
+
+@dataclass
 class AppConfig:
     app_name: str = "WeChat"
     poll_interval_sec: float = 2.0
@@ -186,6 +199,9 @@ class AppConfig:
     workspace_dir: str = "agent_workspace"
     workspace_memory_main_only: bool = True
     workspace_memory_search_limit: int = 3
+    workspace_memory_rerank_enabled: bool = False
+    workspace_memory_rerank_shortlist: int = 24
+    workspace_memory_rerank_weight: float = 2.5
     admin_commands_enabled: bool = True
     admin_session_titles: list[str] = field(default_factory=lambda: ["example_admin"])
     admin_command_prefix: str = "/"
@@ -277,6 +293,7 @@ class AppConfig:
     llm_heartbeat: LlmConfig = field(default_factory=LlmConfig)
     vision: VisionConfig = field(default_factory=VisionConfig)
     embedding: EmbeddingConfig = field(default_factory=EmbeddingConfig)
+    rerank: RerankConfig = field(default_factory=RerankConfig)
 
 
 def _load_region(data: dict, key: str, default: RegionRatio) -> RegionRatio:
@@ -316,6 +333,19 @@ def _load_openai_think_mode(raw: object, default: str = "default") -> str:
     return "default"
 
 
+def _load_sarcasm_level(raw: object, default: str = "low") -> str:
+    value = str(raw if raw is not None else default).strip().lower()
+    if value in ("off", "none", "0", "false", "disable", "disabled", "no", "关", "关闭"):
+        return "off"
+    if value in ("low", "1", "mild", "light", "轻", "轻度"):
+        return "low"
+    if value in ("medium", "mid", "2", "normal", "default", "auto", "中", "中等"):
+        return "medium"
+    if value in ("high", "3", "strong", "heavy", "高", "重"):
+        return "high"
+    return _load_sarcasm_level(default, "low") if value != default else "low"
+
+
 def _load_llm_config(raw_obj: object, default: LlmConfig) -> LlmConfig:
     raw = raw_obj if isinstance(raw_obj, dict) else {}
     base_url = str(raw.get("base_url", default.base_url)).strip().rstrip("/")
@@ -344,6 +374,10 @@ def _load_llm_config(raw_obj: object, default: LlmConfig) -> LlmConfig:
         max_tokens=int(raw.get("max_tokens", default.max_tokens)),
         timeout_sec=float(raw.get("timeout_sec", default.timeout_sec)),
         interest_hint=str(raw.get("interest_hint", default.interest_hint)),
+        sarcasm_level=_load_sarcasm_level(
+            raw.get("sarcasm_level", default.sarcasm_level),
+            default.sarcasm_level,
+        ),
         system_prompt=str(raw.get("system_prompt", default.system_prompt)),
         decision_enabled=bool(raw.get("decision_enabled", default.decision_enabled)),
         decision_on_group=bool(raw.get("decision_on_group", default.decision_on_group)),
@@ -448,6 +482,19 @@ def load_config(path: str | Path | None) -> AppConfig:
     cfg.workspace_memory_search_limit = int(
         data.get("workspace_memory_search_limit", cfg.workspace_memory_search_limit)
     )
+    cfg.workspace_memory_rerank_enabled = bool(
+        data.get("workspace_memory_rerank_enabled", cfg.workspace_memory_rerank_enabled)
+    )
+    cfg.workspace_memory_rerank_shortlist = int(
+        data.get("workspace_memory_rerank_shortlist", cfg.workspace_memory_rerank_shortlist)
+    )
+    cfg.workspace_memory_rerank_weight = float(
+        data.get("workspace_memory_rerank_weight", cfg.workspace_memory_rerank_weight)
+    )
+    if cfg.workspace_memory_rerank_shortlist < 1:
+        cfg.workspace_memory_rerank_shortlist = 1
+    if cfg.workspace_memory_rerank_weight < 0.0:
+        cfg.workspace_memory_rerank_weight = 0.0
     cfg.admin_commands_enabled = bool(
         data.get("admin_commands_enabled", cfg.admin_commands_enabled)
     )
@@ -691,6 +738,25 @@ def load_config(path: str | Path | None) -> AppConfig:
     )
     if not cfg.embedding.base_url:
         cfg.embedding.base_url = "https://api.siliconflow.cn/v1"
+
+    rerank_raw = data.get("rerank", {})
+    rerank_base_url = str(rerank_raw.get("base_url", cfg.rerank.base_url)).strip().rstrip("/")
+    rerank_base_url_env = str(
+        rerank_raw.get("base_url_env", cfg.rerank.base_url_env)
+    ).strip()
+    if (not rerank_base_url) and rerank_base_url_env:
+        rerank_base_url = str(os.getenv(rerank_base_url_env, "")).strip().rstrip("/")
+    cfg.rerank = RerankConfig(
+        enabled=bool(rerank_raw.get("enabled", cfg.rerank.enabled)),
+        base_url=rerank_base_url,
+        base_url_env=rerank_base_url_env,
+        api_key=str(rerank_raw.get("api_key", cfg.rerank.api_key)),
+        api_key_env=str(rerank_raw.get("api_key_env", cfg.rerank.api_key_env)),
+        model=str(rerank_raw.get("model", cfg.rerank.model)),
+        timeout_sec=float(rerank_raw.get("timeout_sec", cfg.rerank.timeout_sec)),
+    )
+    if not cfg.rerank.base_url:
+        cfg.rerank.base_url = "https://api.siliconflow.cn/v1"
     if cfg.heartbeat_interval_sec < 5.0:
         cfg.heartbeat_interval_sec = 5.0
     if cfg.heartbeat_min_idle_sec < 0.0:
