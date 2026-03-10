@@ -31,7 +31,7 @@
   - 文件工作区初始化
   - `AGENTS.md` / `SOUL.md` / `MEMORY.md` 等 bootstrap 文件维护
   - 长期记忆、每日记忆、会话记忆写入
-  - 简单本地检索，把相关记忆片段注入 Vision/LLM
+  - 记忆检索：SQLite(Fts5)+embedding+rerank（不可用时回退文件检索）
 
 - `wechat_rpa/bot.py`
   - 主循环状态机
@@ -47,6 +47,7 @@
 5. 必要时聚焦目标会话并截图 `[chat_context_region]`
 6. Vision 输出 `context + environment` JSON（不产出 reply，不做 should_reply 判断）
 7. 文本 LLM 基于 `context + environment + workspace/context/memory` 做 reply/skip 决策并生成回复
+8. planner 采用多轮循环（plan -> tool -> observation -> re-plan），直到动作预算或收敛条件命中
 8. GUI 点击输入并发送
 9. 更新 baseline、会话完整历史、摘要、每日记忆和持久化文件
 10. 无消息事件时可选进入 heartbeat 分支，执行固定间隔的自驱工具任务

@@ -86,12 +86,26 @@
 | `workspace_dir` | `"agent_workspace"` | 工作区目录，保存规则和 Markdown 记忆 |
 | `workspace_memory_main_only` | `true` | 是否仅管理员会话可读取全局长期记忆 |
 | `workspace_memory_search_limit` | `3` | 每次检索注入多少条相关记忆 |
+| `workspace_memory_rerank_enabled` | `false` | 是否启用记忆重排（模型或 embedding 回退） |
+| `workspace_memory_rerank_shortlist` | `24` | 重排候选池大小 |
+| `workspace_memory_rerank_weight` | `2.5` | 重排分数融合权重 |
+| `workspace_memory_sqlite_enabled` | `false` | 是否启用 SQLite 记忆索引（FTS+向量增强） |
+| `workspace_memory_sqlite_path` | `"data/workspace_memory.sqlite3"` | SQLite 索引文件路径 |
+| `workspace_memory_sqlite_sync_interval_sec` | `20.0` | 自动增量同步最小间隔（秒） |
+| `workspace_memory_sqlite_fts_limit` | `64` | FTS 初召回候选上限 |
+| `workspace_memory_sqlite_vector_limit` | `24` | embedding 打分候选上限 |
+| `workspace_memory_sqlite_chunk_chars` | `320` | 建索引切块最大字符数 |
 | `admin_commands_enabled` | `true` | 是否启用管理员命令 |
 | `admin_session_titles` | `["example_admin"]` | 管理员会话标题白名单 |
 | `admin_command_prefix` | `"/"` | 管理命令前缀 |
 | `agent_actions_enabled` | `true` | 是否启用 LLM 工具规划与执行 |
 | `agent_actions_max_per_turn` | `2` | 每轮最多执行工具动作数 |
 | `agent_actions_fail_open` | `true` | 工具规划失败时是否继续主流程 |
+| `agent_plan_loop_enabled` | `true` | 是否启用多轮工具规划循环 |
+| `agent_plan_max_rounds` | `3` | 单次触发最多规划轮数 |
+| `agent_plan_max_total_actions` | `6` | 单次触发工具总动作预算 |
+| `agent_plan_repeat_limit` | `2` | 相同 tool+args 的最大重复次数 |
+| `agent_plan_observation_max_chars` | `5200` | 规划器可见工具观察文本上限 |
 | `heartbeat_enabled` | `false` | 是否启用心跳（固定间隔自驱任务） |
 | `heartbeat_interval_sec` | `1800.0` | 心跳触发间隔（秒） |
 | `heartbeat_min_idle_sec` | `20.0` | 至少空闲多久后才跑心跳（秒） |

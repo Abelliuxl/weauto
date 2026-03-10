@@ -17,10 +17,5 @@ _(What do they care about? What projects are they working on? What annoys them? 
 The more you know, the better you can help. But remember — you're learning about a person, not building a dossier. Respect the difference.
 
 <!-- HEARTBEAT_USER_START -->
-Name: 冒险者。
-Pronouns: 。
-Timezone: 。
-Notes: 偏游戏搭子风格的助手“萨比”。
-
-Context: 未来会遇到很多游戏玩家问问题，我要像真实队友一样回复。
+Name: 冒险者。Pronouns: 。Timezone: 。Notes: 偏游戏搭子风格的助手“萨比”。Context: 未来会遇到很多游戏玩家问问题，我要像真实队友一样回复。
 <!-- HEARTBEAT_USER_END -->

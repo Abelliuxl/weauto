@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import builtins
+import concurrent.futures
 import json
 import os
 import ssl
@@ -216,6 +217,73 @@ class LlmReplyGenerator:
             opt.pop("num_predict", None)
             patched["options"] = opt
         return patched
+
+    @staticmethod
+    def _coerce_int(value: object) -> int | None:
+        try:
+            return int(value)  # type: ignore[arg-type]
+        except Exception:
+            return None
+
+    @staticmethod
+    def _usage_triplet_from_response(data: dict) -> tuple[int | None, int | None, int | None, int | None]:
+        # OpenAI-compatible usage shape.
+        usage = data.get("usage")
+        if isinstance(usage, dict):
+            prompt = LlmReplyGenerator._coerce_int(
+                usage.get("prompt_tokens", usage.get("input_tokens"))
+            )
+            completion = LlmReplyGenerator._coerce_int(
+                usage.get("completion_tokens", usage.get("output_tokens"))
+            )
+            total = LlmReplyGenerator._coerce_int(usage.get("total_tokens"))
+            if total is None and (prompt is not None or completion is not None):
+                total = (prompt or 0) + (completion or 0)
+            cached = None
+            for key in ("prompt_tokens_details", "input_tokens_details"):
+                detail = usage.get(key)
+                if isinstance(detail, dict):
+                    cached = LlmReplyGenerator._coerce_int(detail.get("cached_tokens"))
+                    if cached is not None:
+                        break
+            return prompt, completion, total, cached
+
+        # Ollama native shape.
+        prompt = LlmReplyGenerator._coerce_int(data.get("prompt_eval_count"))
+        completion = LlmReplyGenerator._coerce_int(data.get("eval_count"))
+        total = None
+        if prompt is not None or completion is not None:
+            total = (prompt or 0) + (completion or 0)
+        return prompt, completion, total, None
+
+    @staticmethod
+    def _fmt_usage_value(value: int | None) -> str:
+        return str(value) if value is not None else "-"
+
+    @staticmethod
+    def _clip_model_name(name: str, limit: int = 80) -> str:
+        clean = re.sub(r"\s+", " ", str(name or "").strip())
+        if not clean:
+            return "-"
+        if len(clean) <= limit:
+            return clean
+        return clean[:limit] + "..."
+
+    def _log_usage_line(self, *, label: str, data: dict, request_model: str) -> None:
+        model_name = self._clip_model_name(str(data.get("model", "")).strip() or request_model)
+        prompt, completion, total, cached = self._usage_triplet_from_response(data)
+        if prompt is None and completion is None and total is None:
+            print(f"[usage] {label} model={model_name} prompt=- completion=- total=-")
+            return
+        msg = (
+            f"[usage] {label} model={model_name} "
+            f"prompt={self._fmt_usage_value(prompt)} "
+            f"completion={self._fmt_usage_value(completion)} "
+            f"total={self._fmt_usage_value(total)}"
+        )
+        if cached is not None:
+            msg += f" cached={cached}"
+        print(msg)
 
     @staticmethod
     def _is_response_format_unsupported(exc: Exception) -> bool:
@@ -633,7 +701,9 @@ class LlmReplyGenerator:
         payload: dict,
         label: str,
         extra_headers: dict[str, str] | None = None,
+        request_model: str = "",
     ) -> dict:
+        model_name = str(request_model or payload.get("model", "")).strip()
         last_error: RuntimeError | None = None
         for attempt in (1, 2):
             resp_text = self._request_text(
@@ -643,6 +713,7 @@ class LlmReplyGenerator:
                 payload=payload,
                 label=label,
                 extra_headers=extra_headers,
+                model=model_name,
             )
             clean = str(resp_text or "").strip()
             if not clean:
@@ -653,6 +724,11 @@ class LlmReplyGenerator:
                 try:
                     data = json.loads(clean)
                     if isinstance(data, dict):
+                        self._log_usage_line(
+                            label=label,
+                            data=data,
+                            request_model=model_name,
+                        )
                         return data
                     last_error = RuntimeError(
                         f"{label} response is not json object: {type(data).__name__}"
@@ -677,6 +753,7 @@ class LlmReplyGenerator:
         payload: dict,
         label: str,
         extra_headers: dict[str, str] | None = None,
+        model: str = "",
     ) -> str:
         request_payload = self._drop_token_limits(payload)
         if self._is_debug_payload_enabled(label):
@@ -705,12 +782,31 @@ class LlmReplyGenerator:
             headers=headers,
         )
         started = time.monotonic()
+        model_name = self._clip_model_name(model)
+        progress_interval_sec = 1.0
         try:
-            ssl_ctx = ssl.create_default_context(cafile=certifi.where())
-            with urllib.request.urlopen(req, timeout=timeout_sec, context=ssl_ctx) as resp:
-                resp_text = resp.read().decode("utf-8", errors="replace")
+            def _do_request() -> str:
+                ssl_ctx = ssl.create_default_context(cafile=certifi.where())
+                with urllib.request.urlopen(req, timeout=timeout_sec, context=ssl_ctx) as resp:
+                    return resp.read().decode("utf-8", errors="replace")
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(_do_request)
+                while True:
+                    try:
+                        resp_text = future.result(timeout=progress_interval_sec)
+                        break
+                    except concurrent.futures.TimeoutError:
+                        elapsed_live = time.monotonic() - started
+                        print(
+                            f"[timing] {label} model={model_name} "
+                            f"running={elapsed_live:.0f}s timeout={float(timeout_sec):.1f}s"
+                        )
             elapsed = time.monotonic() - started
-            print(f"[timing] {label} elapsed={elapsed:.2f}s timeout={float(timeout_sec):.1f}s")
+            print(
+                f"[timing] {label} model={model_name} "
+                f"elapsed={elapsed:.2f}s timeout={float(timeout_sec):.1f}s"
+            )
             if self._is_debug_response_enabled(label):
                 preview = self._preview_text(resp_text, limit=120000)
                 print(
@@ -1876,6 +1972,8 @@ class LlmReplyGenerator:
             "输出格式必须是："
             '{"actions":[{"tool":"...","args":{},"reason":"<=40字"}],"reply_hint":"<=120字"}。'
             "如果不需要动作，actions 返回空数组。reply_hint 可空串。"
+            "若输入中已包含工具观察结果，可继续规划下一步动作；"
+            "但禁止重复输出同一个 tool+args。"
         )
         user_prompt = (
             f"会话类型: {'群聊' if is_group else '私聊'}\n"
@@ -1895,7 +1993,8 @@ class LlmReplyGenerator:
             + "3) 对用户可见回复由主回复链路处理，这里只规划动作与 reply_hint。\n"
             + "4) reply_hint 必须是可直接发送给对方的中文短句；不能写策略说明、语气说明、风格说明，"
             + "不能写类似“顺着这个话题调侃”“用轻松语气回一句”“符合群聊氛围”这样的元提示。\n"
-            + "5) reply_hint 不能索要红包/稿费/转账，不能以先给条件为前提拒绝回答。"
+            + "5) reply_hint 不能索要红包/稿费/转账，不能以先给条件为前提拒绝回答。\n"
+            + "6) 如果已有检索结果仍不足，请换关键词继续检索，不要机械重复同一参数。"
         )
         payload = {
             "model": self.cfg.model,

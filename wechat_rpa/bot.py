@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+import concurrent.futures
 from dataclasses import dataclass
 from datetime import datetime
 from difflib import SequenceMatcher
@@ -189,6 +190,12 @@ class WeChatGuiRpaBot:
             memory_rerank_enabled=self.cfg.workspace_memory_rerank_enabled,
             memory_rerank_shortlist=self.cfg.workspace_memory_rerank_shortlist,
             memory_rerank_weight=self.cfg.workspace_memory_rerank_weight,
+            memory_sqlite_enabled=self.cfg.workspace_memory_sqlite_enabled,
+            memory_sqlite_path=self.cfg.workspace_memory_sqlite_path,
+            memory_sqlite_sync_interval_sec=self.cfg.workspace_memory_sqlite_sync_interval_sec,
+            memory_sqlite_fts_limit=self.cfg.workspace_memory_sqlite_fts_limit,
+            memory_sqlite_vector_limit=self.cfg.workspace_memory_sqlite_vector_limit,
+            memory_sqlite_chunk_chars=self.cfg.workspace_memory_sqlite_chunk_chars,
         )
         self._workspace.ensure_bootstrap_files()
         self._cycle = 0
@@ -1851,6 +1858,341 @@ class WeChatGuiRpaBot:
             return False
         return ("网页检索[" in raw) or ("记忆检索[" in raw)
 
+    @staticmethod
+    def _action_args_preview(args: dict, *, limit: int = 110) -> str:
+        try:
+            text = json.dumps(args or {}, ensure_ascii=False, sort_keys=True)
+        except Exception:
+            text = "{}"
+        compact = re.sub(r"\s+", " ", str(text)).strip()
+        if len(compact) > limit:
+            return compact[:limit] + "..."
+        return compact
+
+    def _plan_actions_with_live_progress(
+        self,
+        *,
+        planner: LlmReplyGenerator,
+        round_idx: int,
+        rounds: int,
+        row: ChatRowState,
+        started_at: float,
+        request_kwargs: dict,
+    ) -> dict:
+        # Keep users informed when planner call is slow; the LLM request itself is blocking.
+        wait_notice_sec = 8.0
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(planner.plan_actions, **request_kwargs)
+            while True:
+                try:
+                    return future.result(timeout=wait_notice_sec)
+                except concurrent.futures.TimeoutError:
+                    if self.cfg.log_verbose:
+                        elapsed = time.monotonic() - started_at
+                        print(
+                            f"[agent-plan] round={round_idx:>2}/{rounds:<2} "
+                            f"wait  row={row.row_idx:>2} elapsed={elapsed:.1f}s "
+                            f"timeout={float(planner.cfg.timeout_sec):.1f}s"
+                        )
+
+    def _run_agent_planner_loop(
+        self,
+        *,
+        planner: LlmReplyGenerator,
+        row: ChatRowState,
+        reason: str,
+        is_group: bool,
+        is_admin: bool,
+        latest_message: str,
+        chat_context: str,
+        environment_context: str,
+        session_context: str,
+        workspace_context: str,
+        memory_recall: str,
+        tools: list[str],
+        per_round_max_actions: int,
+        lookup_intent: bool,
+        lookup_query: str,
+        enforce_lookup_round1: bool,
+    ) -> tuple[str, str, int]:
+        if not tools:
+            return memory_recall, "", 0
+
+        rounds = 1
+        if self.cfg.agent_plan_loop_enabled:
+            rounds = max(1, int(self.cfg.agent_plan_max_rounds))
+        per_round_limit = max(1, int(per_round_max_actions))
+        total_limit = max(per_round_limit, int(self.cfg.agent_plan_max_total_actions))
+        repeat_limit = max(1, int(self.cfg.agent_plan_repeat_limit))
+        obs_limit = max(1200, int(self.cfg.agent_plan_observation_max_chars))
+
+        base_memory = memory_recall or ""
+        merged_memory = base_memory
+        observed_blocks: list[str] = []
+        action_repeat: dict[str, int] = {}
+        total_actions = 0
+        final_hint = ""
+
+        for round_idx in range(1, rounds + 1):
+            remaining = total_limit - total_actions
+            if remaining <= 0:
+                break
+            this_round_max = min(per_round_limit, remaining)
+            plan_started = 0.0
+            try:
+                plan_started = time.monotonic()
+                if self.cfg.log_verbose:
+                    print(
+                        f"[agent-plan] round={round_idx:>2}/{rounds:<2} "
+                        f"start row={row.row_idx:>2} "
+                        f"title={self._fit_col(row.title, 14)} "
+                        f"max={this_round_max:>2} timeout={float(planner.cfg.timeout_sec):.1f}s"
+                    )
+
+                plan_request = {
+                    "title": row.title,
+                    "is_group": is_group,
+                    "reason": reason,
+                    "latest_message": latest_message,
+                    "chat_context": chat_context,
+                    "environment_context": environment_context,
+                    "session_context": session_context,
+                    "workspace_context": workspace_context,
+                    "memory_recall": merged_memory,
+                    "available_tools": tools,
+                    "max_actions": this_round_max,
+                }
+                plan = self._plan_actions_with_live_progress(
+                    planner=planner,
+                    round_idx=round_idx,
+                    rounds=rounds,
+                    row=row,
+                    started_at=plan_started,
+                    request_kwargs=plan_request,
+                )
+                elapsed = time.monotonic() - plan_started
+                planned_actions = (
+                    plan.get("actions")
+                    if isinstance(plan, dict) and isinstance(plan.get("actions"), list)
+                    else []
+                )
+                raw_hint = str(plan.get("reply_hint", "")).strip() if isinstance(plan, dict) else ""
+                hint = self._normalize_planner_reply_hint(
+                    raw_hint,
+                    reason=reason,
+                    latest_message=latest_message or row.preview or row.text or "",
+                )
+                if hint:
+                    final_hint = hint
+                if self.cfg.log_verbose:
+                    names = ",".join(
+                        str(item.get("tool", "")).strip()
+                        for item in planned_actions
+                        if isinstance(item, dict) and str(item.get("tool", "")).strip()
+                    )
+                    print(
+                        f"[agent-plan] round={round_idx:>2}/{rounds:<2} "
+                        f"done  row={row.row_idx:>2} elapsed={elapsed:.2f}s "
+                        f"actions={len(planned_actions):>2} tools={names or '-'}"
+                    )
+                    if hint:
+                        print(
+                            f"             hint={self._fit_col(hint, max(24, self._term_width() - 19))}"
+                        )
+                    elif raw_hint:
+                        print("             hint=(dropped by normalize)")
+
+                if (
+                    enforce_lookup_round1
+                    and round_idx == 1
+                    and lookup_intent
+                    and lookup_query
+                ):
+                    enforced: list[dict] = []
+                    if self._has_web_search_tool() and ("web_search" in tools):
+                        if not self._plan_has_tool(planned_actions, "web_search"):
+                            enforced.append(
+                                {
+                                    "tool": "web_search",
+                                    "args": {"query": lookup_query},
+                                    "reason": "auto lookup intent",
+                                }
+                            )
+                    if "search_memory" in tools:
+                        if not self._plan_has_tool(planned_actions, "search_memory"):
+                            enforced.append(
+                                {
+                                    "tool": "search_memory",
+                                    "args": {"query": lookup_query},
+                                    "reason": "auto memory lookup",
+                                }
+                            )
+                    if enforced:
+                        planned_actions = enforced + list(planned_actions or [])
+                        planned_actions = planned_actions[:this_round_max]
+                        if self.cfg.log_verbose:
+                            names = ",".join(
+                                str(x.get("tool", "")).strip() for x in enforced
+                            )
+                            print(
+                                f"[agent] auto-add lookup tools={names or '-'} | "
+                                f"query={self._fit_col(lookup_query, max(24, self._term_width() - 49))}"
+                            )
+
+                filtered_actions: list[dict] = []
+                for action in planned_actions:
+                    if not isinstance(action, dict):
+                        continue
+                    tool = str(action.get("tool", "")).strip()
+                    args = action.get("args") if isinstance(action.get("args"), dict) else {}
+                    if not tool:
+                        continue
+                    signature = f"{tool}|{json.dumps(args, ensure_ascii=False, sort_keys=True)}"
+                    if action_repeat.get(signature, 0) >= repeat_limit:
+                        continue
+                    filtered_actions.append(action)
+                if not filtered_actions:
+                    if self.cfg.log_verbose:
+                        print(
+                            f"[agent-plan] round={round_idx:>2}/{rounds:<2} "
+                            f"stop (no executable actions)"
+                        )
+                    break
+
+                trace, observations = self._execute_agent_actions(
+                    row,
+                    filtered_actions,
+                    is_admin=is_admin,
+                    max_actions_override=this_round_max,
+                )
+                executed_actions = min(len(filtered_actions), this_round_max)
+                total_actions += executed_actions
+                for action in filtered_actions[:executed_actions]:
+                    tool = str(action.get("tool", "")).strip()
+                    args = action.get("args") if isinstance(action.get("args"), dict) else {}
+                    signature = f"{tool}|{json.dumps(args, ensure_ascii=False, sort_keys=True)}"
+                    action_repeat[signature] = int(action_repeat.get(signature, 0)) + 1
+
+                if trace and self.cfg.log_verbose:
+                    print(
+                        f"[agent] row={row.row_idx:>2} | round={round_idx:>2} "
+                        f"actions={executed_actions:>2}"
+                    )
+                    for ln in trace.split("\n"):
+                        if ln.strip():
+                            print(f"        {ln}")
+
+                if observations:
+                    observed_blocks.append(f"[round {round_idx}]\n{observations}")
+                    observed = "\n\n".join(observed_blocks)
+                    merged_memory = (
+                        f"{base_memory}\n\n[工具执行结果]\n{observed}".strip()
+                    )[:obs_limit]
+                else:
+                    if self.cfg.log_verbose:
+                        print(
+                            f"[agent-plan] round={round_idx:>2}/{rounds:<2} "
+                            "stop (no observation)"
+                        )
+                    break
+            except Exception as exc:
+                if self.cfg.log_verbose:
+                    if plan_started > 0.0:
+                        elapsed = time.monotonic() - plan_started
+                        print(
+                            f"[agent-plan] fail  round={round_idx:>2}/{rounds:<2} "
+                            f"row={row.row_idx:>2} elapsed={elapsed:.2f}s"
+                        )
+                    else:
+                        print(f"[agent-plan] fail  round={round_idx:>2}/{rounds:<2} row={row.row_idx:>2}")
+                if not self.cfg.agent_actions_fail_open:
+                    raise
+                print(f"[warn] agent action planner failed, fail-open: {exc}")
+                if lookup_intent and lookup_query:
+                    fallback_actions: list[dict] = []
+                    if "search_memory" in tools:
+                        fallback_actions.append(
+                            {
+                                "tool": "search_memory",
+                                "args": {"query": lookup_query},
+                                "reason": "planner fail fallback",
+                            }
+                        )
+                    if self._has_web_search_tool() and ("web_search" in tools):
+                        fallback_actions.append(
+                            {
+                                "tool": "web_search",
+                                "args": {"query": lookup_query},
+                                "reason": "planner fail fallback",
+                            }
+                        )
+                    fallback_actions = fallback_actions[:per_round_limit]
+                    if fallback_actions:
+                        trace, observations = self._execute_agent_actions(
+                            row,
+                            fallback_actions,
+                            is_admin=is_admin,
+                            max_actions_override=per_round_limit,
+                        )
+                        if trace and self.cfg.log_verbose:
+                            print(
+                                f"[agent] fallback row={row.row_idx:>2} | "
+                                f"actions={len(fallback_actions):>2}"
+                            )
+                            for ln in trace.split("\n"):
+                                if ln.strip():
+                                    print(f"        {ln}")
+                        if observations:
+                            observed_blocks.append(f"[fallback]\n{observations}")
+                            observed = "\n\n".join(observed_blocks)
+                            merged_memory = (
+                                f"{base_memory}\n\n[工具执行结果]\n{observed}".strip()
+                            )[:obs_limit]
+                break
+
+        planned_reply = ""
+        observed_text = "\n\n".join(observed_blocks)
+        has_lookup_observation = self._has_lookup_observation(observed_text)
+        if lookup_intent and (not observed_text):
+            planned_reply = (
+                "我刚试着查了，但这轮没拿到可用结果（可能检索接口异常）。"
+                "要不要我立刻换关键词再查一次？"
+            )
+        if total_actions > 0 and final_hint:
+            final_hint = ""
+        if lookup_intent and final_hint:
+            final_hint = ""
+        if has_lookup_observation and final_hint:
+            final_hint = ""
+        if final_hint and self._is_deferred_reply_hint(final_hint):
+            rewritten = self._normalize_planner_reply_hint(
+                final_hint,
+                reason=reason,
+                latest_message=latest_message or row.preview or row.text or "",
+            )
+            if rewritten and (not self._is_deferred_reply_hint(rewritten)):
+                final_hint = rewritten
+                if self.cfg.log_verbose:
+                    print(
+                        f"[agent] normalize deferred reply_hint row={row.row_idx:>2} "
+                        f"title={self._fit_col(row.title, 14)}"
+                    )
+            else:
+                final_hint = self._contextual_fallback_reply(
+                    reason=reason,
+                    latest_message=latest_message or row.preview or row.text or "",
+                    fallback="这条我按正经模式处理。",
+                )
+            if self.cfg.log_verbose:
+                print(
+                    f"[agent] rewrite deferred reply_hint row={row.row_idx:>2} "
+                    f"title={self._fit_col(row.title, 14)}"
+                )
+        if final_hint and not planned_reply:
+            fallback = self.cfg.reply_on_mention if reason == "mention" else self.cfg.reply_on_new_message
+            planned_reply = self._sanitize_generated_reply(final_hint, fallback=fallback)
+        return merged_memory, planned_reply, total_actions
+
     def _tavily_search(self, query: str) -> str:
         clean_query = re.sub(r"\s+", " ", query or "").strip()[:120]
         if not clean_query:
@@ -1934,6 +2276,15 @@ class WeChatGuiRpaBot:
             status = ""
             obs = ""
             ok = False
+            action_started = time.monotonic()
+            if self.cfg.log_verbose:
+                arg_preview = self._action_args_preview(args, limit=96)
+                print(
+                    f"[agent] action-start row={row.row_idx:>2} "
+                    f"step={idx:>2}/{max_actions:<2} "
+                    f"tool={tool or '-':<20} "
+                    f"args={self._fit_col(arg_preview, max(20, self._term_width() - 60))}"
+                )
             try:
                 if tool == "remember_long_term":
                     if not is_admin:
@@ -2057,6 +2408,14 @@ class WeChatGuiRpaBot:
                     status = "skip (unknown tool)"
             except Exception as exc:
                 status = f"error ({exc})"
+            action_elapsed = time.monotonic() - action_started
+            if self.cfg.log_verbose:
+                print(
+                    f"[agent] action-done  row={row.row_idx:>2} "
+                    f"step={idx:>2}/{max_actions:<2} "
+                    f"tool={tool or '-':<20} "
+                    f"elapsed={action_elapsed:>5.2f}s status={status}"
+                )
 
             trace = f"{idx}. {tool or '-'} -> {status}"
             if reason:
@@ -2401,44 +2760,67 @@ class WeChatGuiRpaBot:
         )[:2200]
 
         planned_actions = self._parse_heartbeat_direct_actions(tasks_text)
-        if not planned_actions:
-            plan = self.llm_heartbeat.plan_actions(
-                title=row.title,
-                is_group=False,
-                reason="heartbeat",
-                latest_message=tasks_text.split("\n", 1)[0][:180],
-                chat_context=chat_context,
-                environment_context=environment_context,
-                session_context=session_context,
-                workspace_context=workspace_context,
-                memory_recall=memory_recall,
-                available_tools=tools,
-                max_actions=max(1, int(self.cfg.heartbeat_max_actions)),
+        if planned_actions:
+            trace, observations = self._execute_agent_actions(
+                row,
+                planned_actions,
+                is_admin=is_admin,
+                max_actions_override=self.cfg.heartbeat_max_actions,
             )
-            planned_actions = (
-                plan.get("actions")
-                if isinstance(plan, dict) and isinstance(plan.get("actions"), list)
-                else []
+            print(
+                f"[heartbeat] ran actions={len(planned_actions):>2} "
+                f"title={self._fit_col(row.title, 14)}"
             )
-        if not planned_actions:
+            if trace:
+                for line in trace.split("\n"):
+                    if line.strip():
+                        print(f"            {line}")
+            if observations:
+                self._append_session_record(
+                    row,
+                    role="assistant",
+                    text=f"[heartbeat] {observations}",
+                    content_type="text",
+                    sender="",
+                    source="heartbeat",
+                    count_turn=False,
+                )
+            self._memory_dirty = True
+            return True
+
+        lookup_seed = tasks_text.split("\n", 1)[0][:80]
+        lookup_intent = self._is_web_lookup_intent(tasks_text)
+        memory_recall, _, action_count = self._run_agent_planner_loop(
+            planner=self.llm_heartbeat,
+            row=row,
+            reason="heartbeat",
+            is_group=False,
+            is_admin=is_admin,
+            latest_message=lookup_seed,
+            chat_context=chat_context,
+            environment_context=environment_context,
+            session_context=session_context,
+            workspace_context=workspace_context,
+            memory_recall=memory_recall,
+            tools=tools,
+            per_round_max_actions=self.cfg.heartbeat_max_actions,
+            lookup_intent=lookup_intent,
+            lookup_query=lookup_seed,
+            enforce_lookup_round1=False,
+        )
+        if action_count <= 0:
             if self.cfg.log_verbose:
                 print("[heartbeat] no actions planned")
             return False
 
-        trace, observations = self._execute_agent_actions(
-            row,
-            planned_actions,
-            is_admin=is_admin,
-            max_actions_override=self.cfg.heartbeat_max_actions,
-        )
         print(
-            f"[heartbeat] ran actions={len(planned_actions):>2} "
+            f"[heartbeat] ran actions={action_count:>2} "
             f"title={self._fit_col(row.title, 14)}"
         )
-        if trace:
-            for line in trace.split("\n"):
-                if line.strip():
-                    print(f"            {line}")
+        observations = ""
+        marker = "[工具执行结果]"
+        if marker in memory_recall:
+            observations = memory_recall.split(marker, 1)[1].strip()[:1800]
         if observations:
             self._append_session_record(
                 row,
@@ -4146,7 +4528,10 @@ class WeChatGuiRpaBot:
         print(
             f"[start] agent-actions: enabled={self.cfg.agent_actions_enabled} "
             f"max={self.cfg.agent_actions_max_per_turn} "
-            f"fail_open={self.cfg.agent_actions_fail_open}"
+            f"fail_open={self.cfg.agent_actions_fail_open} "
+            f"loop={self.cfg.agent_plan_loop_enabled} "
+            f"rounds={self.cfg.agent_plan_max_rounds} "
+            f"total={self.cfg.agent_plan_max_total_actions}"
         )
         print(
             f"[start] heartbeat: enabled={self.cfg.heartbeat_enabled} "
@@ -4155,6 +4540,7 @@ class WeChatGuiRpaBot:
             f"max_actions={self.cfg.heartbeat_max_actions}"
         )
         print(f"[start] web-search: {self._web_search_status_text()}")
+        print(f"[start] memory-sqlite: {self._workspace.sqlite_status_text()}")
         print(f"[start] rerank: {self._workspace.rerank_status_text()}")
         print(f"        admin={self._fit_col(admin_titles, admin_w)}")
         while True:
@@ -4446,224 +4832,24 @@ class WeChatGuiRpaBot:
                 if self.cfg.agent_actions_enabled:
                     tools = self._available_agent_tools(is_admin=is_admin)
                     if tools:
-                        plan_started = 0.0
-                        try:
-                            plan_started = time.monotonic()
-                            if self.cfg.log_verbose:
-                                print(
-                                    f"[agent-plan] start row={row.row_idx:>2} | "
-                                    f"title={self._fit_col(row.title, 14)} "
-                                    f"tools={len(tools):>2} timeout={float(self.cfg.llm_planner.timeout_sec):.1f}s"
-                                )
-                            plan = self.llm_planner.plan_actions(
-                                title=row.title,
-                                is_group=is_group,
-                                reason=reason,
-                                latest_message=latest_user_message,
-                                chat_context=chat_context,
-                                environment_context=environment_context,
-                                session_context=session_context,
-                                workspace_context=workspace_context,
-                                memory_recall=memory_recall,
-                                available_tools=tools,
-                                max_actions=self.cfg.agent_actions_max_per_turn,
-                            )
-                            plan_elapsed = time.monotonic() - plan_started
-                            planned_actions = (
-                                plan.get("actions")
-                                if isinstance(plan, dict) and isinstance(plan.get("actions"), list)
-                                else []
-                            )
-                            planner_reply_hint_raw = (
-                                str(plan.get("reply_hint", "")).strip()
-                                if isinstance(plan, dict)
-                                else ""
-                            )
-                            planner_reply_hint = self._normalize_planner_reply_hint(
-                                planner_reply_hint_raw,
-                                reason=reason,
-                                latest_message=latest_user_message or row.preview or row.text or "",
-                            )
-                            if self.cfg.log_verbose:
-                                plan_tools = ",".join(
-                                    str(item.get("tool", "")).strip()
-                                    for item in planned_actions
-                                    if isinstance(item, dict) and str(item.get("tool", "")).strip()
-                                )
-                                print(
-                                    f"[agent-plan] done  row={row.row_idx:>2} | "
-                                    f"elapsed={plan_elapsed:.2f}s actions={len(planned_actions):>2} "
-                                    f"tools={plan_tools or '-'}"
-                                )
-                                if planner_reply_hint:
-                                    print(
-                                        f"             hint={self._fit_col(planner_reply_hint, max(24, self._term_width() - 19))}"
-                                    )
-                                elif planner_reply_hint_raw:
-                                    print("             hint=(dropped by normalize)")
-                            if lookup_intent and lookup_query:
-                                enforced_actions: list[dict] = []
-                                if self._has_web_search_tool() and ("web_search" in tools):
-                                    if not self._plan_has_tool(planned_actions, "web_search"):
-                                        enforced_actions.append(
-                                            {
-                                                "tool": "web_search",
-                                                "args": {"query": lookup_query},
-                                                "reason": "auto lookup intent",
-                                            }
-                                        )
-                                if "search_memory" in tools:
-                                    if not self._plan_has_tool(planned_actions, "search_memory"):
-                                        enforced_actions.append(
-                                            {
-                                                "tool": "search_memory",
-                                                "args": {"query": lookup_query},
-                                                "reason": "auto memory lookup",
-                                            }
-                                        )
-                                if enforced_actions:
-                                    planned_actions = enforced_actions + list(planned_actions or [])
-                                    planned_actions = planned_actions[
-                                        : max(1, int(self.cfg.agent_actions_max_per_turn))
-                                    ]
-                                    if self.cfg.log_verbose:
-                                        names = ",".join(
-                                            str(x.get("tool", "")).strip() for x in enforced_actions
-                                        )
-                                        print(
-                                            f"[agent] auto-add lookup tools={names or '-'} | "
-                                            f"query={self._fit_col(lookup_query, max(24, self._term_width() - 49))}"
-                                        )
-                            trace, observations = self._execute_agent_actions(
-                                row,
-                                planned_actions,
-                                is_admin=is_admin,
-                            )
-                            if trace and self.cfg.log_verbose:
-                                print(f"[agent] row={row.row_idx:>2} | actions={len(planned_actions):>2}")
-                                for ln in trace.split("\n"):
-                                    if ln.strip():
-                                        print(f"        {ln}")
-                            if observations:
-                                memory_recall = (
-                                    f"{memory_recall}\n\n[工具执行结果]\n{observations}".strip()
-                                )[:3600]
-                            has_lookup_observation = self._has_lookup_observation(observations)
-                            if lookup_intent and planner_reply_hint:
-                                if self.cfg.log_verbose:
-                                    print(
-                                        f"[agent] drop lookup reply_hint row={row.row_idx:>2} "
-                                        f"title={self._fit_col(row.title, 14)}"
-                                    )
-                                planner_reply_hint = ""
-                            if has_lookup_observation and planner_reply_hint:
-                                if self.cfg.log_verbose:
-                                    print(
-                                        f"[agent] drop post-tool reply_hint row={row.row_idx:>2} "
-                                        f"title={self._fit_col(row.title, 14)}"
-                                    )
-                                planner_reply_hint = ""
-                            if planner_reply_hint and self._is_deferred_reply_hint(planner_reply_hint):
-                                rewritten = self._normalize_planner_reply_hint(
-                                    planner_reply_hint,
-                                    reason=reason,
-                                    latest_message=latest_user_message or row.preview or row.text or "",
-                                )
-                                if rewritten and (not self._is_deferred_reply_hint(rewritten)):
-                                    planner_reply_hint = rewritten
-                                    if self.cfg.log_verbose:
-                                        print(
-                                            f"[agent] normalize deferred reply_hint row={row.row_idx:>2} "
-                                            f"title={self._fit_col(row.title, 14)}"
-                                        )
-                                else:
-                                    planner_reply_hint = self._contextual_fallback_reply(
-                                        reason=reason,
-                                        latest_message=latest_user_message or row.preview or row.text or "",
-                                        fallback="这条我按正经模式处理。",
-                                    )
-                                if self.cfg.log_verbose:
-                                    print(
-                                        f"[agent] rewrite deferred reply_hint row={row.row_idx:>2} "
-                                        f"title={self._fit_col(row.title, 14)}"
-                                    )
-                            if lookup_intent and (not observations):
-                                planned_reply = "我刚试着查了，但这轮没拿到可用结果（可能检索接口异常）。要不要我立刻换关键词再查一次？"
-                            if planned_actions and planner_reply_hint:
-                                if self.cfg.log_verbose:
-                                    print(
-                                        f"[agent] drop action reply_hint row={row.row_idx:>2} "
-                                        f"title={self._fit_col(row.title, 14)}"
-                                    )
-                                planner_reply_hint = ""
-                            if planner_reply_hint and not planned_reply:
-                                fallback = (
-                                    self.cfg.reply_on_mention
-                                    if reason == "mention"
-                                    else self.cfg.reply_on_new_message
-                                )
-                                planned_reply = self._sanitize_generated_reply(
-                                    planner_reply_hint,
-                                    fallback=fallback,
-                                )
-                        except Exception as exc:
-                            if self.cfg.log_verbose:
-                                if plan_started > 0.0:
-                                    plan_elapsed = time.monotonic() - plan_started
-                                    print(
-                                        f"[agent-plan] fail  row={row.row_idx:>2} | "
-                                        f"elapsed={plan_elapsed:.2f}s"
-                                    )
-                                else:
-                                    print(f"[agent-plan] fail  row={row.row_idx:>2}")
-                            if self.cfg.agent_actions_fail_open:
-                                print(f"[warn] agent action planner failed, fail-open: {exc}")
-                                if lookup_intent and lookup_query:
-                                    fallback_actions: list[dict] = []
-                                    if "search_memory" in tools:
-                                        fallback_actions.append(
-                                            {
-                                                "tool": "search_memory",
-                                                "args": {"query": lookup_query},
-                                                "reason": "planner fail fallback",
-                                            }
-                                        )
-                                    if self._has_web_search_tool() and ("web_search" in tools):
-                                        fallback_actions.append(
-                                            {
-                                                "tool": "web_search",
-                                                "args": {"query": lookup_query},
-                                                "reason": "planner fail fallback",
-                                            }
-                                        )
-                                    fallback_actions = fallback_actions[
-                                        : max(1, int(self.cfg.agent_actions_max_per_turn))
-                                    ]
-                                    if fallback_actions:
-                                        trace, observations = self._execute_agent_actions(
-                                            row,
-                                            fallback_actions,
-                                            is_admin=is_admin,
-                                        )
-                                        if trace and self.cfg.log_verbose:
-                                            print(
-                                                f"[agent] fallback row={row.row_idx:>2} | "
-                                                f"actions={len(fallback_actions):>2}"
-                                            )
-                                            for ln in trace.split("\n"):
-                                                if ln.strip():
-                                                    print(f"        {ln}")
-                                        if observations:
-                                            memory_recall = (
-                                                f"{memory_recall}\n\n[工具执行结果]\n{observations}".strip()
-                                            )[:3600]
-                                        else:
-                                            planned_reply = (
-                                                "我刚试着查了，但这轮没拿到可用结果（可能检索接口异常）。"
-                                                "要不要我立刻换关键词再查一次？"
-                                            )
-                            else:
-                                raise
+                        memory_recall, planned_reply, _ = self._run_agent_planner_loop(
+                            planner=self.llm_planner,
+                            row=row,
+                            reason=reason,
+                            is_group=is_group,
+                            is_admin=is_admin,
+                            latest_message=latest_user_message,
+                            chat_context=chat_context,
+                            environment_context=environment_context,
+                            session_context=session_context,
+                            workspace_context=workspace_context,
+                            memory_recall=memory_recall,
+                            tools=tools,
+                            per_round_max_actions=self.cfg.agent_actions_max_per_turn,
+                            lookup_intent=lookup_intent,
+                            lookup_query=lookup_query,
+                            enforce_lookup_round1=True,
+                        )
                 message = self._reply(
                     row,
                     reason,

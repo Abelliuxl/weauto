@@ -202,12 +202,23 @@ class AppConfig:
     workspace_memory_rerank_enabled: bool = False
     workspace_memory_rerank_shortlist: int = 24
     workspace_memory_rerank_weight: float = 2.5
+    workspace_memory_sqlite_enabled: bool = False
+    workspace_memory_sqlite_path: str = "data/workspace_memory.sqlite3"
+    workspace_memory_sqlite_sync_interval_sec: float = 20.0
+    workspace_memory_sqlite_fts_limit: int = 64
+    workspace_memory_sqlite_vector_limit: int = 24
+    workspace_memory_sqlite_chunk_chars: int = 320
     admin_commands_enabled: bool = True
     admin_session_titles: list[str] = field(default_factory=lambda: ["example_admin"])
     admin_command_prefix: str = "/"
     agent_actions_enabled: bool = True
     agent_actions_max_per_turn: int = 2
     agent_actions_fail_open: bool = True
+    agent_plan_loop_enabled: bool = True
+    agent_plan_max_rounds: int = 3
+    agent_plan_max_total_actions: int = 6
+    agent_plan_repeat_limit: int = 2
+    agent_plan_observation_max_chars: int = 5200
     tavily_enabled: bool = False
     tavily_base_url: str = "https://api.tavily.com"
     tavily_api_key: str = ""
@@ -496,10 +507,45 @@ def load_config(path: str | Path | None) -> AppConfig:
     cfg.workspace_memory_rerank_weight = float(
         data.get("workspace_memory_rerank_weight", cfg.workspace_memory_rerank_weight)
     )
+    cfg.workspace_memory_sqlite_enabled = bool(
+        data.get("workspace_memory_sqlite_enabled", cfg.workspace_memory_sqlite_enabled)
+    )
+    cfg.workspace_memory_sqlite_path = str(
+        data.get("workspace_memory_sqlite_path", cfg.workspace_memory_sqlite_path)
+    )
+    cfg.workspace_memory_sqlite_sync_interval_sec = float(
+        data.get(
+            "workspace_memory_sqlite_sync_interval_sec",
+            cfg.workspace_memory_sqlite_sync_interval_sec,
+        )
+    )
+    cfg.workspace_memory_sqlite_fts_limit = int(
+        data.get("workspace_memory_sqlite_fts_limit", cfg.workspace_memory_sqlite_fts_limit)
+    )
+    cfg.workspace_memory_sqlite_vector_limit = int(
+        data.get(
+            "workspace_memory_sqlite_vector_limit",
+            cfg.workspace_memory_sqlite_vector_limit,
+        )
+    )
+    cfg.workspace_memory_sqlite_chunk_chars = int(
+        data.get(
+            "workspace_memory_sqlite_chunk_chars",
+            cfg.workspace_memory_sqlite_chunk_chars,
+        )
+    )
     if cfg.workspace_memory_rerank_shortlist < 1:
         cfg.workspace_memory_rerank_shortlist = 1
     if cfg.workspace_memory_rerank_weight < 0.0:
         cfg.workspace_memory_rerank_weight = 0.0
+    if cfg.workspace_memory_sqlite_sync_interval_sec < 2.0:
+        cfg.workspace_memory_sqlite_sync_interval_sec = 2.0
+    if cfg.workspace_memory_sqlite_fts_limit < 4:
+        cfg.workspace_memory_sqlite_fts_limit = 4
+    if cfg.workspace_memory_sqlite_vector_limit < 1:
+        cfg.workspace_memory_sqlite_vector_limit = 1
+    if cfg.workspace_memory_sqlite_chunk_chars < 120:
+        cfg.workspace_memory_sqlite_chunk_chars = 120
     cfg.admin_commands_enabled = bool(
         data.get("admin_commands_enabled", cfg.admin_commands_enabled)
     )
@@ -516,6 +562,32 @@ def load_config(path: str | Path | None) -> AppConfig:
     cfg.agent_actions_fail_open = bool(
         data.get("agent_actions_fail_open", cfg.agent_actions_fail_open)
     )
+    cfg.agent_plan_loop_enabled = bool(
+        data.get("agent_plan_loop_enabled", cfg.agent_plan_loop_enabled)
+    )
+    cfg.agent_plan_max_rounds = int(
+        data.get("agent_plan_max_rounds", cfg.agent_plan_max_rounds)
+    )
+    cfg.agent_plan_max_total_actions = int(
+        data.get("agent_plan_max_total_actions", cfg.agent_plan_max_total_actions)
+    )
+    cfg.agent_plan_repeat_limit = int(
+        data.get("agent_plan_repeat_limit", cfg.agent_plan_repeat_limit)
+    )
+    cfg.agent_plan_observation_max_chars = int(
+        data.get(
+            "agent_plan_observation_max_chars",
+            cfg.agent_plan_observation_max_chars,
+        )
+    )
+    if cfg.agent_plan_max_rounds < 1:
+        cfg.agent_plan_max_rounds = 1
+    if cfg.agent_plan_max_total_actions < 1:
+        cfg.agent_plan_max_total_actions = 1
+    if cfg.agent_plan_repeat_limit < 1:
+        cfg.agent_plan_repeat_limit = 1
+    if cfg.agent_plan_observation_max_chars < 1200:
+        cfg.agent_plan_observation_max_chars = 1200
     cfg.tavily_enabled = bool(data.get("tavily_enabled", cfg.tavily_enabled))
     cfg.tavily_base_url = str(data.get("tavily_base_url", cfg.tavily_base_url)).rstrip("/")
     cfg.tavily_api_key = str(data.get("tavily_api_key", cfg.tavily_api_key))

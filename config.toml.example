@@ -75,6 +75,12 @@ workspace_memory_search_limit = 3
 workspace_memory_rerank_enabled = true
 workspace_memory_rerank_shortlist = 24
 workspace_memory_rerank_weight = 2.5
+workspace_memory_sqlite_enabled = true
+workspace_memory_sqlite_path = "data/workspace_memory.sqlite3"
+workspace_memory_sqlite_sync_interval_sec = 20.0
+workspace_memory_sqlite_fts_limit = 64
+workspace_memory_sqlite_vector_limit = 24
+workspace_memory_sqlite_chunk_chars = 320
 
 # --------------------
 # Admin Session
@@ -91,6 +97,11 @@ admin_command_prefix = "/"
 agent_actions_enabled = true
 agent_actions_max_per_turn = 2
 agent_actions_fail_open = true
+agent_plan_loop_enabled = true
+agent_plan_max_rounds = 3
+agent_plan_max_total_actions = 6
+agent_plan_repeat_limit = 2
+agent_plan_observation_max_chars = 5200
 
 # --------------------
 # Web Search Tool (Tavily)

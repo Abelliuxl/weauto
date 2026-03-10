@@ -2,12 +2,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+import hashlib
 import json
 import math
 import os
 from pathlib import Path
 import re
 import socket
+import sqlite3
 import time
 from urllib import error as urllib_error
 from urllib import request as urllib_request
@@ -117,6 +119,12 @@ class WorkspaceContextManager:
         memory_rerank_enabled: bool = False,
         memory_rerank_shortlist: int = 24,
         memory_rerank_weight: float = 2.5,
+        memory_sqlite_enabled: bool = False,
+        memory_sqlite_path: str | Path = "data/workspace_memory.sqlite3",
+        memory_sqlite_sync_interval_sec: float = 20.0,
+        memory_sqlite_fts_limit: int = 64,
+        memory_sqlite_vector_limit: int = 24,
+        memory_sqlite_chunk_chars: int = 320,
     ) -> None:
         self.enabled = bool(enabled)
         self.root = Path(root)
@@ -131,6 +139,16 @@ class WorkspaceContextManager:
         self._embedding_cache: dict[str, list[float] | None] = {}
         self._embedding_warned = False
         self._rerank_warned = False
+        self.memory_sqlite_enabled = bool(memory_sqlite_enabled)
+        self.memory_sqlite_path = Path(memory_sqlite_path)
+        self.memory_sqlite_sync_interval_sec = max(2.0, float(memory_sqlite_sync_interval_sec))
+        self.memory_sqlite_fts_limit = max(4, int(memory_sqlite_fts_limit))
+        self.memory_sqlite_vector_limit = max(1, int(memory_sqlite_vector_limit))
+        self.memory_sqlite_chunk_chars = max(120, int(memory_sqlite_chunk_chars))
+        self._memory_sqlite_conn: sqlite3.Connection | None = None
+        self._memory_sqlite_warned = False
+        self._memory_sqlite_dirty = True
+        self._memory_sqlite_last_sync = 0.0
 
     def rerank_status_text(self) -> str:
         if not self.memory_rerank_enabled:
@@ -144,9 +162,19 @@ class WorkspaceContextManager:
             f"weight={self.memory_rerank_weight:.2f}"
         )
 
+    def sqlite_status_text(self) -> str:
+        if not self.memory_sqlite_enabled:
+            return "disabled (workspace_memory_sqlite_enabled=false)"
+        return (
+            f"enabled path={self.memory_sqlite_path} "
+            f"fts_limit={self.memory_sqlite_fts_limit} "
+            f"vector_limit={self.memory_sqlite_vector_limit}"
+        )
+
     def ensure_bootstrap_files(self) -> None:
         if not self.enabled:
             return
+        touched = False
         self.root.mkdir(parents=True, exist_ok=True)
         self.memory_dir.mkdir(parents=True, exist_ok=True)
         self.session_dir.mkdir(parents=True, exist_ok=True)
@@ -155,6 +183,9 @@ class WorkspaceContextManager:
             path = self.root / name
             if not path.exists():
                 path.write_text(content.strip() + "\n", encoding="utf-8")
+                touched = True
+        if touched:
+            self._mark_sqlite_dirty()
 
     def _safe_read(self, path: Path) -> str:
         try:
@@ -177,6 +208,7 @@ class WorkspaceContextManager:
             json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
+        self._mark_sqlite_dirty()
 
     def build_prompt_context(self, *, include_long_term: bool) -> str:
         if not self.enabled:
@@ -249,6 +281,7 @@ class WorkspaceContextManager:
             )
         with session_path.open("a", encoding="utf-8") as fh:
             fh.write(line + "\n")
+        self._mark_sqlite_dirty()
 
     def rewrite_session_records(
         self,
@@ -286,6 +319,7 @@ class WorkspaceContextManager:
                 )
             )
         session_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        self._mark_sqlite_dirty()
 
     def append_long_term_memory(self, note: str) -> None:
         if not self.enabled:
@@ -298,6 +332,7 @@ class WorkspaceContextManager:
             path.write_text(_DEFAULT_FILES["MEMORY.md"].strip() + "\n", encoding="utf-8")
         with path.open("a", encoding="utf-8") as fh:
             fh.write(f"\n- {clean}\n")
+        self._mark_sqlite_dirty()
 
     def reset_session_memory(self, *, session_key: str, title: str) -> None:
         if not self.enabled:
@@ -313,6 +348,7 @@ class WorkspaceContextManager:
             self._session_state_path(session_key),
             self._new_session_state(session_key=session_key, title=title),
         )
+        self._mark_sqlite_dirty()
 
     def merge_session_memory(
         self,
@@ -375,6 +411,7 @@ class WorkspaceContextManager:
         dst["title"] = dst_title or str(dst.get("title", "") or dst_key)
         dst["updated_at"] = stamp
         self._save_session_state(dst)
+        self._mark_sqlite_dirty()
 
     def update_session_summary(self, *, session_key: str, title: str, summary: str) -> None:
         if not self.enabled:
@@ -702,11 +739,19 @@ class WorkspaceContextManager:
             return ""
 
         hits: list[MemoryHit] = []
-        for path in self._candidate_files(session_key=session_key, include_global=include_global):
-            content = self._safe_read(path)
-            if not content:
-                continue
-            hits.extend(self._score_file(path, content, clean_query))
+        if self.memory_sqlite_enabled:
+            hits = self._search_memory_hits_sqlite(
+                clean_query,
+                session_key=session_key,
+                include_global=include_global,
+                limit=max(1, limit),
+            )
+        if not hits:
+            for path in self._candidate_files(session_key=session_key, include_global=include_global):
+                content = self._safe_read(path)
+                if not content:
+                    continue
+                hits.extend(self._score_file(path, content, clean_query))
 
         hits.sort(key=lambda item: item.score, reverse=True)
         if hits and self.memory_rerank_enabled:
@@ -726,6 +771,399 @@ class WorkspaceContextManager:
             if len(lines) >= max(1, limit):
                 break
         return "\n".join(lines)[:2400]
+
+    def _mark_sqlite_dirty(self) -> None:
+        if not self.memory_sqlite_enabled:
+            return
+        self._memory_sqlite_dirty = True
+
+    def _sqlite_conn(self) -> sqlite3.Connection | None:
+        if (not self.enabled) or (not self.memory_sqlite_enabled):
+            return None
+        if self._memory_sqlite_conn is not None:
+            return self._memory_sqlite_conn
+        try:
+            db_path = self.memory_sqlite_path
+            if not db_path.is_absolute():
+                db_path = (Path.cwd() / db_path).resolve()
+            db_path.parent.mkdir(parents=True, exist_ok=True)
+            conn = sqlite3.connect(str(db_path), timeout=12.0)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA temp_store=MEMORY")
+            self._sqlite_init_schema(conn)
+            self._memory_sqlite_conn = conn
+            self.memory_sqlite_path = db_path
+            return conn
+        except Exception as exc:
+            if not self._memory_sqlite_warned:
+                print(f"[warn] sqlite memory index unavailable, fallback to file recall: {exc}")
+                self._memory_sqlite_warned = True
+            return None
+
+    def _sqlite_init_schema(self, conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS memory_sources (
+                source_path TEXT PRIMARY KEY,
+                source_hash TEXT NOT NULL,
+                scope TEXT NOT NULL,
+                session_slug TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS memory_chunks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_path TEXT NOT NULL,
+                scope TEXT NOT NULL,
+                session_slug TEXT NOT NULL,
+                chunk_index INTEGER NOT NULL,
+                snippet TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_memory_chunks_scope ON memory_chunks(scope, session_slug)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_memory_chunks_source ON memory_chunks(source_path)"
+        )
+        conn.execute(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS memory_chunks_fts "
+            "USING fts5(snippet, tokenize='unicode61')"
+        )
+        conn.commit()
+
+    def _collect_index_sources(self) -> list[tuple[Path, str, str]]:
+        out: list[tuple[Path, str, str]] = []
+        long_term = self.root / "MEMORY.md"
+        if long_term.exists():
+            out.append((long_term, "long_term", ""))
+        for path in sorted(self.memory_dir.glob("*.md")):
+            if path.is_file():
+                out.append((path, "daily", ""))
+        for path in sorted(self.session_dir.glob("*.md")):
+            if path.is_file():
+                out.append((path, "session", self._slug(path.stem)))
+        for path in sorted(self.session_state_dir.glob("*.json")):
+            if path.is_file():
+                out.append((path, "session_state", self._slug(path.stem)))
+        return out
+
+    def _source_relpath(self, path: Path) -> str:
+        try:
+            return str(path.resolve().relative_to(self.root.resolve()))
+        except Exception:
+            return str(path)
+
+    def _split_index_chunks(self, text: str) -> list[str]:
+        clean_text = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+        if not clean_text.strip():
+            return []
+        limit = self.memory_sqlite_chunk_chars
+        chunks: list[str] = []
+        sections = [sec.strip() for sec in re.split(r"\n\s*\n", clean_text) if sec.strip()]
+        if not sections:
+            sections = [clean_text.strip()]
+
+        for section in sections:
+            lines = []
+            for line in section.splitlines():
+                normalized = re.sub(r"\s+", " ", line).strip()
+                if not normalized:
+                    continue
+                if normalized.startswith("#"):
+                    continue
+                lines.append(normalized)
+            if not lines:
+                continue
+            merged = " ".join(lines).strip()
+            if len(merged) <= limit:
+                chunks.append(merged)
+                continue
+
+            sentences = [x.strip() for x in re.split(r"(?<=[。！？!?；;])\s*", merged) if x.strip()]
+            if not sentences:
+                sentences = [merged]
+            buf = ""
+            for sent in sentences:
+                if len(sent) > limit:
+                    if buf:
+                        chunks.append(buf[:limit])
+                        buf = ""
+                    for i in range(0, len(sent), limit):
+                        part = sent[i : i + limit].strip()
+                        if part:
+                            chunks.append(part)
+                    continue
+                candidate = f"{buf} {sent}".strip() if buf else sent
+                if len(candidate) <= limit:
+                    buf = candidate
+                else:
+                    if buf:
+                        chunks.append(buf)
+                    buf = sent
+            if buf:
+                chunks.append(buf)
+        uniq: list[str] = []
+        seen: set[str] = set()
+        for chunk in chunks:
+            normalized = re.sub(r"\s+", " ", chunk).strip()
+            if not normalized:
+                continue
+            key = normalized.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            uniq.append(normalized)
+            if len(uniq) >= 3000:
+                break
+        return uniq
+
+    def _session_state_text(self, path: Path) -> str:
+        data = self._safe_json_load(path)
+        if not data:
+            return ""
+        lines: list[str] = []
+        title = self._clip_text(data.get("title", ""), 40)
+        if title:
+            lines.append(f"会话: {title}")
+        summary = self._clip_text((data.get("profile") or {}).get("summary", ""), 240)
+        if summary:
+            lines.append(f"会话摘要: {summary}")
+        for person in (data.get("people") or [])[:80]:
+            if not isinstance(person, dict):
+                continue
+            name = self._clip_text(person.get("name", ""), 24)
+            if not name:
+                continue
+            aliases = ",".join(
+                self._clip_text(item, 16) for item in (person.get("aliases") or [])[:3] if str(item).strip()
+            )
+            notes = " / ".join(
+                self._clip_text(item, 36) for item in (person.get("notes") or [])[:2] if str(item).strip()
+            )
+            tail = " ".join(x for x in [aliases, notes] if x)
+            lines.append(f"人物: {name}" + (f" {tail}" if tail else ""))
+        for fact in (data.get("facts") or [])[:120]:
+            if not isinstance(fact, dict):
+                continue
+            text = self._clip_text(fact.get("text", ""), 180)
+            if text:
+                lines.append(f"事实: {text}")
+        for rel in (data.get("relations") or [])[:120]:
+            if not isinstance(rel, dict):
+                continue
+            subject = self._clip_text(rel.get("subject", ""), 24)
+            relation = self._clip_text(rel.get("relation", ""), 20)
+            target = self._clip_text(rel.get("target", ""), 24)
+            if subject and relation and target:
+                note = self._clip_text(rel.get("note", ""), 60)
+                lines.append(
+                    f"关系: {subject} -> {relation} -> {target}" + (f" ({note})" if note else "")
+                )
+        for event in (data.get("events") or [])[-160:]:
+            if not isinstance(event, dict):
+                continue
+            text = self._clip_text(event.get("text", ""), 180)
+            if text:
+                lines.append(f"事件: {text}")
+        return "\n".join(lines)
+
+    def _source_chunks(self, path: Path, scope: str) -> list[str]:
+        if scope == "session_state":
+            return self._split_index_chunks(self._session_state_text(path))
+        return self._split_index_chunks(self._safe_read(path))
+
+    def _sync_memory_sqlite_index(self, *, force: bool = False) -> None:
+        if (not self.memory_sqlite_enabled) or (not self.enabled):
+            return
+        now = time.time()
+        if (
+            (not force)
+            and (self._memory_sqlite_last_sync > 0.0)
+            and ((now - self._memory_sqlite_last_sync) < self.memory_sqlite_sync_interval_sec)
+        ):
+            return
+        conn = self._sqlite_conn()
+        if conn is None:
+            return
+
+        sources = self._collect_index_sources()
+        current_paths = {self._source_relpath(path) for path, _, _ in sources}
+        existing_rows = conn.execute(
+            "SELECT source_path, source_hash, scope, session_slug FROM memory_sources"
+        ).fetchall()
+        existing_map = {
+            str(row["source_path"]): (
+                str(row["source_hash"]),
+                str(row["scope"]),
+                str(row["session_slug"]),
+            )
+            for row in existing_rows
+        }
+
+        touched = False
+        with conn:
+            for stale_path in sorted(set(existing_map.keys()) - current_paths):
+                conn.execute(
+                    "DELETE FROM memory_chunks_fts WHERE rowid IN "
+                    "(SELECT id FROM memory_chunks WHERE source_path = ?)",
+                    (stale_path,),
+                )
+                conn.execute("DELETE FROM memory_chunks WHERE source_path = ?", (stale_path,))
+                conn.execute("DELETE FROM memory_sources WHERE source_path = ?", (stale_path,))
+                touched = True
+
+            for path, scope, session_slug in sources:
+                relpath = self._source_relpath(path)
+                try:
+                    raw_bytes = path.read_bytes()
+                except Exception:
+                    raw_bytes = b""
+                source_hash = hashlib.sha1(raw_bytes).hexdigest()
+                prev = existing_map.get(relpath)
+                if prev and prev == (source_hash, scope, session_slug):
+                    continue
+
+                conn.execute(
+                    "DELETE FROM memory_chunks_fts WHERE rowid IN "
+                    "(SELECT id FROM memory_chunks WHERE source_path = ?)",
+                    (relpath,),
+                )
+                conn.execute("DELETE FROM memory_chunks WHERE source_path = ?", (relpath,))
+                chunks = self._source_chunks(path, scope)
+                for idx, snippet in enumerate(chunks):
+                    cur = conn.execute(
+                        "INSERT INTO memory_chunks(source_path, scope, session_slug, chunk_index, snippet) "
+                        "VALUES(?,?,?,?,?)",
+                        (relpath, scope, session_slug, idx, snippet),
+                    )
+                    row_id = int(cur.lastrowid or 0)
+                    if row_id > 0:
+                        conn.execute(
+                            "INSERT INTO memory_chunks_fts(rowid, snippet) VALUES(?, ?)",
+                            (row_id, snippet),
+                        )
+                conn.execute(
+                    "INSERT INTO memory_sources(source_path, source_hash, scope, session_slug, updated_at) "
+                    "VALUES(?,?,?,?,?) "
+                    "ON CONFLICT(source_path) DO UPDATE SET "
+                    "source_hash=excluded.source_hash, "
+                    "scope=excluded.scope, "
+                    "session_slug=excluded.session_slug, "
+                    "updated_at=excluded.updated_at",
+                    (relpath, source_hash, scope, session_slug, int(now)),
+                )
+                touched = True
+
+        self._memory_sqlite_last_sync = now
+        self._memory_sqlite_dirty = False
+        if touched:
+            print(
+                f"[memory-sqlite] synced sources={len(sources)} path={self.memory_sqlite_path}"
+            )
+
+    def _sqlite_scope_clause(
+        self,
+        *,
+        include_global: bool,
+        session_key: str,
+    ) -> tuple[str, list[str]]:
+        if include_global:
+            return "", []
+        session_slug = self._slug(session_key or "")
+        return " AND c.scope IN ('session','session_state') AND c.session_slug = ? ", [session_slug]
+
+    def _sqlite_match_query(self, query: str) -> str:
+        tokens = self._tokens(query)
+        if not tokens:
+            clean = re.sub(r"\s+", " ", query or "").strip()
+            if not clean:
+                return ""
+            return f"\"{clean.replace('\"', '')[:80]}\""
+        phrases = [f"\"{token.replace('\"', '')}\"" for token in tokens[:12]]
+        return " OR ".join(phrases)
+
+    def _search_memory_hits_sqlite(
+        self,
+        query: str,
+        *,
+        session_key: str,
+        include_global: bool,
+        limit: int,
+    ) -> list[MemoryHit]:
+        self._sync_memory_sqlite_index()
+        conn = self._sqlite_conn()
+        if conn is None:
+            return []
+
+        match_query = self._sqlite_match_query(query)
+        if not match_query:
+            return []
+        scope_clause, scope_params = self._sqlite_scope_clause(
+            include_global=include_global,
+            session_key=session_key,
+        )
+        fetch_limit = max(max(1, limit), self.memory_sqlite_fts_limit)
+        sql = (
+            "SELECT c.source_path, c.snippet, bm25(memory_chunks_fts) AS bm "
+            "FROM memory_chunks_fts "
+            "JOIN memory_chunks c ON c.id = memory_chunks_fts.rowid "
+            "WHERE memory_chunks_fts MATCH ? "
+            + scope_clause
+            + " ORDER BY bm ASC LIMIT ?"
+        )
+        params: list[object] = [match_query]
+        params.extend(scope_params)
+        params.append(fetch_limit)
+
+        try:
+            rows = conn.execute(sql, tuple(params)).fetchall()
+        except Exception as exc:
+            if not self._memory_sqlite_warned:
+                print(f"[warn] sqlite FTS query failed, fallback to file recall: {exc}")
+                self._memory_sqlite_warned = True
+            return []
+
+        hits: list[MemoryHit] = []
+        query_tokens = self._tokens(query)
+        for row in rows:
+            snippet = self._clip_text(row["snippet"], 320)
+            if not snippet:
+                continue
+            try:
+                bm25_raw = float(row["bm"])
+            except Exception:
+                bm25_raw = 0.0
+            lexical = 1.0 / (1.0 + abs(bm25_raw))
+            norm = self._norm(snippet)
+            lexical += 0.15 * sum(1 for token in query_tokens if token in norm)
+            hits.append(
+                MemoryHit(
+                    path=str(row["source_path"]),
+                    score=float(lexical),
+                    snippet=snippet,
+                )
+            )
+        if not hits:
+            return []
+
+        if self._embedding_enabled():
+            shortlist = hits[: max(1, self.memory_sqlite_vector_limit)]
+            embed_scores = self._embedding_similarity_map(
+                query,
+                [item.snippet for item in shortlist],
+            )
+            if embed_scores:
+                for item in hits:
+                    item.score += float(embed_scores.get(item.snippet, 0.0) or 0.0) * 2.0
+        hits.sort(key=lambda item: item.score, reverse=True)
+        return hits
 
     def _rerank_memory_hits(
         self,

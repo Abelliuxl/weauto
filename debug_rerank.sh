@@ -34,6 +34,12 @@ workspace = WorkspaceContextManager(
     memory_rerank_enabled=cfg.workspace_memory_rerank_enabled,
     memory_rerank_shortlist=cfg.workspace_memory_rerank_shortlist,
     memory_rerank_weight=cfg.workspace_memory_rerank_weight,
+    memory_sqlite_enabled=cfg.workspace_memory_sqlite_enabled,
+    memory_sqlite_path=cfg.workspace_memory_sqlite_path,
+    memory_sqlite_sync_interval_sec=cfg.workspace_memory_sqlite_sync_interval_sec,
+    memory_sqlite_fts_limit=cfg.workspace_memory_sqlite_fts_limit,
+    memory_sqlite_vector_limit=cfg.workspace_memory_sqlite_vector_limit,
+    memory_sqlite_chunk_chars=cfg.workspace_memory_sqlite_chunk_chars,
 )
 
 print(
@@ -49,6 +55,7 @@ print(
     f"base_url={cfg.rerank.base_url or '-'}"
 )
 print(f"[status] {workspace.rerank_status_text()}")
+print(f"[status] sqlite={workspace.sqlite_status_text()}")
 
 hits = workspace.search_memory(
     query=query,
