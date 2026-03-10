@@ -193,7 +193,33 @@ class WorkspaceContextManager:
             parts.append(f"[{name}]\n{content[:4000]}")
         return "\n\n".join(parts)[:12000]
 
-    def append_record(self, *, session_key: str, title: str, role: str, text: str) -> None:
+    def _format_record_line(
+        self,
+        *,
+        stamp: str,
+        title: str,
+        role: str,
+        text: str,
+        sender: str = "",
+    ) -> str:
+        short_role = "A" if role == "assistant" else ("U" if role == "user" else "?")
+        clean_sender = self._normalize_name(sender)
+        if role == "user" and (not clean_sender):
+            title_name = self._normalize_name(title)
+            if title_name and (not title_name.startswith("群")):
+                clean_sender = title_name
+        sender_prefix = f"({clean_sender})" if (role == "user" and clean_sender) else ""
+        return f"- [{stamp}] [{title}] {short_role}{sender_prefix}: {text}"
+
+    def append_record(
+        self,
+        *,
+        session_key: str,
+        title: str,
+        role: str,
+        text: str,
+        sender: str = "",
+    ) -> None:
         if not self.enabled:
             return
         clean = self._clip_text(text, 500)
@@ -203,9 +229,13 @@ class WorkspaceContextManager:
         now = datetime.now()
         day_path = self.memory_dir / f"{now:%Y-%m-%d}.md"
         session_path = self.session_dir / f"{self._slug(session_key or title or 'session')}.md"
-        stamp = now.strftime("%Y-%m-%d %H:%M:%S")
-        short_role = "A" if role == "assistant" else ("U" if role == "user" else "?")
-        line = f"- [{stamp}] [{title or session_key}] {short_role}: {clean}"
+        line = self._format_record_line(
+            stamp=now.strftime("%Y-%m-%d %H:%M:%S"),
+            title=(title or session_key),
+            role=role,
+            text=clean,
+            sender=sender,
+        )
 
         if not day_path.exists():
             day_path.write_text(f"# Daily Memory {now:%Y-%m-%d}\n\n", encoding="utf-8")
@@ -219,6 +249,43 @@ class WorkspaceContextManager:
             )
         with session_path.open("a", encoding="utf-8") as fh:
             fh.write(line + "\n")
+
+    def rewrite_session_records(
+        self,
+        *,
+        session_key: str,
+        title: str,
+        records: list[dict] | None,
+    ) -> None:
+        if not self.enabled:
+            return
+        session_path = self.session_dir / f"{self._slug(session_key or title or 'session')}.md"
+        lines = [f"# Session Memory", "", f"- key: {session_key}", f"- title: {title}", ""]
+        for record in records or []:
+            if not isinstance(record, dict):
+                continue
+            clean = self._clip_text(record.get("text", ""), 500)
+            if not clean:
+                continue
+            observed_at = int(record.get("observed_at", 0) or 0)
+            try:
+                stamp = (
+                    datetime.fromtimestamp(observed_at).strftime("%Y-%m-%d %H:%M:%S")
+                    if observed_at > 0
+                    else datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                )
+            except Exception:
+                stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            lines.append(
+                self._format_record_line(
+                    stamp=stamp,
+                    title=(title or session_key),
+                    role=str(record.get("role", "unknown")),
+                    text=clean,
+                    sender=str(record.get("sender", "")),
+                )
+            )
+        session_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     def append_long_term_memory(self, note: str) -> None:
         if not self.enabled:
@@ -320,10 +387,10 @@ class WorkspaceContextManager:
         state["updated_at"] = self._now_iso()
         self._save_session_state(state)
 
-    def remember_structured(
+    def _remember_structured_into_state(
         self,
+        state: dict,
         *,
-        session_key: str,
         title: str,
         records: list[dict] | None = None,
         summary: str = "",
@@ -331,12 +398,8 @@ class WorkspaceContextManager:
         facts: list[str] | None = None,
         events: list[str] | None = None,
         relations: list[dict] | None = None,
+        stamp: str,
     ) -> None:
-        if not self.enabled:
-            return
-        state = self._load_session_state(session_key=session_key, title=title)
-        stamp = self._now_iso()
-
         if summary:
             state.setdefault("profile", {})["summary"] = self._clip_text(summary, 240)
 
@@ -423,6 +486,55 @@ class WorkspaceContextManager:
             elif role == "assistant" and text:
                 self._append_event(state, f"我回复: {text}", stamp=stamp)
 
+    def rewrite_session_structured(
+        self,
+        *,
+        session_key: str,
+        title: str,
+        records: list[dict] | None = None,
+        summary: str = "",
+    ) -> None:
+        if not self.enabled:
+            return
+        state = self._new_session_state(session_key=session_key, title=title)
+        stamp = self._now_iso()
+        self._remember_structured_into_state(
+            state,
+            title=title,
+            records=records,
+            summary=summary,
+            stamp=stamp,
+        )
+        state["updated_at"] = stamp
+        self._save_session_state(state)
+
+    def remember_structured(
+        self,
+        *,
+        session_key: str,
+        title: str,
+        records: list[dict] | None = None,
+        summary: str = "",
+        people: list[dict] | None = None,
+        facts: list[str] | None = None,
+        events: list[str] | None = None,
+        relations: list[dict] | None = None,
+    ) -> None:
+        if not self.enabled:
+            return
+        state = self._load_session_state(session_key=session_key, title=title)
+        stamp = self._now_iso()
+        self._remember_structured_into_state(
+            state,
+            title=title,
+            records=records,
+            summary=summary,
+            people=people,
+            facts=facts,
+            events=events,
+            relations=relations,
+            stamp=stamp,
+        )
         state["updated_at"] = stamp
         self._save_session_state(state)
 

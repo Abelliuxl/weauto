@@ -34,9 +34,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "command",
         nargs="?",
-        choices=("run", "recover"),
+        choices=("run", "recover", "recover-auto", "recoverauto"),
         default="run",
-        help="run=normal loop; recover=manual page-by-page memory recovery mode",
+        help="run=normal loop; recover=manual recovery; recover-auto/recoverauto=auto scroll recovery",
     )
     parser.add_argument(
         "--config",
@@ -58,6 +58,9 @@ def main() -> None:
     bot = WeChatGuiRpaBot(cfg)
     if args.command == "recover":
         bot.run_recover_mode(countdown_sec=max(0, int(args.recover_countdown)))
+        return
+    if args.command in {"recover-auto", "recoverauto"}:
+        bot.run_recover_auto_mode(countdown_sec=max(0, int(args.recover_countdown)))
         return
     bot.run_forever()
 

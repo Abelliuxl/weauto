@@ -42,6 +42,12 @@ WeAuto 是一个仅基于 GUI 的微信自动化项目，核心能力是：
 ./start_rpa.sh config.toml recover
 ```
 
+恢复记忆模式（自动点安全点并持续上滑，到顶自动停止）：
+
+```bash
+./start_rpa.sh config.toml recoverauto
+```
+
 `start_rpa.sh` 会自动：
 
 - 创建并使用 `.venv312`
@@ -88,6 +94,7 @@ python run.py --config config.toml
 - 行标题区域校准：`./carlibrate_row_title.sh config.toml`
 - 行预览区域校准：`./carlibrate_preview.sh config.toml`
 - 未读红点圆形区域校准：`./carlibrate_unread.sh config.toml`
+- recover-auto 点击点与滚动幅度校准：`./carlibrate_recover_auto.sh config.toml`
 - 调试点击行：`./debug_click.sh config.toml --dry-run`
 - 调试点击预览区域：`./debug_preview.sh config.toml --dry-run`
 - 调试未读红点位置：`./debug_unread.sh config.toml --dry-run`

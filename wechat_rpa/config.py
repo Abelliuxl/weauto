@@ -280,6 +280,11 @@ class AppConfig:
     skip_if_latest_chat_from_self_private: bool = False
 
     input_point: PointRatio = field(default_factory=lambda: PointRatio(x=0.73, y=0.92))
+    recover_auto_click_point: PointRatio = field(
+        default_factory=lambda: PointRatio(x=-1.0, y=-1.0)
+    )
+    recover_auto_scroll_amount: int = 900
+    recover_auto_scroll_pause_sec: float = 0.7
     unread_badge: UnreadBadgeConfig = field(default_factory=UnreadBadgeConfig)
     unread_badge_circle: UnreadBadgeCircleConfig = field(
         default_factory=UnreadBadgeCircleConfig
@@ -620,6 +625,15 @@ def load_config(path: str | Path | None) -> AppConfig:
     )
 
     cfg.input_point = _load_point(data, "input_point", cfg.input_point)
+    cfg.recover_auto_click_point = _load_point(
+        data, "recover_auto_click_point", cfg.recover_auto_click_point
+    )
+    cfg.recover_auto_scroll_amount = int(
+        data.get("recover_auto_scroll_amount", cfg.recover_auto_scroll_amount)
+    )
+    cfg.recover_auto_scroll_pause_sec = float(
+        data.get("recover_auto_scroll_pause_sec", cfg.recover_auto_scroll_pause_sec)
+    )
 
     badge = data.get("unread_badge", {})
     cfg.unread_badge = UnreadBadgeConfig(

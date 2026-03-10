@@ -140,6 +140,17 @@ class FocusResult:
 
 
 @dataclass
+class RecoverCaptureResult:
+    bounds: "WindowBounds"
+    title: str
+    session_key: str
+    parsed: int
+    appended: int
+    last_line: str = ""
+    next_title: str = ""
+
+
+@dataclass
 class SessionState:
     short: list[str]
     history: list[dict]
@@ -619,6 +630,7 @@ class WeChatGuiRpaBot:
                 title=row.title,
                 role=norm_role,
                 text=clean,
+                sender=(sender or "").strip(),
             )
             self._workspace.remember_structured(
                 session_key=key,
@@ -630,20 +642,33 @@ class WeChatGuiRpaBot:
                 print(f"[warn] workspace memory append failed: {exc}")
         self._memory_dirty = True
 
-    def _merge_session_records(
+    def _session_short_item_from_record(self, record: dict) -> str:
+        role = str(record.get("role", "unknown")).strip().lower()
+        text = re.sub(r"\s+", " ", str(record.get("text", ""))).strip()
+        sender = (str(record.get("sender", "")) or "").strip()[:24]
+        short_role = "A" if role == "assistant" else ("U" if role == "user" else "?")
+        if role == "user" and sender:
+            return f"{short_role}({sender}):{text[:128]}"
+        return f"{short_role}:{text[:140]}"
+
+    def _refresh_session_short_from_history(self, sess: SessionState) -> None:
+        items: list[str] = []
+        for record in sess.history:
+            text = re.sub(r"\s+", " ", str(record.get("text", ""))).strip()
+            if not text:
+                continue
+            items.append(self._session_short_item_from_record(record))
+        max_items = max(4, self.cfg.memory_short_max_items)
+        sess.short = items[-max_items:]
+
+    def _normalize_records_for_merge(
         self,
-        row: ChatRowState,
         records: list[dict] | None,
         *,
-        source: str = "vision",
-    ) -> None:
-        if not records:
-            return
-        key = self._session_key_for_row(row)
-        sess = self._get_or_create_session(key)
-        existing_keys = [self._session_record_key(x) for x in sess.history[-40:]]
+        source: str,
+    ) -> list[dict]:
         incoming: list[dict] = []
-        for record in records:
+        for record in records or []:
             if not isinstance(record, dict):
                 continue
             text = str(record.get("text", "")).strip()
@@ -658,9 +683,111 @@ class WeChatGuiRpaBot:
                     "source": source,
                 }
             )
+        return incoming
+
+    @staticmethod
+    def _max_suffix_prefix_overlap(left: list[str], right: list[str]) -> int:
+        max_overlap = min(len(left), len(right))
+        for size in range(max_overlap, 0, -1):
+            if left[-size:] == right[:size]:
+                return size
+        return 0
+
+    @staticmethod
+    def _set_record_observed_range(records: list[dict], *, before: int | None = None, after: int | None = None) -> None:
+        if not records:
+            return
+        if before is not None:
+            start = int(before) - len(records)
+        else:
+            anchor = int(after if after is not None else time.time())
+            start = anchor + 1
+        for idx, record in enumerate(records):
+            record["observed_at"] = start + idx
+
+    def _rewrite_recover_workspace_session(self, row: ChatRowState) -> None:
+        key = self._session_key_for_row(row)
+        sess = self._get_or_create_session(key)
+        try:
+            self._workspace.rewrite_session_records(
+                session_key=key,
+                title=row.title,
+                records=sess.history,
+            )
+            self._workspace.rewrite_session_structured(
+                session_key=key,
+                title=row.title,
+                records=sess.history,
+                summary=sess.summary,
+            )
+        except Exception as exc:
+            if self.cfg.log_verbose:
+                print(f"[warn] recover workspace rewrite failed: {exc}")
+
+    def _merge_session_records(
+        self,
+        row: ChatRowState,
+        records: list[dict] | None,
+        *,
+        source: str = "vision",
+        order_mode: str = "append",
+    ) -> None:
+        if not records:
+            return
+        key = self._session_key_for_row(row)
+        sess = self._get_or_create_session(key)
+        incoming = self._normalize_records_for_merge(records, source=source)
         if not incoming:
             return
 
+        if order_mode == "recover":
+            existing_head_keys = [self._session_record_key(x) for x in sess.history[:80]]
+            existing_tail_keys = [self._session_record_key(x) for x in sess.history[-80:]]
+            incoming_keys = [self._session_record_key(x) for x in incoming]
+
+            prepend_overlap = self._max_suffix_prefix_overlap(incoming_keys, existing_head_keys)
+            append_overlap = self._max_suffix_prefix_overlap(existing_tail_keys, incoming_keys)
+
+            if not sess.history:
+                self._set_record_observed_range(incoming, after=int(time.time()) - 1)
+                sess.history = list(incoming)
+            elif prepend_overlap > 0 and prepend_overlap >= append_overlap:
+                new_records = incoming[:-prepend_overlap]
+                if not new_records:
+                    return
+                first_ts = int(sess.history[0].get("observed_at", 0) or 0)
+                if first_ts <= 0:
+                    first_ts = int(sess.history[-1].get("observed_at", 0) or int(time.time()))
+                self._set_record_observed_range(new_records, before=first_ts)
+                sess.history = list(new_records) + list(sess.history)
+            elif append_overlap > 0:
+                new_records = incoming[append_overlap:]
+                if not new_records:
+                    return
+                last_ts = int(sess.history[-1].get("observed_at", 0) or 0)
+                self._set_record_observed_range(new_records, after=last_ts)
+                sess.history.extend(new_records)
+            else:
+                first_ts = int(sess.history[0].get("observed_at", 0) or 0)
+                if first_ts <= 0:
+                    first_ts = int(time.time())
+                self._set_record_observed_range(incoming, before=first_ts)
+                sess.history = list(incoming) + list(sess.history)
+                if self.cfg.log_verbose:
+                    print(
+                        f"[recover-merge] no overlap | key={self._fit_col(key, 12)} | "
+                        f"prepend={len(incoming):>2}"
+                    )
+
+            hist_limit = max(0, int(self.cfg.memory_history_max_items))
+            if hist_limit > 0 and len(sess.history) > hist_limit:
+                sess.history = sess.history[-hist_limit:]
+            self._refresh_session_short_from_history(sess)
+            self._remember_session_title(key, row.title)
+            self._memory_dirty = True
+            return
+
+        existing_keys = [self._session_record_key(x) for x in sess.history[-40:]]
         incoming_keys = [self._session_record_key(x) for x in incoming]
         overlap = 0
         max_overlap = min(len(existing_keys), len(incoming_keys))
@@ -3315,6 +3442,18 @@ class WeChatGuiRpaBot:
         time.sleep(max(0.01, self.cfg.mouse_down_hold_sec))
         pyautogui.mouseUp()
 
+    def _perform_scroll(self, amount: int) -> None:
+        total = int(amount)
+        if total == 0:
+            return
+        direction = 1 if total > 0 else -1
+        remaining = abs(total)
+        while remaining > 0:
+            step = min(120, remaining)
+            pyautogui.scroll(direction * step)
+            remaining -= step
+            time.sleep(0.015)
+
     def _paste_and_send(self, message: str) -> None:
         pyperclip.copy(message)
         time.sleep(0.05)
@@ -3468,6 +3607,263 @@ class WeChatGuiRpaBot:
             print("[recover] stdin unavailable, auto-continue in 2s")
             time.sleep(2.0)
 
+    def _recover_title_match_score(self, left: str, right: str) -> float:
+        lhs = self._normalize_title_text(left)
+        rhs = self._normalize_title_text(right)
+        if not lhs or not rhs:
+            return 0.0
+        if lhs == rhs:
+            return 100.0
+        if lhs in rhs or rhs in lhs:
+            return 88.0 - abs(len(lhs) - len(rhs))
+        return SequenceMatcher(a=lhs, b=rhs).ratio() * 50.0
+
+    def _recover_sidebar_title(
+        self,
+        bounds: "WindowBounds",
+        *,
+        header_title: str = "",
+        last_title: str = "",
+        mode_tag: str = "recover",
+    ) -> str:
+        try:
+            rows = self._scan_rows_from_bounds(bounds)
+        except Exception as exc:
+            if self.cfg.log_verbose:
+                print(f"[warn] {mode_tag} sidebar scan failed: {exc}")
+            return ""
+
+        rows = [item for item in rows if self._normalize_session_title_display(item.title)]
+        if not rows:
+            return ""
+
+        if last_title:
+            expected = self._recover_virtual_row(last_title, -1)
+            matched = self._find_row_in_snapshot(rows, expected)
+            if matched and matched.title:
+                title = self._normalize_session_title_display(matched.title)
+                if title:
+                    if title != self._normalize_session_title_display(last_title):
+                        print(
+                            f"[{mode_tag}] title-from-row | "
+                            f"prev={self._fit_col(last_title, 16)} -> use={self._fit_col(title, 16)}"
+                        )
+                    return title
+
+        best_title = ""
+        best_score = 0.0
+        for item in rows:
+            title = self._normalize_session_title_display(item.title)
+            if not title:
+                continue
+            score = self._recover_title_match_score(title, header_title)
+            if score > best_score:
+                best_score = score
+                best_title = title
+        if best_title and best_score >= 42.0:
+            if header_title and best_title != self._normalize_session_title_display(header_title):
+                print(
+                    f"[{mode_tag}] title-from-row | "
+                    f"header={self._fit_col(header_title, 16)} -> use={self._fit_col(best_title, 16)}"
+                )
+            return best_title
+        return ""
+
+    def _stabilize_recover_title(
+        self,
+        title_ocr: str,
+        *,
+        last_title: str = "",
+        mode_tag: str = "recover",
+    ) -> str:
+        candidate = self._normalize_session_title_display(title_ocr)
+        previous = self._normalize_session_title_display(last_title)
+        if candidate and previous and self._is_chat_header_matched(previous, candidate):
+            if candidate != previous:
+                print(
+                    f"[{mode_tag}] title-stabilized | "
+                    f"ocr={self._fit_col(candidate, 16)} -> use={self._fit_col(previous, 16)}"
+                )
+            return previous
+
+        if candidate:
+            resolved_key = self._resolve_session_key_by_query(candidate)
+            if resolved_key:
+                resolved_title = self._normalize_session_title_display(
+                    self._display_session_name(resolved_key)
+                )
+                if resolved_title and self._is_chat_header_matched(resolved_title, candidate):
+                    if candidate != resolved_title:
+                        print(
+                            f"[{mode_tag}] title-corrected | "
+                            f"ocr={self._fit_col(candidate, 16)} -> use={self._fit_col(resolved_title, 16)}"
+                        )
+                    return resolved_title
+
+        return candidate or previous
+
+    def _recover_capture_page(
+        self,
+        *,
+        page: int,
+        last_title: str = "",
+        mode_tag: str = "recover",
+    ) -> RecoverCaptureResult:
+        self._activate_wechat()
+        time.sleep(self.cfg.activate_wait_sec)
+        bounds = get_front_window_bounds(self.cfg.app_name)
+
+        title_ocr = self._detect_active_chat_title(bounds)
+        sidebar_title = self._recover_sidebar_title(
+            bounds,
+            header_title=title_ocr,
+            last_title=last_title,
+            mode_tag=mode_tag,
+        )
+        if sidebar_title and title_ocr and (not self._is_chat_header_matched(sidebar_title, title_ocr)):
+            print(
+                f"[{mode_tag}] row/header mismatch | "
+                f"row={self._fit_col(sidebar_title, 16)} | header={self._fit_col(title_ocr, 16)}"
+            )
+        title_seed = sidebar_title or title_ocr
+        next_title = self._stabilize_recover_title(
+            title_seed,
+            last_title=last_title,
+            mode_tag=mode_tag,
+        ) or "unknown-session"
+        title = next_title
+        if not title_seed:
+            print(
+                f"[warn] {mode_tag} title OCR empty, fallback={self._fit_col(title, 16)}"
+            )
+
+        row = self._recover_virtual_row(title, page)
+        session_key = self._session_key_for_row(row)
+        sess_before = self._get_or_create_session(session_key)
+        before_count = len(sess_before.history)
+        is_group = self._is_group_chat(row)
+
+        session_context = self._build_session_context(row)
+        session_history = self._build_session_history_text(row)
+        workspace_context = self._workspace_context_for_row(row, is_admin=False)
+        memory_recall = self._workspace_memory_recall_for_row(
+            row,
+            title or session_key,
+            is_admin=False,
+        )
+
+        snapshot = self._extract_chat_context(
+            bounds,
+            title=title,
+            reason="recover",
+            is_group=is_group,
+            session_context=session_context,
+            session_history=session_history,
+            workspace_context=workspace_context,
+            memory_recall=memory_recall,
+            latest_hint="recover_page_scan",
+            preview="",
+        )
+
+        records = list(snapshot.chat_records or [])
+        if records:
+            self._merge_session_records(
+                row,
+                records,
+                source="recover",
+                order_mode="recover",
+            )
+        if snapshot.memory_summary:
+            self._apply_session_summary(row, snapshot.memory_summary)
+        self._rewrite_recover_workspace_session(row)
+        self._save_persistent_memory()
+
+        sess_after = self._get_or_create_session(session_key)
+        appended = max(0, len(sess_after.history) - before_count)
+        print(
+            f"[{mode_tag}] page={page} done | title={self._fit_col(title, 16)} "
+            f"| key={self._fit_col(session_key, 12)} | parsed={len(records):>2} | appended={appended:>2}"
+        )
+        if snapshot.last_line:
+            line_w = max(24, self._term_width() - 18)
+            print(f"          last={self._fit_col(snapshot.last_line, line_w)}")
+        return RecoverCaptureResult(
+            bounds=bounds,
+            title=title,
+            session_key=session_key,
+            parsed=len(records),
+            appended=appended,
+            last_line=snapshot.last_line,
+            next_title=next_title,
+        )
+
+    def _recover_scroll_probe(self, bounds: "WindowBounds") -> np.ndarray:
+        x = bounds.x + int(bounds.width * self.cfg.chat_context_region.x)
+        y = bounds.y + int(bounds.height * self.cfg.chat_context_region.y)
+        w = int(bounds.width * self.cfg.chat_context_region.w)
+        h = int(bounds.height * self.cfg.chat_context_region.h)
+        if w <= 0 or h <= 0:
+            return np.zeros((1, 1), dtype=np.uint8)
+        shot = screenshot_region(x, y, w, h, high_res=True)
+        gray = np.asarray(shot.convert("L"), dtype=np.uint8)
+        if gray.ndim != 2 or gray.size == 0:
+            return np.zeros((1, 1), dtype=np.uint8)
+        pad_y = max(1, int(gray.shape[0] * 0.04))
+        pad_x = max(1, int(gray.shape[1] * 0.04))
+        if gray.shape[0] > pad_y * 2 and gray.shape[1] > pad_x * 2:
+            gray = gray[pad_y:-pad_y, pad_x:-pad_x]
+        return gray[::3, ::3]
+
+    def _recover_scroll_changed(
+        self,
+        before: np.ndarray,
+        after: np.ndarray,
+    ) -> tuple[bool, float, float]:
+        if before.shape != after.shape:
+            return True, 999.0, 1.0
+        if before.size == 0 or after.size == 0:
+            return False, 0.0, 0.0
+        diff = np.abs(before.astype(np.int16) - after.astype(np.int16))
+        mean_diff = float(diff.mean())
+        changed_ratio = float((diff >= 12).mean())
+        moved = (mean_diff >= 3.0) or (changed_ratio >= 0.015)
+        return moved, mean_diff, changed_ratio
+
+    def _recover_auto_click_xy(self, bounds: "WindowBounds") -> tuple[int, int]:
+        point = self.cfg.recover_auto_click_point
+        if not (0.0 <= point.x <= 1.0 and 0.0 <= point.y <= 1.0):
+            raise ValueError(
+                "recover_auto_click_point invalid; run ./carlibrate_recover_auto.sh config.toml first"
+            )
+        return (
+            bounds.x + int(bounds.width * point.x),
+            bounds.y + int(bounds.height * point.y),
+        )
+
+    def _recover_auto_scroll_once(self, bounds: "WindowBounds", *, page: int) -> bool:
+        amount = max(1, abs(int(self.cfg.recover_auto_scroll_amount)))
+        pause_sec = max(0.15, float(self.cfg.recover_auto_scroll_pause_sec))
+        before = self._recover_scroll_probe(bounds)
+        click_x, click_y = self._recover_auto_click_xy(bounds)
+        self._safe_click(click_x, click_y)
+        time.sleep(0.08)
+        self._perform_scroll(amount)
+        time.sleep(pause_sec)
+        latest_bounds = get_front_window_bounds(self.cfg.app_name)
+        after = self._recover_scroll_probe(latest_bounds)
+        moved, mean_diff, changed_ratio = self._recover_scroll_changed(before, after)
+        if moved:
+            print(
+                f"[recover-auto] page={page} scrolled | steps={amount} "
+                f"| diff={mean_diff:.2f} | change={changed_ratio:.3f}"
+            )
+        else:
+            print(
+                f"[recover-auto] stop | top reached | steps={amount} "
+                f"| diff={mean_diff:.2f} | change={changed_ratio:.3f}"
+            )
+        return moved
+
     def run_recover_mode(self, *, countdown_sec: int = 3) -> None:
         self._last_activity_at = time.time()
         self._last_heartbeat_at = 0.0
@@ -3486,79 +3882,67 @@ class WeChatGuiRpaBot:
                 self._recover_countdown(countdown_sec)
 
                 try:
-                    self._activate_wechat()
-                    time.sleep(self.cfg.activate_wait_sec)
-                    bounds = get_front_window_bounds(self.cfg.app_name)
-                except Exception as exc:
+                    result = self._recover_capture_page(
+                        page=page,
+                        last_title=last_title,
+                        mode_tag="recover",
+                    )
+                except WindowNotFoundError as exc:
                     print(f"[warn] recover window not ready: {exc}")
                     self._recover_wait_next_page()
                     page -= 1
                     continue
-
-                title_ocr = self._detect_active_chat_title(bounds)
-                if title_ocr:
-                    last_title = title_ocr
-                title = title_ocr or last_title or "unknown-session"
-                if not title_ocr:
-                    print(
-                        f"[warn] recover title OCR empty, fallback={self._fit_col(title, 16)}"
-                    )
-
-                row = self._recover_virtual_row(title, page)
-                session_key = self._session_key_for_row(row)
-                sess_before = self._get_or_create_session(session_key)
-                before_count = len(sess_before.history)
-                is_group = self._is_group_chat(row)
-
-                session_context = self._build_session_context(row)
-                session_history = self._build_session_history_text(row)
-                workspace_context = self._workspace_context_for_row(row, is_admin=False)
-                memory_recall = self._workspace_memory_recall_for_row(
-                    row,
-                    title or session_key,
-                    is_admin=False,
-                )
-
-                try:
-                    snapshot = self._extract_chat_context(
-                        bounds,
-                        title=title,
-                        reason="recover",
-                        is_group=is_group,
-                        session_context=session_context,
-                        session_history=session_history,
-                        workspace_context=workspace_context,
-                        memory_recall=memory_recall,
-                        latest_hint="recover_page_scan",
-                        preview="",
-                    )
                 except Exception as exc:
-                    print(f"[warn] recover analyze failed: {exc}")
+                    print(f"[warn] recover capture failed: {exc}")
                     self._recover_wait_next_page()
                     continue
-
-                records = list(snapshot.chat_records or [])
-                if records:
-                    self._merge_session_records(row, records, source="recover")
-                if snapshot.memory_summary:
-                    self._apply_session_summary(row, snapshot.memory_summary)
-                self._apply_workspace_memory_update(row, snapshot)
-                self._save_persistent_memory()
-
-                sess_after = self._get_or_create_session(session_key)
-                appended = max(0, len(sess_after.history) - before_count)
-                print(
-                    f"[recover] page={page} done | title={self._fit_col(title, 16)} "
-                    f"| key={self._fit_col(session_key, 12)} | parsed={len(records):>2} | appended={appended:>2}"
-                )
-                if snapshot.last_line:
-                    line_w = max(24, self._term_width() - 18)
-                    print(f"          last={self._fit_col(snapshot.last_line, line_w)}")
+                last_title = result.next_title or last_title
                 self._recover_wait_next_page()
         except KeyboardInterrupt:
             self._save_persistent_memory()
             print("")
             print(f"[recover] stopped | pages={page}")
+
+    def run_recover_auto_mode(self, *, countdown_sec: int = 3) -> None:
+        self._last_activity_at = time.time()
+        self._last_heartbeat_at = 0.0
+        page = 0
+        last_title = ""
+        print("[start] recover-auto mode started")
+        print("[start] 每页会执行: 标题识别 -> 聊天截图分析 -> 记忆落盘 -> 安全点击 -> 自动上滑")
+        print("[start] 到达最顶且无法继续上滑后会自动停止")
+        try:
+            while True:
+                page += 1
+                print("")
+                print(f"[recover-auto] page={page} ready")
+                self._recover_countdown(countdown_sec)
+                try:
+                    result = self._recover_capture_page(
+                        page=page,
+                        last_title=last_title,
+                        mode_tag="recover-auto",
+                    )
+                except WindowNotFoundError as exc:
+                    print(f"[warn] recover-auto window not ready: {exc}")
+                    break
+                except Exception as exc:
+                    print(f"[warn] recover-auto capture failed: {exc}")
+                    break
+
+                last_title = result.next_title or last_title
+                try:
+                    if not self._recover_auto_scroll_once(result.bounds, page=page):
+                        break
+                except Exception as exc:
+                    print(f"[warn] recover-auto scroll failed: {exc}")
+                    break
+        except KeyboardInterrupt:
+            print("")
+            print(f"[recover-auto] interrupted | pages={page}")
+        finally:
+            self._save_persistent_memory()
+            print(f"[recover-auto] stopped | pages={page}")
 
     def run_forever(self) -> None:
         self._last_activity_at = time.time()

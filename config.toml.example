@@ -163,6 +163,8 @@ chat_context_max_lines = 14
 chat_self_x_ratio = 0.62
 skip_if_latest_chat_from_self = true
 skip_if_latest_chat_from_self_private = false
+recover_auto_scroll_amount = 900
+recover_auto_scroll_pause_sec = 0.7
 
 # --------------------
 # Region Feature Switches
@@ -231,6 +233,10 @@ r = 0.195652
 [input_point]
 x = 0.73
 y = 0.92
+
+[recover_auto_click_point]
+x = -1.0
+y = -1.0
 
 # --------------------
 # Detection Thresholds
