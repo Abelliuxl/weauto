@@ -17,6 +17,7 @@ import sys
 import time
 import unicodedata
 import urllib.error
+import urllib.parse
 import urllib.request
 
 import numpy as np
@@ -1622,6 +1623,12 @@ class WeChatGuiRpaBot:
             )
         return tools
 
+    def _active_web_search_provider(self) -> str:
+        provider = str(self.cfg.web_search_provider or "").strip().lower()
+        if provider == "brave":
+            return "brave"
+        return "tavily"
+
     def _resolve_tavily_api_key(self) -> str:
         if self.cfg.tavily_api_key:
             return self.cfg.tavily_api_key
@@ -1630,21 +1637,60 @@ class WeChatGuiRpaBot:
             return ""
         return os.getenv(env_name, "")
 
-    def _has_web_search_tool(self) -> bool:
-        return bool(self.cfg.tavily_enabled and self._resolve_tavily_api_key())
+    def _resolve_brave_api_key(self) -> str:
+        if self.cfg.brave_api_key:
+            return self.cfg.brave_api_key
+        env_name = (self.cfg.brave_api_key_env or "").strip()
+        if not env_name:
+            return ""
+        return os.getenv(env_name, "")
 
-    def _web_search_status_text(self) -> str:
-        if not self.cfg.tavily_enabled:
-            return "disabled (tavily_enabled=false)"
-        if self._resolve_tavily_api_key():
+    def _resolve_web_search_api_key(self, provider: str) -> str:
+        if provider == "brave":
+            return self._resolve_brave_api_key()
+        return self._resolve_tavily_api_key()
+
+    def _web_search_enabled(self, provider: str) -> bool:
+        if provider == "brave":
+            return bool(self.cfg.brave_enabled)
+        return bool(self.cfg.tavily_enabled)
+
+    def _web_search_max_results(self, provider: str) -> int:
+        if provider == "brave":
+            return max(1, int(self.cfg.brave_max_results))
+        return max(1, int(self.cfg.tavily_max_results))
+
+    def _web_search_key_hint(self, provider: str) -> str:
+        if provider == "brave":
+            env_name = (self.cfg.brave_api_key_env or "").strip()
             return (
-                f"available (tool=web_search provider=tavily "
-                f"max_results={max(1, int(self.cfg.tavily_max_results))})"
+                f"config.brave_api_key or env {env_name}"
+                if env_name
+                else "config.brave_api_key"
             )
         env_name = (self.cfg.tavily_api_key_env or "").strip()
-        if env_name:
-            return f"blocked (missing api key: config.tavily_api_key or env {env_name})"
-        return "blocked (missing api key: config.tavily_api_key)"
+        return (
+            f"config.tavily_api_key or env {env_name}"
+            if env_name
+            else "config.tavily_api_key"
+        )
+
+    def _has_web_search_tool(self) -> bool:
+        provider = self._active_web_search_provider()
+        if not self._web_search_enabled(provider):
+            return False
+        return bool(self._resolve_web_search_api_key(provider))
+
+    def _web_search_status_text(self) -> str:
+        provider = self._active_web_search_provider()
+        if not self._web_search_enabled(provider):
+            return f"disabled (provider={provider} {provider}_enabled=false)"
+        if self._resolve_web_search_api_key(provider):
+            return (
+                f"available (tool=web_search provider={provider} "
+                f"max_results={self._web_search_max_results(provider)})"
+            )
+        return f"blocked (missing api key: {self._web_search_key_hint(provider)})"
 
     @staticmethod
     def _plan_has_tool(actions: list[dict] | None, tool_name: str) -> bool:
@@ -2193,21 +2239,63 @@ class WeChatGuiRpaBot:
             planned_reply = self._sanitize_generated_reply(final_hint, fallback=fallback)
         return merged_memory, planned_reply, total_actions
 
+    @staticmethod
+    def _clean_web_query(query: str) -> str:
+        return re.sub(r"\s+", " ", query or "").strip()[:120]
+
+    @staticmethod
+    def _compact_web_text(raw: object, *, limit: int) -> str:
+        return re.sub(r"\s+", " ", str(raw or "")).strip()[:limit]
+
+    def _format_web_search_text(
+        self,
+        *,
+        summary: str,
+        rows: list[tuple[str, str, str]],
+        max_results: int,
+    ) -> str:
+        lines: list[str] = []
+        clean_summary = self._compact_web_text(summary, limit=240)
+        if clean_summary:
+            lines.append(f"摘要: {clean_summary}")
+        for title, url_item, snippet in rows[: max(1, int(max_results))]:
+            row = " | ".join(
+                [
+                    x
+                    for x in [
+                        self._compact_web_text(title, limit=90),
+                        self._compact_web_text(url_item, limit=160),
+                        self._compact_web_text(snippet, limit=180),
+                    ]
+                    if x
+                ]
+            )
+            if row:
+                lines.append(row)
+        return "\n".join(lines)[:1200]
+
+    def _web_search(self, query: str) -> tuple[str, str]:
+        provider = self._active_web_search_provider()
+        if provider == "brave":
+            return provider, self._brave_search(query)
+        return provider, self._tavily_search(query)
+
     def _tavily_search(self, query: str) -> str:
-        clean_query = re.sub(r"\s+", " ", query or "").strip()[:120]
+        clean_query = self._clean_web_query(query)
         if not clean_query:
             return ""
         api_key = self._resolve_tavily_api_key()
         if not api_key:
             raise RuntimeError("tavily api key missing")
 
+        max_results = self._web_search_max_results("tavily")
         base = (self.cfg.tavily_base_url or "https://api.tavily.com").rstrip("/")
         url = base if base.endswith("/search") else (base + "/search")
         payload = {
             "api_key": api_key,
             "query": clean_query,
             "search_depth": "basic",
-            "max_results": max(1, int(self.cfg.tavily_max_results)),
+            "max_results": max_results,
             "include_answer": True,
             "include_raw_content": False,
         }
@@ -2232,21 +2320,94 @@ class WeChatGuiRpaBot:
             raise RuntimeError(f"tavily network error: {exc}") from exc
 
         data = json.loads(raw)
-        lines: list[str] = []
-        answer = re.sub(r"\s+", " ", str(data.get("answer", "") or "")).strip()
-        if answer:
-            lines.append(f"摘要: {answer[:240]}")
+        answer = self._compact_web_text(data.get("answer", ""), limit=240)
         results = data.get("results") if isinstance(data.get("results"), list) else []
-        for item in results[: max(1, int(self.cfg.tavily_max_results))]:
+        rows: list[tuple[str, str, str]] = []
+        for item in results[:max_results]:
             if not isinstance(item, dict):
                 continue
-            title = re.sub(r"\s+", " ", str(item.get("title", "") or "")).strip()[:90]
-            url_item = str(item.get("url", "") or "").strip()[:160]
-            content = re.sub(r"\s+", " ", str(item.get("content", "") or "")).strip()[:180]
-            row = " | ".join([x for x in [title, url_item, content] if x])
-            if row:
-                lines.append(row)
-        return "\n".join(lines)[:1200]
+            rows.append(
+                (
+                    self._compact_web_text(item.get("title", ""), limit=90),
+                    self._compact_web_text(item.get("url", ""), limit=160),
+                    self._compact_web_text(item.get("content", ""), limit=180),
+                )
+            )
+        return self._format_web_search_text(summary=answer, rows=rows, max_results=max_results)
+
+    def _brave_search(self, query: str) -> str:
+        clean_query = self._clean_web_query(query)
+        if not clean_query:
+            return ""
+        api_key = self._resolve_brave_api_key()
+        if not api_key:
+            raise RuntimeError("brave api key missing")
+
+        max_results = self._web_search_max_results("brave")
+        timeout_sec = max(1.0, float(self.cfg.brave_timeout_sec))
+        base = (self.cfg.brave_base_url or "https://api.search.brave.com/res/v1/web").rstrip("/")
+        url = base if base.endswith("/search") else (base + "/search")
+        query_url = f"{url}?{urllib.parse.urlencode({'q': clean_query, 'count': max_results})}"
+        req = urllib.request.Request(
+            url=query_url,
+            method="GET",
+            headers={
+                "Accept": "application/json",
+                "X-Subscription-Token": api_key,
+            },
+        )
+        try:
+            ssl_ctx = ssl.create_default_context()
+            with urllib.request.urlopen(
+                req,
+                timeout=timeout_sec,
+                context=ssl_ctx,
+            ) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"brave http error: {exc.code} {detail}") from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"brave network error: {exc}") from exc
+
+        data = json.loads(raw)
+        web_obj = data.get("web") if isinstance(data.get("web"), dict) else {}
+        results = web_obj.get("results")
+        if not isinstance(results, list):
+            results = data.get("results")
+        if not isinstance(results, list):
+            results = []
+
+        rows: list[tuple[str, str, str]] = []
+        for item in results[:max_results]:
+            if not isinstance(item, dict):
+                continue
+            description = self._compact_web_text(item.get("description", ""), limit=180)
+            extra = ""
+            extra_raw = item.get("extra_snippets")
+            if isinstance(extra_raw, list):
+                extra_parts: list[str] = []
+                for part in extra_raw[:2]:
+                    clean_part = self._compact_web_text(part, limit=90)
+                    if clean_part:
+                        extra_parts.append(clean_part)
+                if extra_parts:
+                    extra = " ".join(extra_parts)
+            snippet = self._compact_web_text(
+                f"{description} {extra}".strip(),
+                limit=180,
+            )
+            rows.append(
+                (
+                    self._compact_web_text(item.get("title", ""), limit=90),
+                    self._compact_web_text(item.get("url", ""), limit=160),
+                    snippet,
+                )
+            )
+
+        summary_parts = [snippet for _, _, snippet in rows if snippet][:2]
+        summary = self._compact_web_text("；".join(summary_parts), limit=240)
+        return self._format_web_search_text(summary=summary, rows=rows, max_results=max_results)
 
     def _execute_agent_actions(
         self,
@@ -2371,18 +2532,21 @@ class WeChatGuiRpaBot:
                         ok = True
                 elif tool == "web_search":
                     query = re.sub(r"\s+", " ", str(args.get("query", "")).strip())[:80]
+                    provider = self._active_web_search_provider()
                     if not query:
                         status = "skip (empty query)"
-                    elif not self.cfg.tavily_enabled:
-                        status = "skip (tavily disabled)"
+                    elif not self._web_search_enabled(provider):
+                        status = f"skip ({provider} disabled)"
+                    elif not self._resolve_web_search_api_key(provider):
+                        status = f"skip (missing {provider} api key)"
                     else:
-                        search_text = self._tavily_search(query)
+                        active_provider, search_text = self._web_search(query)
                         if search_text:
                             status = "ok"
-                            obs = f"网页检索[{query}]: {search_text}"
+                            obs = f"网页检索[{query}]({active_provider}): {search_text}"
                         else:
                             status = "ok (no-hit)"
-                            obs = f"网页检索[{query}]无命中"
+                            obs = f"网页检索[{query}]({active_provider})无命中"
                         ok = True
                 elif tool == "mute_session":
                     if not is_admin:

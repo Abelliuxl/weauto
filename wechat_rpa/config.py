@@ -219,12 +219,19 @@ class AppConfig:
     agent_plan_max_total_actions: int = 6
     agent_plan_repeat_limit: int = 2
     agent_plan_observation_max_chars: int = 5200
+    web_search_provider: str = "tavily"
     tavily_enabled: bool = False
     tavily_base_url: str = "https://api.tavily.com"
     tavily_api_key: str = ""
     tavily_api_key_env: str = "TAVILY_API_KEY"
     tavily_max_results: int = 3
     tavily_timeout_sec: float = 8.0
+    brave_enabled: bool = False
+    brave_base_url: str = "https://api.search.brave.com/res/v1/web"
+    brave_api_key: str = ""
+    brave_api_key_env: str = "BRAVE_SEARCH_API_KEY"
+    brave_max_results: int = 3
+    brave_timeout_sec: float = 8.0
     heartbeat_enabled: bool = False
     heartbeat_interval_sec: float = 1800.0
     heartbeat_min_idle_sec: float = 20.0
@@ -360,6 +367,15 @@ def _load_sarcasm_level(raw: object, default: str = "low") -> str:
     if value in ("high", "3", "strong", "heavy", "高", "重"):
         return "high"
     return _load_sarcasm_level(default, "low") if value != default else "low"
+
+
+def _load_web_search_provider(raw: object, default: str = "tavily") -> str:
+    value = str(raw if raw is not None else default).strip().lower()
+    if value in ("tavily",):
+        return "tavily"
+    if value in ("brave", "brave_search", "brave-search"):
+        return "brave"
+    return _load_web_search_provider(default, "tavily") if value != default else "tavily"
 
 
 def _load_llm_config(raw_obj: object, default: LlmConfig) -> LlmConfig:
@@ -588,12 +604,22 @@ def load_config(path: str | Path | None) -> AppConfig:
         cfg.agent_plan_repeat_limit = 1
     if cfg.agent_plan_observation_max_chars < 1200:
         cfg.agent_plan_observation_max_chars = 1200
+    cfg.web_search_provider = _load_web_search_provider(
+        data.get("web_search_provider", cfg.web_search_provider),
+        cfg.web_search_provider,
+    )
     cfg.tavily_enabled = bool(data.get("tavily_enabled", cfg.tavily_enabled))
     cfg.tavily_base_url = str(data.get("tavily_base_url", cfg.tavily_base_url)).rstrip("/")
     cfg.tavily_api_key = str(data.get("tavily_api_key", cfg.tavily_api_key))
     cfg.tavily_api_key_env = str(data.get("tavily_api_key_env", cfg.tavily_api_key_env))
     cfg.tavily_max_results = int(data.get("tavily_max_results", cfg.tavily_max_results))
     cfg.tavily_timeout_sec = float(data.get("tavily_timeout_sec", cfg.tavily_timeout_sec))
+    cfg.brave_enabled = bool(data.get("brave_enabled", cfg.brave_enabled))
+    cfg.brave_base_url = str(data.get("brave_base_url", cfg.brave_base_url)).rstrip("/")
+    cfg.brave_api_key = str(data.get("brave_api_key", cfg.brave_api_key))
+    cfg.brave_api_key_env = str(data.get("brave_api_key_env", cfg.brave_api_key_env))
+    cfg.brave_max_results = int(data.get("brave_max_results", cfg.brave_max_results))
+    cfg.brave_timeout_sec = float(data.get("brave_timeout_sec", cfg.brave_timeout_sec))
     cfg.heartbeat_enabled = bool(data.get("heartbeat_enabled", cfg.heartbeat_enabled))
     cfg.heartbeat_interval_sec = float(
         data.get("heartbeat_interval_sec", cfg.heartbeat_interval_sec)

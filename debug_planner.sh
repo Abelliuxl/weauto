@@ -88,7 +88,28 @@ tools = [
     "set_session_summary",
     "search_memory",
 ]
-if cfg.tavily_enabled and (cfg.tavily_api_key or (cfg.tavily_api_key_env and os.getenv(cfg.tavily_api_key_env))):
+provider = str(getattr(cfg, "web_search_provider", "tavily") or "").strip().lower()
+if provider not in {"tavily", "brave"}:
+    provider = "tavily"
+if provider == "brave":
+    web_enabled = bool(getattr(cfg, "brave_enabled", False))
+    web_api_ok = bool(
+        getattr(cfg, "brave_api_key", "")
+        or (
+            getattr(cfg, "brave_api_key_env", "")
+            and os.getenv(getattr(cfg, "brave_api_key_env"))
+        )
+    )
+else:
+    web_enabled = bool(getattr(cfg, "tavily_enabled", False))
+    web_api_ok = bool(
+        getattr(cfg, "tavily_api_key", "")
+        or (
+            getattr(cfg, "tavily_api_key_env", "")
+            and os.getenv(getattr(cfg, "tavily_api_key_env"))
+        )
+    )
+if web_enabled and web_api_ok:
     tools.append("web_search")
 tools.extend(["remember_long_term", "mute_session", "unmute_session"])
 

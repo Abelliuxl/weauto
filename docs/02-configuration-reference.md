@@ -112,12 +112,19 @@
 | `heartbeat_max_actions` | `2` | 心跳每轮最多工具动作数 |
 | `heartbeat_fail_open` | `true` | 心跳失败是否不中断主循环 |
 | `heartbeat_prompt` | 内置提示词 | 心跳规划提示词，会和 `HEARTBEAT.md` 一起注入 |
-| `tavily_enabled` | `false` | 是否启用 Tavily 网页检索工具 |
+| `web_search_provider` | `"tavily"` | `web_search` 使用的检索 provider：`tavily` 或 `brave` |
+| `tavily_enabled` | `false` | 是否启用 Tavily provider |
 | `tavily_base_url` | `https://api.tavily.com` | Tavily API 地址 |
 | `tavily_api_key` | `""` | Tavily key（为空则走环境变量） |
 | `tavily_api_key_env` | `TAVILY_API_KEY` | Tavily 环境变量名 |
 | `tavily_max_results` | `3` | Tavily 每次返回条数上限 |
 | `tavily_timeout_sec` | `8.0` | Tavily 请求超时（秒） |
+| `brave_enabled` | `false` | 是否启用 Brave provider |
+| `brave_base_url` | `https://api.search.brave.com/res/v1/web` | Brave Search API 地址 |
+| `brave_api_key` | `""` | Brave key（为空则走环境变量） |
+| `brave_api_key_env` | `BRAVE_SEARCH_API_KEY` | Brave 环境变量名 |
+| `brave_max_results` | `3` | Brave 每次返回条数上限 |
+| `brave_timeout_sec` | `8.0` | Brave 请求超时（秒） |
 
 管理员命令（实际实现）：
 

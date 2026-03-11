@@ -1990,7 +1990,7 @@ class LlmReplyGenerator:
             "remember_session_event": "args={\"event\":\"<=120字\"} 记录当前会话近期事件",
             "set_session_summary": "args={\"summary\":\"<=200字\"} 更新当前会话画像摘要",
             "search_memory": "args={\"query\":\"<=80字\"} 在记忆库检索相关片段",
-            "web_search": "args={\"query\":\"<=80字\"} 联网检索公开网页信息（Tavily）",
+            "web_search": "args={\"query\":\"<=80字\"} 联网检索公开网页信息（provider 可配置）",
             "remember_long_term": "args={\"note\":\"<=200字\"} 写入长期记忆（仅管理员）",
             "maintain_memory": "args={\"days\":1-14} 整理近期记忆到 MEMORY.md",
             "refine_persona_files": "args={} 整理 SOUL/IDENTITY/USER/TOOLS 设定文件",
