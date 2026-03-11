@@ -1,14 +1,15 @@
 from __future__ import annotations
 
 import builtins
-import concurrent.futures
 import json
 import os
+import queue
 import ssl
 import base64
 import io
 import re
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -789,19 +790,46 @@ class LlmReplyGenerator:
                 ssl_ctx = ssl.create_default_context(cafile=certifi.where())
                 with urllib.request.urlopen(req, timeout=timeout_sec, context=ssl_ctx) as resp:
                     return resp.read().decode("utf-8", errors="replace")
+            done_q: queue.Queue[tuple[str, object]] = queue.Queue(maxsize=1)
 
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                future = pool.submit(_do_request)
-                while True:
-                    try:
-                        resp_text = future.result(timeout=progress_interval_sec)
-                        break
-                    except concurrent.futures.TimeoutError:
-                        elapsed_live = time.monotonic() - started
+            def _worker() -> None:
+                try:
+                    done_q.put(("ok", _do_request()))
+                except BaseException as exc:  # keep worker failures visible to caller
+                    done_q.put(("err", exc))
+
+            worker = threading.Thread(
+                target=_worker,
+                name=f"{label}-request",
+                daemon=True,
+            )
+            worker.start()
+            timeout_value = max(float(timeout_sec), 0.1)
+            deadline = started + timeout_value
+            last_logged_sec = -1
+            while True:
+                now = time.monotonic()
+                remaining = deadline - now
+                if remaining <= 0:
+                    raise TimeoutError("forced cutoff at request deadline")
+                wait_sec = min(progress_interval_sec, remaining)
+                try:
+                    state, payload = done_q.get(timeout=max(wait_sec, 0.05))
+                except queue.Empty:
+                    elapsed_live = int(time.monotonic() - started)
+                    if elapsed_live != last_logged_sec:
                         print(
                             f"[timing] {label} model={model_name} "
-                            f"running={elapsed_live:.0f}s timeout={float(timeout_sec):.1f}s"
+                            f"running={elapsed_live:d}s timeout={float(timeout_sec):.1f}s"
                         )
+                        last_logged_sec = elapsed_live
+                    continue
+                if state == "ok":
+                    resp_text = str(payload)
+                    break
+                raise payload if isinstance(payload, BaseException) else RuntimeError(
+                    f"{label} worker failed without exception object"
+                )
             elapsed = time.monotonic() - started
             print(
                 f"[timing] {label} model={model_name} "
@@ -828,6 +856,12 @@ class LlmReplyGenerator:
             elapsed = time.monotonic() - started
             raise RuntimeError(
                 f"{label} network error after {elapsed:.2f}s "
+                f"(timeout={float(timeout_sec):.1f}s): {exc}"
+            )
+        except TimeoutError as exc:
+            elapsed = time.monotonic() - started
+            raise RuntimeError(
+                f"{label} timeout after {elapsed:.2f}s "
                 f"(timeout={float(timeout_sec):.1f}s): {exc}"
             )
         return resp_text
