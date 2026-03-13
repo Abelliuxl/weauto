@@ -232,6 +232,11 @@ class AppConfig:
     brave_api_key_env: str = "BRAVE_SEARCH_API_KEY"
     brave_max_results: int = 3
     brave_timeout_sec: float = 8.0
+    # Agent Reach provider (via mcporter + Exa MCP)
+    agent_reach_enabled: bool = False
+    agent_reach_mcporter_cmd: str = "mcporter"
+    agent_reach_max_results: int = 5
+    agent_reach_timeout_sec: float = 12.0
     heartbeat_enabled: bool = False
     heartbeat_interval_sec: float = 1800.0
     heartbeat_min_idle_sec: float = 20.0
@@ -375,6 +380,8 @@ def _load_web_search_provider(raw: object, default: str = "tavily") -> str:
         return "tavily"
     if value in ("brave", "brave_search", "brave-search"):
         return "brave"
+    if value in ("agent_reach", "agent-reach", "agentreach", "reach", "exa"):
+        return "agent_reach"
     return _load_web_search_provider(default, "tavily") if value != default else "tavily"
 
 
@@ -620,6 +627,16 @@ def load_config(path: str | Path | None) -> AppConfig:
     cfg.brave_api_key_env = str(data.get("brave_api_key_env", cfg.brave_api_key_env))
     cfg.brave_max_results = int(data.get("brave_max_results", cfg.brave_max_results))
     cfg.brave_timeout_sec = float(data.get("brave_timeout_sec", cfg.brave_timeout_sec))
+    cfg.agent_reach_enabled = bool(data.get("agent_reach_enabled", cfg.agent_reach_enabled))
+    cfg.agent_reach_mcporter_cmd = str(
+        data.get("agent_reach_mcporter_cmd", cfg.agent_reach_mcporter_cmd)
+    ).strip()
+    cfg.agent_reach_max_results = int(
+        data.get("agent_reach_max_results", cfg.agent_reach_max_results)
+    )
+    cfg.agent_reach_timeout_sec = float(
+        data.get("agent_reach_timeout_sec", cfg.agent_reach_timeout_sec)
+    )
     cfg.heartbeat_enabled = bool(data.get("heartbeat_enabled", cfg.heartbeat_enabled))
     cfg.heartbeat_interval_sec = float(
         data.get("heartbeat_interval_sec", cfg.heartbeat_interval_sec)

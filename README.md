@@ -1,123 +1,119 @@
 # WeAuto：微信 macOS GUI RPA
 
-WeAuto 是一个仅基于 GUI 的微信自动化项目，核心能力是：
+![WeAuto Icon](docs/assets/weauto-icon.png)
 
-- 截图 + OCR 识别左侧聊天列表
-- 基于未读/预览变化/@ 触发自动处理
-- 右侧聊天区截图交给 Vision，输出规范化 `context + environment` JSON，再由文本 LLM 生成最终回复
-- 以聊天窗口标题为 session，持久化完整历史、短期上下文和长期摘要
-- 使用 `agent_workspace/` 文件工作区模拟 OpenClaw 风格 agent：人格、规则、长期记忆、每日记忆、会话记忆都可落盘检索
-- 支持 heartbeat 固定间隔自驱任务（可直接解析 `HEARTBEAT.md` 的工具指令，或回退 LLM 规划后执行）
-- 可选接入 LLM 进行分流决策
-- 鼠标键盘自动化点击并发送消息
+WeAuto 是一个仅基于 GUI 的微信自动化项目（不 Hook、不注入、不读微信数据库）。
 
-项目不使用 Hook、不注入进程、不读取微信数据库。
+当前实现核心能力：
 
-## 先做什么（建议顺序）
+- 左侧会话列表截图 + OCR（`rapidocr/paddleocr/cnocr`）
+- 触发检测：`mention` / `new_message` / `preview 变化`
+- 右侧聊天区截图交给 Vision，解析为标准化 `context + environment` JSON
+- 文本 LLM 负责是否回复（decision）+ 生成回复（reply）+ 会话摘要（summary）
+- `agent_workspace/` 工作区记忆体系（长期记忆、每日记忆、会话记忆）
+- 可选工具规划循环（memory/web_search/mute 等）
+- 可选 heartbeat 空闲自驱任务（含 `HEARTBEAT.md` 直接指令解析）
 
-1. 复制配置文件：`cp config.toml.example config.toml`
+## 快速开始（推荐顺序）
+
+1. 复制配置：`cp config.toml.example config.toml`
 2. 打开微信桌面端并固定窗口布局
-3. 先完成校准（非常重要）：见 [校准流程文档](docs/01-calibration-workflow.md)
-4. 校准后先用 `dry_run = true` 观察日志
-5. 稳定后再改成 `dry_run = false` 开启真实发送
+3. 先完成校准：见 [docs/01-calibration-workflow.md](docs/01-calibration-workflow.md)
+4. 先用 `dry_run=true` 跑一段时间观察日志
+5. 稳定后再切 `dry_run=false`
 
-## 文档导航
+## 启动方式
 
-- [文档总览](docs/README.md)
-- [校准流程（先看）](docs/01-calibration-workflow.md)
-- [配置文件完整参考](docs/02-configuration-reference.md)
-- [运行与日常操作](docs/03-run-and-operations.md)
-- [调试与故障排查](docs/04-debug-and-troubleshooting.md)
-- [架构与代码地图](docs/05-architecture.md)
-
-## 快速启动
+推荐：
 
 ```bash
 ./start_rpa.sh config.toml
 ```
 
-恢复记忆模式（手动翻页，逐页截图分析并写入记忆）：
-
-```bash
-./start_rpa.sh config.toml recover
-```
-
-恢复记忆模式（自动点安全点并持续上滑，到顶自动停止）：
-
-```bash
-./start_rpa.sh config.toml recoverauto
-```
-
 `start_rpa.sh` 会自动：
 
-- 创建并使用 `.venv312`
+- 创建/使用 `.venv312`
 - 安装 `requirements.txt`
-- 自动创建 `config.toml`（若不存在）
-- 启动 `python run.py --config ...`
-- 输出日志到 `logs/rpa_*.log`
+- 自动创建 `config.toml`（不存在时）
+- 自动加载 `.env.weauto` 和 `.env`（若存在）
+- 启动 `python -u run.py --config ...`
+- 生成 `logs/rpa_YYYYmmdd_HHMMSS.log`
+- 按文件数/总大小自动清理旧日志（`LOG_KEEP_MAX_FILES`、`LOG_KEEP_MAX_TOTAL_MB`）
 
-也可直接启动：
+也可直接运行：
 
 ```bash
 python run.py --config config.toml
 ```
 
-## OCR 后端切换（可选）
+## 运行模式
 
-项目默认使用 `rapidocr`。现在支持通过 `config.toml` 的 `[ocr]` 段切换：
-
-- `backend = "rapidocr"`（默认，已在 `requirements.txt`）
-- `backend = "paddleocr"`（精度通常更高，依赖更重）
-- `backend = "cnocr"`（接入简单，中文场景常用）
-
-如果切换到 `paddleocr/cnocr`，需要额外安装依赖：
+普通主循环：
 
 ```bash
-./.venv312/bin/pip install paddleocr
-./.venv312/bin/pip install cnocr
+./start_rpa.sh config.toml
 ```
 
-也可以开启 A/B 对比日志（同图双跑）：
+recover（手动翻页）：
 
-- `ab_compare_backend = "paddleocr"`
-- `ab_compare_sample_rate = 0.2`
+```bash
+./start_rpa.sh config.toml recover
+```
 
-终端会输出 `[ocr-ab]`，用于对比两种 OCR 文本差异。
+recover-auto（自动安全点点击 + 持续上滑直到到顶）：
 
-## 常用脚本速查
+```bash
+./start_rpa.sh config.toml recoverauto
+# 或
+./start_rpa.sh config.toml recover-auto
+```
 
-- 启动主程序：`./start_rpa.sh config.toml`
-- 行框校准：`./carlibrate_rows.sh config.toml`
-- 群聊右侧标题栏校准：`./carlibrate_title_group.sh config.toml`
-- 私聊右侧标题栏校准：`./carlibrate_title_private.sh config.toml`
-- 聊天记录区域校准：`./carlibrate_chat_context.sh config.toml`
-- 行标题区域校准：`./carlibrate_row_title.sh config.toml`
-- 行预览区域校准：`./carlibrate_preview.sh config.toml`
-- 未读红点圆形区域校准：`./carlibrate_unread.sh config.toml`
-- recover-auto 点击点与滚动幅度校准：`./carlibrate_recover_auto.sh config.toml`
-- 调试点击行：`./debug_click.sh config.toml --dry-run`
-- 调试点击预览区域：`./debug_preview.sh config.toml --dry-run`
-- 调试未读红点位置：`./debug_unread.sh config.toml --dry-run`
+## 常用脚本
 
-注意：脚本名采用仓库当前命名（`carlibrate_*`）。
+校准：
 
-## 运行前置条件
+- `./carlibrate_rows.sh config.toml`
+- `./carlibrate_title_group.sh config.toml`
+- `./carlibrate_title_private.sh config.toml`
+- `./carlibrate_chat_context.sh config.toml`
+- `./carlibrate_row_title.sh config.toml`
+- `./carlibrate_preview.sh config.toml`
+- `./carlibrate_unread.sh config.toml`
+- `./carlibrate_recover_auto.sh config.toml`
 
-- macOS（依赖 Quartz + AppleScript）
+调试：
+
+- `./debug_click.sh config.toml --dry-run`
+- `./debug_preview.sh config.toml --dry-run`
+- `./debug_unread.sh config.toml --dry-run`
+- `./debug_planner.sh config.toml`
+- `./debug_rerank.sh config.toml`
+- `./debug_memory_sqlite.sh config.toml`
+- `./debug_heartbeat.sh config.toml --show-tasks`
+
+维护：
+
+- `./clear_session_data.sh config.toml "会话key" --dry-run`
+
+## 前置条件
+
+- macOS
 - 微信桌面版已登录且窗口可见
-- Python/终端已授予权限：
+- 终端/Python 已授予：
   - Accessibility（辅助功能）
   - Screen Recording（屏幕录制）
 
-## 当前仓库结构（核心）
+## 配置入口
 
-- `run.py`：入口
-- `start_rpa.sh`：一键启动
-- `config.toml.example`：配置模板
-- `wechat_rpa/config.py`：配置加载与默认值
-- `wechat_rpa/window.py`：窗口定位与截图
-- `wechat_rpa/ocr.py`：OCR 引擎封装
-- `wechat_rpa/detector.py`：聊天行检测与触发信息提取
-- `wechat_rpa/llm.py`：LLM/Vision 调用
-- `wechat_rpa/workspace_context.py`：OpenClaw 风格文件工作区与记忆检索
-- `wechat_rpa/bot.py`：主循环、session 记忆、workspace 记忆注入、Vision 回复执行
+- 模板：`config.toml.example`
+- 实际加载逻辑：`wechat_rpa/config.py`
+- 详细配置说明：`docs/02-configuration-reference.md`
+
+## 文档导航
+
+- [文档总览](docs/README.md)
+- [校准流程](docs/01-calibration-workflow.md)
+- [配置参考](docs/02-configuration-reference.md)
+- [运行与运维](docs/03-run-and-operations.md)
+- [调试与排障](docs/04-debug-and-troubleshooting.md)
+- [架构与代码地图](docs/05-architecture.md)

@@ -1627,6 +1627,8 @@ class WeChatGuiRpaBot:
         provider = str(self.cfg.web_search_provider or "").strip().lower()
         if provider == "brave":
             return "brave"
+        if provider in ("agent_reach", "agent-reach", "agentreach", "reach", "exa"):
+            return "agent_reach"
         return "tavily"
 
     def _resolve_tavily_api_key(self) -> str:
@@ -1648,19 +1650,27 @@ class WeChatGuiRpaBot:
     def _resolve_web_search_api_key(self, provider: str) -> str:
         if provider == "brave":
             return self._resolve_brave_api_key()
+        if provider == "agent_reach":
+            return ""
         return self._resolve_tavily_api_key()
 
     def _web_search_enabled(self, provider: str) -> bool:
+        if provider == "agent_reach":
+            return bool(self.cfg.agent_reach_enabled)
         if provider == "brave":
             return bool(self.cfg.brave_enabled)
         return bool(self.cfg.tavily_enabled)
 
     def _web_search_max_results(self, provider: str) -> int:
+        if provider == "agent_reach":
+            return max(1, int(self.cfg.agent_reach_max_results))
         if provider == "brave":
             return max(1, int(self.cfg.brave_max_results))
         return max(1, int(self.cfg.tavily_max_results))
 
     def _web_search_key_hint(self, provider: str) -> str:
+        if provider == "agent_reach":
+            return "install/configure mcporter + exa (via agent-reach install)"
         if provider == "brave":
             env_name = (self.cfg.brave_api_key_env or "").strip()
             return (
@@ -1679,12 +1689,26 @@ class WeChatGuiRpaBot:
         provider = self._active_web_search_provider()
         if not self._web_search_enabled(provider):
             return False
+        if provider == "agent_reach":
+            cmd = str(self.cfg.agent_reach_mcporter_cmd or "").strip()
+            return bool(cmd and shutil.which(cmd))
         return bool(self._resolve_web_search_api_key(provider))
 
     def _web_search_status_text(self) -> str:
         provider = self._active_web_search_provider()
         if not self._web_search_enabled(provider):
             return f"disabled (provider={provider} {provider}_enabled=false)"
+        if provider == "agent_reach":
+            cmd = str(self.cfg.agent_reach_mcporter_cmd or "").strip()
+            if cmd and shutil.which(cmd):
+                return (
+                    f"available (tool=web_search provider={provider} "
+                    f"mcporter={cmd} max_results={self._web_search_max_results(provider)})"
+                )
+            return (
+                f"blocked (missing command: {cmd or 'mcporter'}; "
+                f"{self._web_search_key_hint(provider)})"
+            )
         if self._resolve_web_search_api_key(provider):
             return (
                 f"available (tool=web_search provider={provider} "
@@ -1714,7 +1738,23 @@ class WeChatGuiRpaBot:
         lowered = raw.lower()
         if "wowhead" in lowered:
             return True
-        verbs = ("查", "搜", "检索", "看看", "看下", "看一下", "帮我查", "帮我看", "找一下")
+        verbs = (
+            "查",
+            "搜",
+            "检索",
+            "查询",
+            "搜索",
+            "看看",
+            "看下",
+            "看一下",
+            "帮我查",
+            "帮我看",
+            "找一下",
+            "查下",
+            "查一下",
+            "搜下",
+            "搜一下",
+        )
         topics = (
             "消息",
             "更新",
@@ -1725,14 +1765,36 @@ class WeChatGuiRpaBot:
             "hotfix",
             "patch",
             "补丁",
+            "装备",
+            "装等",
+            "材料",
+            "需求",
+            "赛季",
+            "大秘境",
+            "掉落",
+            "攻略",
+            "词缀",
         )
         temporal = ("今天", "最新", "最近", "刚刚")
         has_verb = any(v in raw for v in verbs)
         has_topic = any(t in raw for t in topics) or any(t in lowered for t in topics)
         has_temporal = any(t in raw for t in temporal)
+        has_version = bool(re.search(r"\b\d+\.\d+\b", raw))
+        explicit_lookup = (
+            ("检索" in raw)
+            or ("搜索" in raw)
+            or ("查询" in raw)
+            or ("联网" in raw)
+            or ("上网查" in raw)
+        )
         memory_cues = ("记得", "记不记得", "你还记得", "之前说过", "以前提过", "在记忆里")
         has_memory_cue = any(c in raw for c in memory_cues)
-        return (has_verb and (has_topic or has_temporal)) or (has_topic and has_temporal) or has_memory_cue
+        return (
+            (has_verb and (has_topic or has_temporal or has_version))
+            or (has_topic and (has_temporal or has_version))
+            or (explicit_lookup and (not has_memory_cue))
+            or has_memory_cue
+        )
 
     @staticmethod
     def _is_opinion_prompt(text: str) -> bool:
@@ -2199,7 +2261,13 @@ class WeChatGuiRpaBot:
         planned_reply = ""
         observed_text = "\n\n".join(observed_blocks)
         has_lookup_observation = self._has_lookup_observation(observed_text)
-        if lookup_intent and (not observed_text):
+        has_lookup_error = ("网页检索[" in observed_text) and ("失败" in observed_text)
+        if lookup_intent and has_lookup_error:
+            planned_reply = (
+                "我这轮已经发起检索了，但接口超时/异常，没拿到可用结果。"
+                "我马上缩短关键词再重查一轮。"
+            )
+        elif lookup_intent and (not observed_text):
             planned_reply = (
                 "我刚试着查了，但这轮没拿到可用结果（可能检索接口异常）。"
                 "要不要我立刻换关键词再查一次？"
@@ -2276,9 +2344,192 @@ class WeChatGuiRpaBot:
 
     def _web_search(self, query: str) -> tuple[str, str]:
         provider = self._active_web_search_provider()
+        if provider == "agent_reach":
+            return provider, self._agent_reach_search(query)
         if provider == "brave":
             return provider, self._brave_search(query)
         return provider, self._tavily_search(query)
+
+    @staticmethod
+    def _extract_json_from_text(raw: str) -> object | None:
+        text = str(raw or "").strip()
+        if not text:
+            return None
+        try:
+            return json.loads(text)
+        except Exception:
+            pass
+        decoder = json.JSONDecoder()
+        for idx, ch in enumerate(text):
+            if ch not in "{[":
+                continue
+            try:
+                value, _ = decoder.raw_decode(text, idx)
+            except Exception:
+                continue
+            return value
+        return None
+
+    def _collect_rows_from_payload(self, payload: object) -> list[tuple[str, str, str]]:
+        rows: list[tuple[str, str, str]] = []
+
+        def add_row(title: object, url_item: object, snippet: object) -> None:
+            t = self._compact_web_text(title, limit=90)
+            u = self._compact_web_text(url_item, limit=160)
+            s = self._compact_web_text(snippet, limit=180)
+            if t or u or s:
+                rows.append((t, u, s))
+
+        def walk(node: object) -> None:
+            if isinstance(node, list):
+                for item in node:
+                    walk(item)
+                return
+            if not isinstance(node, dict):
+                return
+
+            title = node.get("title", "")
+            url_item = node.get("url", node.get("link", node.get("source", "")))
+            snippet = (
+                node.get("snippet")
+                or node.get("content")
+                or node.get("description")
+                or node.get("text")
+                or ""
+            )
+            if title or url_item or snippet:
+                add_row(title, url_item, snippet)
+
+            for key in (
+                "results",
+                "items",
+                "entries",
+                "documents",
+                "organic",
+                "data",
+                "web",
+                "hits",
+            ):
+                child = node.get(key)
+                if child is not None:
+                    walk(child)
+
+            # Some MCP responses return text blocks containing JSON payload.
+            content = node.get("content")
+            if isinstance(content, list):
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    text = str(block.get("text", "")).strip()
+                    if not text:
+                        continue
+                    parsed = self._extract_json_from_text(text)
+                    if parsed is None:
+                        add_row("", "", text)
+                    else:
+                        walk(parsed)
+
+        walk(payload)
+
+        deduped: list[tuple[str, str, str]] = []
+        seen: set[tuple[str, str, str]] = set()
+        for item in rows:
+            if item in seen:
+                continue
+            seen.add(item)
+            deduped.append(item)
+        return deduped
+
+    def _collect_rows_from_agent_reach_text(self, raw_text: str) -> list[tuple[str, str, str]]:
+        text = str(raw_text or "")
+        if not text:
+            return []
+
+        # Handle both plain text output and JS-inspect style escaped strings.
+        normalized = text.replace("\\r\\n", "\n").replace("\\n", "\n")
+        normalized = re.sub(r"'\s*\+\s*'", "", normalized)
+
+        rows: list[tuple[str, str, str]] = []
+        chunks = normalized.split("Title:")
+        for part in chunks[1:]:
+            block = part.strip()
+            if not block:
+                continue
+            title_line, _, rest = block.partition("\n")
+            title = title_line.strip().strip("'\"")
+
+            url_match = re.search(r"(?:^|\n)\s*URL:\s*(.+)", rest)
+            url_item = url_match.group(1).strip().strip("'\"") if url_match else ""
+
+            text_match = re.search(r"(?:^|\n)\s*Text:\s*", rest)
+            snippet = rest[text_match.end() :].strip() if text_match else rest.strip()
+            snippet = snippet.strip("'\"")
+
+            t = self._compact_web_text(title, limit=90)
+            u = self._compact_web_text(url_item, limit=160)
+            s = self._compact_web_text(snippet, limit=180)
+            if t or u or s:
+                rows.append((t, u, s))
+
+        deduped: list[tuple[str, str, str]] = []
+        seen: set[tuple[str, str, str]] = set()
+        for item in rows:
+            if item in seen:
+                continue
+            seen.add(item)
+            deduped.append(item)
+        return deduped
+
+    def _agent_reach_search(self, query: str) -> str:
+        clean_query = self._clean_web_query(query)
+        if not clean_query:
+            return ""
+
+        cmd = str(self.cfg.agent_reach_mcporter_cmd or "mcporter").strip()
+        if not cmd:
+            raise RuntimeError("agent_reach mcporter command missing")
+        mcporter = shutil.which(cmd)
+        if not mcporter:
+            raise RuntimeError(f"agent_reach command not found: {cmd}")
+
+        max_results = self._web_search_max_results("agent_reach")
+        timeout_sec = max(1.0, float(self.cfg.agent_reach_timeout_sec))
+        escaped_query = clean_query.replace("\\", "\\\\").replace('"', '\\"')
+        expr = f'exa.web_search_exa(query: "{escaped_query}", numResults: {max_results})'
+        proc = subprocess.run(
+            [mcporter, "call", expr],
+            capture_output=True,
+            text=True,
+            timeout=timeout_sec,
+        )
+        stdout = str(proc.stdout or "").strip()
+        stderr = str(proc.stderr or "").strip()
+        if proc.returncode != 0:
+            detail = self._compact_web_text(stderr or stdout, limit=300)
+            raise RuntimeError(f"agent_reach exa call failed: {detail or proc.returncode}")
+
+        payload = self._extract_json_from_text(stdout)
+        rows: list[tuple[str, str, str]] = []
+        if payload is None:
+            rows = self._collect_rows_from_agent_reach_text(stdout)
+            if not rows:
+                detail = self._compact_web_text(stdout, limit=300)
+                raise RuntimeError(f"agent_reach exa response parse failed: {detail}")
+
+        summary = ""
+        if isinstance(payload, dict):
+            summary = self._compact_web_text(
+                payload.get("summary", payload.get("answer", payload.get("message", ""))),
+                limit=240,
+            )
+            rows = self._collect_rows_from_payload(payload)
+        elif isinstance(payload, list):
+            rows = self._collect_rows_from_payload(payload)
+        elif not rows:
+            rows = self._collect_rows_from_agent_reach_text(stdout)
+        if (not summary) and rows:
+            summary = self._compact_web_text("；".join(x[2] for x in rows if x[2])[:800], limit=240)
+        return self._format_web_search_text(summary=summary, rows=rows, max_results=max_results)
 
     def _tavily_search(self, query: str) -> str:
         clean_query = self._clean_web_query(query)
@@ -2537,8 +2788,16 @@ class WeChatGuiRpaBot:
                         status = "skip (empty query)"
                     elif not self._web_search_enabled(provider):
                         status = f"skip ({provider} disabled)"
-                    elif not self._resolve_web_search_api_key(provider):
+                    elif (provider in ("tavily", "brave")) and (
+                        not self._resolve_web_search_api_key(provider)
+                    ):
                         status = f"skip (missing {provider} api key)"
+                    elif provider == "agent_reach" and (
+                        not str(self.cfg.agent_reach_mcporter_cmd or "").strip()
+                        or not shutil.which(str(self.cfg.agent_reach_mcporter_cmd or "").strip())
+                    ):
+                        cmd = str(self.cfg.agent_reach_mcporter_cmd or "").strip()
+                        status = f"skip (missing command: {cmd or 'mcporter'})"
                     else:
                         active_provider, search_text = self._web_search(query)
                         if search_text:
@@ -2571,7 +2830,14 @@ class WeChatGuiRpaBot:
                 else:
                     status = "skip (unknown tool)"
             except Exception as exc:
-                status = f"error ({exc})"
+                err = self._compact_web_text(exc, limit=240)
+                status = f"error ({err})"
+                if tool == "web_search":
+                    query = re.sub(r"\s+", " ", str(args.get("query", "")).strip())[:80]
+                    obs = f"网页检索[{query}]失败: {err}"
+                elif tool == "search_memory":
+                    query = re.sub(r"\s+", " ", str(args.get("query", "")).strip())[:80]
+                    obs = f"记忆检索[{query}]失败: {err}"
             action_elapsed = time.monotonic() - action_started
             if self.cfg.log_verbose:
                 print(

@@ -107,7 +107,7 @@ agent_plan_observation_max_chars = 5200
 # Web Search Tool
 # --------------------
 
-# 当前 web_search 使用的 provider：tavily | brave
+# 当前 web_search 使用的 provider：tavily | brave | agent_reach
 web_search_provider = "tavily"
 
 # Tavily provider
@@ -125,6 +125,12 @@ brave_api_key = ""
 brave_api_key_env = "BRAVE_SEARCH_API_KEY"
 brave_max_results = 3
 brave_timeout_sec = 8.0
+
+# Agent Reach provider（通过 mcporter 调 exa）
+agent_reach_enabled = false
+agent_reach_mcporter_cmd = "mcporter"
+agent_reach_max_results = 5
+agent_reach_timeout_sec = 12.0
 
 # --------------------
 # Heartbeat

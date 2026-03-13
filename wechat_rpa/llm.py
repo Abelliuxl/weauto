@@ -501,6 +501,11 @@ class LlmReplyGenerator:
         )
         attempts.append(t3)
 
+        # 4) Fix stray quote before comma between object close and next key.
+        # Example: {"args":{"query":"x"}","reason":"..."} -> {"args":{"query":"x"},"reason":"..."}
+        t4 = re.sub(r'}\s*"\s*,\s*"', '},"', t3)
+        attempts.append(t4)
+
         # De-duplicate while preserving order.
         out: list[str] = []
         seen: set[str] = set()
