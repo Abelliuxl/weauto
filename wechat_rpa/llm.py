@@ -1241,7 +1241,7 @@ class LlmReplyGenerator:
             '  "environment": {\n'
             '    "summary": "对方在催问和游戏资讯相关的问题。",\n'
             '    "time_hints": ["昨天 19:30"],\n'
-            '    "people": [{"name": "示例用户", "alias": "阿亮", "description": "会找我帮忙查信息"}],\n'
+            '    "people": [{"name": "示例用户", "alias": "好友A", "description": "会找我帮忙查信息"}],\n'
             '    "facts": ["示例用户最近关注魔兽世界资讯"],\n'
             '    "events": ["今天让助手检索魔兽世界最新消息"],\n'
             '    "relations": [{"subject": "示例用户", "relation": "常向我咨询", "target": "助手", "note": "多次让我帮忙查信息"}]\n'

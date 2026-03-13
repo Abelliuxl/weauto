@@ -17,10 +17,14 @@ WeAuto 是一个仅基于 GUI 的微信自动化项目（不 Hook、不注入、
 ## 快速开始（推荐顺序）
 
 1. 复制配置：`cp config.toml.example config.toml`
-2. 打开微信桌面端并固定窗口布局
-3. 先完成校准：见 [docs/01-calibration-workflow.md](docs/01-calibration-workflow.md)
-4. 先用 `dry_run=true` 跑一段时间观察日志
-5. 稳定后再切 `dry_run=false`
+2. 初始化工作区个性化模板：
+   - `cp agent_workspace/IDENTITY.example.md agent_workspace/IDENTITY.md`
+   - `cp agent_workspace/MEMORY.example.md agent_workspace/MEMORY.md`
+   - `cp agent_workspace/TOOLS.example.md agent_workspace/TOOLS.md`
+3. 打开微信桌面端并固定窗口布局
+4. 先完成校准：见 [docs/01-calibration-workflow.md](docs/01-calibration-workflow.md)
+5. 先用 `dry_run=true` 跑一段时间观察日志
+6. 稳定后再切 `dry_run=false`
 
 ## 启动方式
 

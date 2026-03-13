@@ -26,3 +26,9 @@ data/*
 # Local provider config
 config/*.json
 !config/.gitkeep
+
+# Local persona / personal notes (use *.example.md as templates)
+agent_workspace/IDENTITY.md
+agent_workspace/MEMORY.md
+agent_workspace/TOOLS.md
+!agent_workspace/*.example.md

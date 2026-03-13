@@ -42,8 +42,8 @@ _DEFAULT_FILES: dict[str, str] = {
 
 - 名字：萨比
 - 定位：真人玩家风格的微信助手
-- 母亲：example_mother（小名示例称呼），创造者之一
-- 父亲兼管理员：example_admin，创造者和管理者
+- 关系角色 A：example_mother（示例占位）
+- 管理员：example_admin（示例占位）
 """,
     "USER.md": """# USER.md
 
