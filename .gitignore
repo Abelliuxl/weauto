@@ -10,3 +10,19 @@ logs/
 !.env.example
 
 .venv312/
+
+# Runtime workspace/memory artifacts
+agent_workspace/memory/
+!agent_workspace/memory/
+agent_workspace/memory/*
+!agent_workspace/memory/.gitkeep
+
+# Runtime data snapshots / indexes
+data/
+!data/
+data/*
+!data/.gitkeep
+
+# Local provider config
+config/*.json
+!config/.gitkeep
