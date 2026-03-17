@@ -1613,6 +1613,8 @@ class WeChatGuiRpaBot:
             "set_session_summary",
             "search_memory",
         ]
+        if self.cfg.person_impression_enabled:
+            tools.append("search_person_impression")
         if self.cfg.workspace_enabled:
             tools.extend(
                 [
@@ -3535,6 +3537,47 @@ class WeChatGuiRpaBot:
                             status = "ok (no-hit)"
                             obs = f"记忆检索[{query}]无命中"
                         ok = True
+                elif tool == "search_person_impression":
+                    query = re.sub(r"\s+", " ", str(args.get("query", "")).strip())[:80]
+                    if not query:
+                        status = "skip (empty query)"
+                    elif not self.cfg.person_impression_enabled:
+                        status = "skip (person impression disabled)"
+                    else:
+                        hits = self._workspace.search_person_impressions(
+                            query=query,
+                            limit=max(1, int(self.cfg.person_impression_search_limit)),
+                        )
+                        compact = re.sub(r"\s+", " ", hits or "").strip()
+                        if compact:
+                            compact = compact[:260]
+                            status = "ok"
+                            obs = f"人物印象检索[{query}]: {compact}"
+                        else:
+                            status = "ok (no-hit)"
+                            obs = f"人物印象检索[{query}]无命中"
+                        ok = True
+                elif tool == "maintain_person_impressions":
+                    days_raw = args.get("days", self.cfg.person_impression_days)
+                    max_people_raw = args.get(
+                        "max_people",
+                        self.cfg.person_impression_max_people_per_run,
+                    )
+                    try:
+                        days = int(days_raw)
+                    except Exception:
+                        days = int(self.cfg.person_impression_days)
+                    try:
+                        max_people = int(max_people_raw)
+                    except Exception:
+                        max_people = int(self.cfg.person_impression_max_people_per_run)
+                    done, detail = self._heartbeat_maintain_person_impressions(
+                        days=max(1, min(3650, days)),
+                        max_people=max(1, min(200, max_people)),
+                    )
+                    status = "ok" if done else detail
+                    obs = detail if done else ""
+                    ok = done
                 elif tool == "workspace_list_files":
                     rel_path = re.sub(r"\s+", " ", str(args.get("path", "")).strip())[:200]
                     recursive_raw = args.get("recursive", False)
@@ -3720,6 +3763,11 @@ class WeChatGuiRpaBot:
                 elif tool == "search_memory":
                     query = re.sub(r"\s+", " ", str(args.get("query", "")).strip())[:80]
                     obs = f"记忆检索[{query}]失败: {err}"
+                elif tool == "search_person_impression":
+                    query = re.sub(r"\s+", " ", str(args.get("query", "")).strip())[:80]
+                    obs = f"人物印象检索[{query}]失败: {err}"
+                elif tool == "maintain_person_impressions":
+                    obs = f"人物印象维护失败: {err}"
                 elif tool == "workspace_list_files":
                     rel_path = re.sub(r"\s+", " ", str(args.get("path", "")).strip())[:120]
                     obs = f"工作区目录[{rel_path or '.'}]失败: {err}"
@@ -3811,6 +3859,43 @@ class WeChatGuiRpaBot:
                     }
                 )
                 seen.add("maintain_memory")
+            if (
+                "maintain_person_impressions" in lowered
+                and "maintain_person_impressions" not in seen
+            ):
+                days = 30
+                max_people = 6
+                m = re.search(r"days\s*[:=]\s*(\d{1,4})", clean, flags=re.IGNORECASE)
+                if not m:
+                    m = re.search(r"days\"\s*:\s*(\d{1,4})", clean, flags=re.IGNORECASE)
+                if not m:
+                    m = re.search(r"(\d{1,4})\s*天", clean)
+                if m:
+                    try:
+                        days = int(m.group(1))
+                    except Exception:
+                        days = 30
+                mp = re.search(r"max_people\s*[:=]\s*(\d{1,3})", clean, flags=re.IGNORECASE)
+                if not mp:
+                    mp = re.search(r"max_people\"\s*:\s*(\d{1,3})", clean, flags=re.IGNORECASE)
+                if not mp:
+                    mp = re.search(r"最多\s*(\d{1,3})\s*人", clean)
+                if mp:
+                    try:
+                        max_people = int(mp.group(1))
+                    except Exception:
+                        max_people = 6
+                actions.append(
+                    {
+                        "tool": "maintain_person_impressions",
+                        "args": {
+                            "days": max(1, min(3650, days)),
+                            "max_people": max(1, min(200, max_people)),
+                        },
+                        "reason": "heartbeat direct task",
+                    }
+                )
+                seen.add("maintain_person_impressions")
             if "refine_persona_files" in lowered and "refine_persona_files" not in seen:
                 actions.append(
                     {
@@ -3931,6 +4016,153 @@ class WeChatGuiRpaBot:
             return True, detail
         return False, "skip (memory unchanged)"
 
+    def _heartbeat_maintain_person_impressions(
+        self,
+        *,
+        days: int,
+        max_people: int,
+    ) -> tuple[bool, str]:
+        if not self.cfg.workspace_enabled:
+            return False, "skip (workspace disabled)"
+        if not self.cfg.person_impression_enabled:
+            return False, "skip (person impression disabled)"
+        backends = self._heartbeat_llm_backends()
+        if not backends:
+            return False, "skip (llm disabled)"
+
+        capped_days = max(1, min(3650, int(days)))
+        capped_people = max(1, min(200, int(max_people)))
+        candidates = self._workspace.collect_person_impression_candidates(
+            days=capped_days,
+            max_people=capped_people,
+        )
+        if not candidates:
+            return False, "skip (no person candidates)"
+
+        def _merge_unique(
+            first: list[str] | None,
+            second: list[str] | None,
+            *,
+            limit: int,
+            max_len: int,
+        ) -> list[str]:
+            out: list[str] = []
+            seen_items: set[str] = set()
+            for seq in (first or [], second or []):
+                if isinstance(seq, str):
+                    iterable = [seq]
+                elif isinstance(seq, list):
+                    iterable = seq
+                else:
+                    iterable = [seq]
+                for source in iterable:
+                    clean = re.sub(r"\s+", " ", str(source or "")).strip()
+                    if not clean:
+                        continue
+                    clean = clean[:max_len]
+                    key = clean.lower()
+                    if key in seen_items:
+                        continue
+                    seen_items.add(key)
+                    out.append(clean)
+                    if len(out) >= max(1, int(limit)):
+                        return out
+            return out
+
+        changed = 0
+        unchanged = 0
+        failures = 0
+        first_error = ""
+        backend_used: set[str] = set()
+        for item in candidates:
+            name = re.sub(r"\s+", " ", str(item.get("name", "")).strip())[:24]
+            if not name:
+                continue
+            aliases = [str(x) for x in (item.get("aliases") or [])]
+            notes = [str(x) for x in (item.get("notes") or [])]
+            sessions = [str(x) for x in (item.get("sessions") or [])]
+            facts = [str(x) for x in (item.get("facts") or [])]
+            events = [str(x) for x in (item.get("events") or [])]
+            relations = [str(x) for x in (item.get("relations") or [])]
+            mentions_raw = item.get("mentions", 0)
+            try:
+                mentions = int(mentions_raw)
+            except Exception:
+                mentions = 0
+
+            digest: dict = {}
+            for backend_name, llm in backends:
+                try:
+                    candidate = llm.heartbeat_person_impression_digest(
+                        name=name,
+                        aliases=aliases,
+                        notes=notes,
+                        sessions=sessions,
+                        facts=facts,
+                        events=events,
+                        relations=relations,
+                        mentions=mentions,
+                    )
+                except Exception as exc:
+                    if not first_error:
+                        first_error = str(exc)
+                    continue
+                if candidate:
+                    digest = candidate
+                    backend_used.add(backend_name)
+                    break
+
+            llm_keywords = digest.get("keywords")
+            llm_facts = digest.get("facts")
+            llm_events = digest.get("events")
+            llm_relations = digest.get("relations")
+            keywords = _merge_unique(llm_keywords, notes, limit=10, max_len=16)
+            merged_facts = _merge_unique(llm_facts, facts, limit=8, max_len=70)
+            merged_events = _merge_unique(llm_events, events, limit=8, max_len=90)
+            merged_relations = _merge_unique(llm_relations, relations, limit=8, max_len=90)
+            impression = re.sub(r"\s+", " ", str(digest.get("impression", "") or "")).strip()[:220]
+            if not impression:
+                fallback_impression = "；".join(
+                    x for x in [*notes[:2], *facts[:1]] if re.sub(r"\s+", " ", str(x or "")).strip()
+                )
+                impression = fallback_impression[:220]
+
+            try:
+                updated, _ = self._workspace.upsert_person_impression(
+                    name=name,
+                    aliases=aliases,
+                    keywords=keywords,
+                    impression=impression,
+                    facts=merged_facts,
+                    events=merged_events,
+                    relations=merged_relations,
+                    sessions=sessions,
+                )
+            except Exception as exc:
+                failures += 1
+                if not first_error:
+                    first_error = str(exc)
+                continue
+
+            if updated:
+                changed += 1
+            else:
+                unchanged += 1
+
+        processed = changed + unchanged + failures
+        if changed > 0:
+            detail = (
+                f"人物印象已整理 {changed}/{max(1, processed)} 人 "
+                f"(days={capped_days}, max_people={capped_people})"
+            )
+            if backend_used:
+                detail += f" via {','.join(sorted(backend_used)[:3])}"
+            return True, detail
+        if failures > 0 and (not unchanged):
+            err = self._compact_web_text(first_error or "unknown", limit=140)
+            return False, f"error ({err})"
+        return False, "skip (person impressions unchanged)"
+
     def _heartbeat_refine_persona_files(self) -> tuple[bool, str]:
         if not self.cfg.workspace_enabled:
             return False, "skip (workspace disabled)"
@@ -4036,6 +4268,8 @@ class WeChatGuiRpaBot:
             "maintain_memory",
             "refine_persona_files",
         ]
+        if self.cfg.person_impression_enabled:
+            tools.extend(["search_person_impression", "maintain_person_impressions"])
         if self.cfg.admin_commands_enabled:
             tools.append("remember_long_term")
         if self._has_volc_web_search_tool():

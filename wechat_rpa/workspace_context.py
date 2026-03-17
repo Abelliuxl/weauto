@@ -63,6 +63,22 @@ _DEFAULT_FILES: dict[str, str] = {
 - 稳定事实
 - 长期约定
 """,
+    "PEOPLE_ALIASES.md": """# PEOPLE_ALIASES.md
+
+手工维护“同一个人不同名字”的映射。
+
+写法（每行一条）：
+- 标准名 -> 别名1, 别名2, 别名3
+
+支持通配：
+- `*后缀`：后缀匹配（例：`*cong`）
+- `前缀*`：前缀匹配（例：`cong*`）
+- `*片段*`：包含匹配（例：`*cong*`）
+
+示例：
+- 刘晓亮 -> real刘晓亮, 亮哥, fake 刘晓亮
+- 萨比 -> 魔法少女, 魔法少女 龙虾
+""",
 }
 
 _NAME_PATTERNS = [
@@ -131,6 +147,8 @@ class WorkspaceContextManager:
         self.memory_dir = self.root / "memory"
         self.session_dir = self.memory_dir / "sessions"
         self.session_state_dir = self.memory_dir / "session_state"
+        self.people_dir = self.memory_dir / "people"
+        self.people_aliases_path = self.root / "PEOPLE_ALIASES.md"
         self.embedding_cfg = embedding_cfg or EmbeddingConfig()
         self.rerank_cfg = rerank_cfg or RerankConfig()
         self.memory_rerank_enabled = bool(memory_rerank_enabled)
@@ -179,6 +197,7 @@ class WorkspaceContextManager:
         self.memory_dir.mkdir(parents=True, exist_ok=True)
         self.session_dir.mkdir(parents=True, exist_ok=True)
         self.session_state_dir.mkdir(parents=True, exist_ok=True)
+        self.people_dir.mkdir(parents=True, exist_ok=True)
         for name, content in _DEFAULT_FILES.items():
             path = self.root / name
             if not path.exists():
@@ -209,6 +228,102 @@ class WorkspaceContextManager:
             encoding="utf-8",
         )
         self._mark_sqlite_dirty()
+
+    def _load_manual_person_alias_rules(self) -> tuple[dict[str, str], list[tuple[str, str, str]]]:
+        path = self.people_aliases_path
+        if not path.exists():
+            return {}, []
+        raw = self._safe_read(path)
+        if not raw:
+            return {}, []
+        mapping: dict[str, str] = {}
+        patterns: list[tuple[str, str, str]] = []
+        seen_patterns: set[str] = set()
+        for line in raw.splitlines():
+            clean = line.strip()
+            if not clean or clean.startswith("#"):
+                continue
+            if clean.startswith("- "):
+                clean = clean[2:].strip()
+            sep = ""
+            for token in ("->", "=>", "="):
+                if token in clean:
+                    sep = token
+                    break
+            if not sep:
+                continue
+            left, right = [part.strip() for part in clean.split(sep, 1)]
+            canonical = self._normalize_name(left)
+            if not canonical or _looks_like_placeholder_person(canonical):
+                continue
+            alias_tokens = [x.strip() for x in re.split(r"[，,、；;|]", right) if x.strip()]
+            for alias in alias_tokens:
+                raw_alias = str(alias).strip()
+                if not raw_alias:
+                    continue
+                has_star = "*" in raw_alias
+                starts_star = raw_alias.startswith("*")
+                ends_star = raw_alias.endswith("*")
+                if has_star and (starts_star or ends_star):
+                    core = self._normalize_name(raw_alias.strip("*"))
+                    if not core or _looks_like_placeholder_person(core):
+                        continue
+                    token_norm = self._norm(core)
+                    if not token_norm:
+                        continue
+                    mode = "contains" if (starts_star and ends_star) else ("suffix" if starts_star else "prefix")
+                    pattern_key = f"{mode}|{token_norm}|{self._norm(canonical)}"
+                    if pattern_key in seen_patterns:
+                        continue
+                    seen_patterns.add(pattern_key)
+                    patterns.append((mode, token_norm, canonical))
+                    continue
+
+                clean_alias = self._normalize_name(raw_alias)
+                if not clean_alias:
+                    continue
+                if _looks_like_placeholder_person(clean_alias):
+                    continue
+                if self._norm(clean_alias) == self._norm(canonical):
+                    continue
+                mapping[self._norm(clean_alias)] = canonical
+            # Canonical maps to itself so later lookups can share one path.
+            mapping[self._norm(canonical)] = canonical
+        return mapping, patterns
+
+    def _load_manual_person_alias_map(self) -> dict[str, str]:
+        mapping, _ = self._load_manual_person_alias_rules()
+        return mapping
+
+    def _resolve_manual_person_name(
+        self,
+        name: str,
+        alias_map: dict[str, str],
+        alias_patterns: list[tuple[str, str, str]] | None = None,
+    ) -> str:
+        clean = self._normalize_name(name)
+        if not clean:
+            return ""
+        norm_clean = self._norm(clean)
+        canonical = alias_map.get(norm_clean, "")
+        if (not canonical) and alias_patterns:
+            for mode, token, target in alias_patterns:
+                if not token:
+                    continue
+                matched = False
+                if mode == "suffix":
+                    matched = norm_clean.endswith(token)
+                elif mode == "prefix":
+                    matched = norm_clean.startswith(token)
+                else:
+                    matched = token in norm_clean
+                if matched:
+                    canonical = target
+                    break
+        canonical_clean = self._normalize_name(canonical)
+        if canonical_clean:
+            return canonical_clean
+        return clean
 
     def build_prompt_context(self, *, include_long_term: bool) -> str:
         if not self.enabled:
@@ -333,6 +448,293 @@ class WorkspaceContextManager:
         with path.open("a", encoding="utf-8") as fh:
             fh.write(f"\n- {clean}\n")
         self._mark_sqlite_dirty()
+
+    @staticmethod
+    def _update_managed_block(raw: str, *, start_marker: str, end_marker: str, body: str) -> str:
+        current = raw or ""
+        payload = (body or "").strip()
+        if not payload:
+            return current
+        block = f"{start_marker}\n{payload}\n{end_marker}"
+        s_idx = current.find(start_marker)
+        e_idx = current.find(end_marker)
+        if s_idx >= 0 and e_idx > s_idx:
+            e_end = e_idx + len(end_marker)
+            merged = current[:s_idx].rstrip() + "\n\n" + block + current[e_end:]
+            return merged.rstrip() + "\n"
+        merged = current.rstrip()
+        if merged:
+            merged += "\n\n"
+        merged += block + "\n"
+        return merged
+
+    def _person_impression_path(self, name: str) -> Path:
+        clean_name = self._normalize_name(name)
+        slug = self._slug(clean_name or name or "person")
+        digest = hashlib.sha1((clean_name or name or slug).encode("utf-8")).hexdigest()[:8]
+        return self.people_dir / f"{slug}_{digest}.md"
+
+    def read_person_impression(self, *, name: str) -> str:
+        if not self.enabled:
+            return ""
+        path = self._person_impression_path(name)
+        if not path.exists():
+            return ""
+        return self._safe_read(path)[:2200]
+
+    def upsert_person_impression(
+        self,
+        *,
+        name: str,
+        aliases: list[str] | None = None,
+        keywords: list[str] | None = None,
+        impression: str = "",
+        facts: list[str] | None = None,
+        events: list[str] | None = None,
+        relations: list[str] | None = None,
+        sessions: list[str] | None = None,
+    ) -> tuple[bool, str]:
+        if not self.enabled:
+            return False, "skip (workspace disabled)"
+        clean_name = self._normalize_name(name)
+        if not clean_name:
+            return False, "skip (empty person name)"
+        path = self._person_impression_path(clean_name)
+        aliases_clean = [self._normalize_name(x) for x in (aliases or [])]
+        aliases_clean = [x for x in aliases_clean if x and x != clean_name][:6]
+        keywords_clean = [
+            self._clip_text(x, 16)
+            for x in (keywords or [])
+            if self._clip_text(x, 16)
+        ][:10]
+        facts_clean = [self._clip_text(x, 70) for x in (facts or []) if self._clip_text(x, 70)][:8]
+        events_clean = [self._clip_text(x, 90) for x in (events or []) if self._clip_text(x, 90)][:8]
+        relations_clean = [
+            self._clip_text(x, 90) for x in (relations or []) if self._clip_text(x, 90)
+        ][:8]
+        sessions_clean = [self._clip_text(x, 24) for x in (sessions or []) if self._clip_text(x, 24)][:8]
+        impression_clean = self._clip_text(impression, 220)
+        stamp = self._now_iso()
+        body = "\n".join(
+            [
+                f"- 人物: {clean_name}",
+                f"- 关键词: {', '.join(keywords_clean) if keywords_clean else '无'}",
+                f"- 印象: {impression_clean or '无'}",
+                f"- 别名: {', '.join(aliases_clean) if aliases_clean else '无'}",
+                f"- 事实: {' | '.join(facts_clean) if facts_clean else '无'}",
+                f"- 事件: {' | '.join(events_clean) if events_clean else '无'}",
+                f"- 关系: {' | '.join(relations_clean) if relations_clean else '无'}",
+                f"- 来源会话: {', '.join(sessions_clean) if sessions_clean else '无'}",
+                f"- 更新时间: {stamp}",
+            ]
+        )
+        old = path.read_text(encoding="utf-8") if path.exists() else f"# 人物印象：{clean_name}\n"
+        new_text = self._update_managed_block(
+            old,
+            start_marker="<!-- HEARTBEAT_PERSON_IMPRESSION_START -->",
+            end_marker="<!-- HEARTBEAT_PERSON_IMPRESSION_END -->",
+            body=body,
+        )
+        if new_text == old:
+            return False, "skip (person impression unchanged)"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(new_text, encoding="utf-8")
+        self._mark_sqlite_dirty()
+        return True, f"人物印象已更新: {clean_name}"
+
+    def _parse_time_to_epoch(self, raw: object) -> float:
+        text = str(raw or "").strip()
+        if not text:
+            return 0.0
+        normalized = text.replace("T", " ").replace("Z", "")
+        for candidate in (normalized, normalized[:19], normalized[:10]):
+            clean = candidate.strip()
+            if not clean:
+                continue
+            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+                try:
+                    return datetime.strptime(clean, fmt).timestamp()
+                except Exception:
+                    continue
+            try:
+                return datetime.fromisoformat(clean).timestamp()
+            except Exception:
+                continue
+        return 0.0
+
+    def collect_person_impression_candidates(
+        self,
+        *,
+        days: int = 30,
+        max_people: int = 8,
+    ) -> list[dict]:
+        if not self.enabled:
+            return []
+        cutoff_days = max(1, int(days))
+        cutoff = time.time() - (cutoff_days * 86400)
+        manual_alias_map, manual_alias_patterns = self._load_manual_person_alias_rules()
+        buckets: dict[str, dict] = {}
+        for path in sorted(self.session_state_dir.glob("*.json")):
+            state = self._safe_json_load(path)
+            if not isinstance(state, dict):
+                continue
+            title = self._clip_text(state.get("title", ""), 24)
+            session_updated = self._parse_time_to_epoch(state.get("updated_at", ""))
+            people = [x for x in (state.get("people") or []) if self._is_valid_person_entry(x)]
+            people = [x for x in people if self._is_sender_person_entry(x)]
+            events = [x for x in (state.get("events") or []) if isinstance(x, dict)]
+            facts = [x for x in (state.get("facts") or []) if isinstance(x, dict)]
+            relations = [x for x in (state.get("relations") or []) if isinstance(x, dict)]
+
+            for person in people:
+                raw_name = self._normalize_name(str(person.get("name", "")))
+                name = self._resolve_manual_person_name(
+                    raw_name,
+                    manual_alias_map,
+                    manual_alias_patterns,
+                )
+                if not name:
+                    continue
+                person_seen = self._parse_time_to_epoch(person.get("last_seen", ""))
+                latest_seen = max(person_seen, session_updated)
+                if latest_seen > 0 and latest_seen < cutoff:
+                    continue
+                key = self._norm(name)
+                target = buckets.setdefault(
+                    key,
+                    {
+                        "name": name,
+                        "aliases": set(),
+                        "notes": set(),
+                        "sessions": set(),
+                        "facts": [],
+                        "events": [],
+                        "relations": [],
+                        "mentions": 0,
+                        "last_seen": latest_seen,
+                    },
+                )
+                target["mentions"] = int(target.get("mentions", 0) or 0) + int(
+                    person.get("mentions", 0) or 0
+                )
+                target["last_seen"] = max(float(target.get("last_seen", 0.0) or 0.0), latest_seen)
+                if title:
+                    target["sessions"].add(title)
+                if raw_name and raw_name != name:
+                    target["aliases"].add(raw_name)
+                for alias in person.get("aliases") or []:
+                    clean_alias = self._normalize_name(str(alias))
+                    if clean_alias and clean_alias != name:
+                        canonical_alias = self._resolve_manual_person_name(
+                            clean_alias,
+                            manual_alias_map,
+                            manual_alias_patterns,
+                        )
+                        if canonical_alias == name:
+                            target["aliases"].add(clean_alias)
+                        else:
+                            if canonical_alias and canonical_alias != name:
+                                target["aliases"].add(canonical_alias)
+                            if clean_alias != canonical_alias:
+                                target["aliases"].add(clean_alias)
+                for note in person.get("notes") or []:
+                    clean_note = self._clip_text(note, 60)
+                    if clean_note:
+                        target["notes"].add(clean_note)
+
+                match_keys = [self._norm(name)] + [self._norm(x) for x in list(target["aliases"])]
+                for item in facts:
+                    text = self._clip_text(item.get("text", ""), 80)
+                    if not text:
+                        continue
+                    text_norm = self._norm(text)
+                    if any(k and (k in text_norm) for k in match_keys):
+                        if text not in target["facts"]:
+                            target["facts"].append(text)
+                for item in events:
+                    text = self._clip_text(item.get("text", ""), 90)
+                    if not text:
+                        continue
+                    text_norm = self._norm(text)
+                    if text.startswith(f"{name}:") or any(k and (k in text_norm) for k in match_keys):
+                        if text not in target["events"]:
+                            target["events"].append(text)
+                for item in relations:
+                    subject = self._resolve_manual_person_name(
+                        str(item.get("subject", "")),
+                        manual_alias_map,
+                        manual_alias_patterns,
+                    )
+                    rel = self._clip_text(item.get("relation", ""), 24)
+                    rel_target = self._resolve_manual_person_name(
+                        str(item.get("target", "")),
+                        manual_alias_map,
+                        manual_alias_patterns,
+                    )
+                    note = self._clip_text(item.get("note", ""), 40)
+                    if not subject or not rel or not rel_target:
+                        continue
+                    subject_norm = self._norm(subject)
+                    target_norm = self._norm(rel_target)
+                    if any(k and (k == subject_norm or k == target_norm) for k in match_keys):
+                        relation_line = f"{subject} -> {rel} -> {rel_target}"
+                        if note:
+                            relation_line += f"；{note}"
+                        if relation_line not in target["relations"]:
+                            target["relations"].append(relation_line)
+
+        ranked = sorted(
+            buckets.values(),
+            key=lambda item: (
+                float(item.get("last_seen", 0.0) or 0.0),
+                int(item.get("mentions", 0) or 0),
+            ),
+            reverse=True,
+        )
+        out: list[dict] = []
+        for item in ranked[: max(1, int(max_people))]:
+            out.append(
+                {
+                    "name": str(item.get("name", "")),
+                    "aliases": sorted(item.get("aliases") or [])[:6],
+                    "notes": sorted(item.get("notes") or [])[:6],
+                    "sessions": sorted(item.get("sessions") or [])[:8],
+                    "facts": (item.get("facts") or [])[:8],
+                    "events": (item.get("events") or [])[:8],
+                    "relations": (item.get("relations") or [])[:8],
+                    "mentions": int(item.get("mentions", 0) or 0),
+                }
+            )
+        return out
+
+    def search_person_impressions(self, *, query: str, limit: int = 3) -> str:
+        if not self.enabled:
+            return ""
+        clean_query = re.sub(r"\s+", " ", query or "").strip()
+        if len(clean_query) < 1:
+            return ""
+        hits: list[MemoryHit] = []
+        for path in sorted(self.people_dir.glob("*.md")):
+            if not path.is_file():
+                continue
+            content = self._safe_read(path)
+            if not content:
+                continue
+            scored = self._score_file(path, content, clean_query)
+            if scored:
+                hits.extend(scored[:2])
+        hits.sort(key=lambda item: item.score, reverse=True)
+        lines: list[str] = []
+        seen: set[str] = set()
+        for hit in hits:
+            key = f"{hit.path}|{hit.snippet}"
+            if key in seen:
+                continue
+            seen.add(key)
+            lines.append(f"[{hit.path}] {hit.snippet}")
+            if len(lines) >= max(1, int(limit)):
+                break
+        return "\n".join(lines)[:2400]
 
     def reset_session_memory(self, *, session_key: str, title: str) -> None:
         if not self.enabled:
@@ -852,6 +1254,9 @@ class WorkspaceContextManager:
         for path in sorted(self.session_state_dir.glob("*.json")):
             if path.is_file():
                 out.append((path, "session_state", self._slug(path.stem)))
+        for path in sorted(self.people_dir.glob("*.md")):
+            if path.is_file():
+                out.append((path, "people", ""))
         return out
 
     def _source_relpath(self, path: Path) -> str:
@@ -1469,6 +1874,10 @@ class WorkspaceContextManager:
     ) -> None:
         clean_name = self._normalize_name(canonical_name)
         clean_alias = self._normalize_name(alias_name)
+        if clean_name and _looks_like_placeholder_person(clean_name):
+            clean_name = ""
+        if clean_alias and _looks_like_placeholder_person(clean_alias):
+            clean_alias = ""
         if not clean_name or not clean_alias or clean_name == clean_alias:
             self._upsert_person(state, name=clean_name or clean_alias, alias="", note=note, stamp=stamp)
             return
@@ -1545,6 +1954,19 @@ class WorkspaceContextManager:
         return not _looks_like_placeholder_person(name)
 
     @staticmethod
+    def _is_sender_person_entry(person: dict) -> bool:
+        if not isinstance(person, dict):
+            return False
+        notes = person.get("notes") or []
+        for note in notes:
+            clean = re.sub(r"\s+", " ", str(note or "")).strip()
+            if not clean:
+                continue
+            if "发送者" in clean:
+                return True
+        return False
+
+    @staticmethod
     def _looks_like_group_roster_query(query: str) -> bool:
         raw = re.sub(r"\s+", " ", (query or "").strip())
         if not raw:
@@ -1594,6 +2016,8 @@ class WorkspaceContextManager:
         clean_relation = self._normalize_relation(relation)
         clean_note = self._clip_text(note, 80)
         if not clean_subject or not clean_target or not clean_relation:
+            return
+        if _looks_like_placeholder_person(clean_subject) or _looks_like_placeholder_person(clean_target):
             return
         self._upsert_person(state, name=clean_subject, alias="", note="在关系中出现", stamp=stamp)
         self._upsert_person(state, name=clean_target, alias="", note="在关系中出现", stamp=stamp)
@@ -1748,7 +2172,15 @@ class WorkspaceContextManager:
         clean = clean.strip(" []【】()（）,，。.!！?？:：;；\"'“”‘’")
         clean = re.sub(r"^(real|test|tmp)[-_ ]*", "", clean, flags=re.IGNORECASE)
         clean = re.sub(r"(也行|都行|就行|可以|呀|啊|呢|吧)$", "", clean)
+        clean = re.sub(r"\s+", " ", clean).strip()
         if len(clean) < 2:
+            return ""
+        if len(clean) > 18:
+            return ""
+        # Reject obvious non-name token composition; keep simple IDs like _coney / Carl.
+        if re.search(r"[，,。.!！?？:：;；|/\\\[\]{}<>]+", clean):
+            return ""
+        if "、" in clean:
             return ""
         if _looks_like_noise_name(clean):
             return ""
@@ -1800,7 +2232,22 @@ class WorkspaceContextManager:
 
         for person in merged_people:
             person["aliases"] = (person.get("aliases") or [])[:8]
-            person["notes"] = (person.get("notes") or [])[-4:]
+            notes = [self._clip_text(x, 80) for x in (person.get("notes") or []) if self._clip_text(x, 80)]
+            sender_notes = [x for x in notes if "发送者" in x]
+            tail_notes = [x for x in notes if x not in sender_notes]
+            compact_notes: list[str] = []
+            if sender_notes:
+                compact_notes.append(sender_notes[0])
+            compact_notes.extend(tail_notes[-3:])
+            uniq_notes: list[str] = []
+            seen_note: set[str] = set()
+            for note in compact_notes:
+                key = self._norm(note)
+                if not key or key in seen_note:
+                    continue
+                seen_note.add(key)
+                uniq_notes.append(note)
+            person["notes"] = uniq_notes[:4]
         merged_people = [person for person in merged_people if self._is_valid_person_entry(person)]
         merged_people.sort(
             key=lambda item: (-int(item.get("mentions", 0) or 0), str(item.get("last_seen", ""))),
@@ -2188,7 +2635,18 @@ class WorkspaceContextManager:
 
 def _looks_like_noise_name(text: str) -> bool:
     lower = (text or "").strip().lower()
-    if lower in {"图片", "photo", "image", "unknown", "系统消息"}:
+    if lower in {
+        "图片",
+        "photo",
+        "image",
+        "unknown",
+        "系统消息",
+        "system",
+        "assistant",
+        "user",
+        "myself",
+        "unknown user",
+    }:
         return True
     if re.fullmatch(r"[\d_ -]+", lower or ""):
         return True
@@ -2201,20 +2659,124 @@ def _looks_like_placeholder_person(text: str) -> bool:
         return True
     if _looks_like_noise_name(clean):
         return True
+    lower = clean.lower()
     exact = {
         "群成员",
         "其他群成员",
+        "其他成员",
         "群聊成员",
         "其他人",
         "大家",
         "有人",
         "未知人物",
+        "未知",
         "我方",
+        "系统",
+        "系统提示",
+        "用户",
+        "未知用户",
+        "未知昵称用户",
+        "匿名用户",
+        "对方",
+        "对方用户",
+        "聊天对方",
+        "好友",
+        "群聊",
+        "该群",
+        "会话",
+        "私聊",
+        "群主",
+        "管理员",
+        "微信系统",
+        "微信",
+        "微信游戏",
+        "已卸载",
+        "王者荣耀",
+        "魔兽世界",
     }
     if clean in exact:
         return True
+    if lower in {"system", "assistant", "user", "unknown"}:
+        return True
+    if clean.startswith(("群-", "群聊-", "私聊-", "会话-")):
+        return True
+    if clean.lower().startswith(("fake ", "fake-", "fake_")):
+        return True
+    if clean.lower().startswith("unnamed_user"):
+        return True
+    if "群主" in clean:
+        return True
+    if "系统" in clean:
+        return True
+    if clean.endswith("用户"):
+        return True
+    if "头像" in clean:
+        return True
     if "群成员" in clean or "群聊成员" in clean or "群友" in clean:
         return True
+    non_person_keywords = (
+        "聊天",
+        "对话",
+        "会话",
+        "讨论",
+        "请求",
+        "需求",
+        "提问",
+        "查询",
+        "查看",
+        "相关",
+        "问题",
+        "信息",
+        "画像",
+        "绘制",
+        "生成",
+        "赛季",
+        "版本",
+        "大秘境",
+        "装备",
+        "文本",
+        "消息",
+        "表情包",
+        "文件",
+        "话题",
+    )
+    if len(clean) >= 4 and any(token in clean for token in non_person_keywords):
+        return True
+    clause_markers = (
+        "没想到",
+        "感觉",
+        "准备",
+        "提及",
+        "相关",
+        "关于",
+        "讨论",
+        "谈论",
+        "请求",
+        "查询",
+        "查看",
+        "获取",
+        "开启",
+        "关闭",
+        "话题",
+        "看法",
+        "情况",
+        "提问",
+        "邀请",
+        "卸载",
+        "系统",
+    )
+    if len(clean) >= 5 and any(token in clean for token in clause_markers):
+        return True
+    if " " in clean:
+        parts = [x for x in clean.split(" ") if x]
+        if any(
+            token in clean
+            for token in ("说话", "提及", "请求", "相关", "聊天", "对话", "查询", "查看")
+        ):
+            return True
+        # e.g. "萨比 爬" is usually a sentence fragment, not a stable person id.
+        if parts and any((len(p) == 1 and re.fullmatch(r"[\u4e00-\u9fff]", p)) for p in parts[1:]):
+            return True
     suffixes = (
         "相关消息",
         "消息",
@@ -2232,5 +2794,10 @@ def _looks_like_placeholder_person(text: str) -> bool:
         "关卡",
         "地图",
         "线索",
+        "需求",
+        "请求",
+        "对话",
+        "聊天",
+        "会话",
     )
     return any(clean.endswith(suffix) for suffix in suffixes)

@@ -275,6 +275,10 @@ class AppConfig:
         "Do not infer or repeat old tasks from prior chats. "
         "If nothing needs attention, return no actions."
     )
+    person_impression_enabled: bool = False
+    person_impression_days: int = 90
+    person_impression_max_people_per_run: int = 6
+    person_impression_search_limit: int = 3
 
     reply_on_new_message: str = "已收到消息，我稍后回复你。"
     reply_on_mention: str = "收到@，我看到了，稍后处理。"
@@ -740,6 +744,21 @@ def load_config(path: str | Path | None) -> AppConfig:
         data.get("heartbeat_fail_open", cfg.heartbeat_fail_open)
     )
     cfg.heartbeat_prompt = str(data.get("heartbeat_prompt", cfg.heartbeat_prompt))
+    cfg.person_impression_enabled = bool(
+        data.get("person_impression_enabled", cfg.person_impression_enabled)
+    )
+    cfg.person_impression_days = int(
+        data.get("person_impression_days", cfg.person_impression_days)
+    )
+    cfg.person_impression_max_people_per_run = int(
+        data.get(
+            "person_impression_max_people_per_run",
+            cfg.person_impression_max_people_per_run,
+        )
+    )
+    cfg.person_impression_search_limit = int(
+        data.get("person_impression_search_limit", cfg.person_impression_search_limit)
+    )
 
     cfg.reply_on_new_message = str(
         data.get("reply_on_new_message", cfg.reply_on_new_message)
@@ -1029,5 +1048,17 @@ def load_config(path: str | Path | None) -> AppConfig:
         cfg.heartbeat_min_idle_sec = 0.0
     if cfg.heartbeat_max_actions < 1:
         cfg.heartbeat_max_actions = 1
+    if cfg.person_impression_days < 1:
+        cfg.person_impression_days = 1
+    if cfg.person_impression_days > 3650:
+        cfg.person_impression_days = 3650
+    if cfg.person_impression_max_people_per_run < 1:
+        cfg.person_impression_max_people_per_run = 1
+    if cfg.person_impression_max_people_per_run > 200:
+        cfg.person_impression_max_people_per_run = 200
+    if cfg.person_impression_search_limit < 1:
+        cfg.person_impression_search_limit = 1
+    if cfg.person_impression_search_limit > 12:
+        cfg.person_impression_search_limit = 12
 
     return cfg

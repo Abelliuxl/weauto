@@ -6,6 +6,7 @@
 
 每次心跳优先执行以下维护任务（按顺序）：
 - 使用工具 `maintain_memory`，参数 `{"days": 7}`，整理最近 7 天 daily memory 到 `MEMORY.md` 的托管区块。
+- 使用工具 `maintain_person_impressions`，参数 `{"days": 120, "max_people": 100}`，按历史会话状态维护 `memory/people/*.md` 人物印象。
 - 使用工具 `refine_persona_files`，整理并去重 `SOUL.md`、`IDENTITY.md`、`USER.md`、`TOOLS.md` 的托管区块。
 
 执行约束：

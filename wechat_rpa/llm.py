@@ -2219,6 +2219,7 @@ class LlmReplyGenerator:
             "remember_session_event": "args={\"event\":\"<=120字\"} 记录当前会话近期事件",
             "set_session_summary": "args={\"summary\":\"<=200字\"} 更新当前会话画像摘要",
             "search_memory": "args={\"query\":\"<=80字\"} 在记忆库检索相关片段",
+            "search_person_impression": "args={\"query\":\"<=80字\"} 检索特定人物的印象记忆",
             "workspace_list_files": (
                 "args={\"path\":\"<=120字,可空\",\"recursive\":false,\"max_entries\":1-200} "
                 "列出 agent_workspace 目录内容"
@@ -2239,6 +2240,10 @@ class LlmReplyGenerator:
             ),
             "remember_long_term": "args={\"note\":\"<=200字\"} 写入长期记忆（仅管理员）",
             "maintain_memory": "args={\"days\":1-14} 整理近期记忆到 MEMORY.md",
+            "maintain_person_impressions": (
+                "args={\"days\":1-3650,\"max_people\":1-200} "
+                "按近期会话维护人物印象记忆"
+            ),
             "refine_persona_files": "args={} 整理 SOUL/IDENTITY/USER/TOOLS 设定文件",
             "mute_session": "args={} 静音当前会话（仅管理员）",
             "unmute_session": "args={} 取消静音当前会话（仅管理员）",
@@ -2389,6 +2394,15 @@ class LlmReplyGenerator:
                     if not query:
                         continue
                     args = {"query": query}
+                elif tool == "search_person_impression":
+                    query = re.sub(
+                        r"\s+",
+                        " ",
+                        str(args_obj.get("query", "") or args_obj.get("text", "")).strip(),
+                    )[:80]
+                    if not query:
+                        continue
+                    args = {"query": query}
                 elif tool == "workspace_list_files":
                     rel_path = re.sub(
                         r"\s+",
@@ -2470,6 +2484,21 @@ class LlmReplyGenerator:
                         days = 3
                     days = max(1, min(14, days))
                     args = {"days": days}
+                elif tool == "maintain_person_impressions":
+                    days_raw = args_obj.get("days", 30)
+                    max_people_raw = args_obj.get("max_people", 6)
+                    try:
+                        days = int(days_raw)
+                    except Exception:
+                        days = 30
+                    try:
+                        max_people = int(max_people_raw)
+                    except Exception:
+                        max_people = 6
+                    args = {
+                        "days": max(1, min(3650, days)),
+                        "max_people": max(1, min(200, max_people)),
+                    }
                 elif tool == "refine_persona_files":
                     args = {}
                 elif tool in ("mute_session", "unmute_session"):
@@ -2489,6 +2518,101 @@ class LlmReplyGenerator:
             "actions": normalized,
             "reply_hint": reply_hint,
             "send_reply": send_reply,
+        }
+
+    def heartbeat_person_impression_digest(
+        self,
+        *,
+        name: str,
+        aliases: list[str],
+        notes: list[str],
+        sessions: list[str],
+        facts: list[str],
+        events: list[str],
+        relations: list[str],
+        mentions: int = 0,
+    ) -> dict[str, object]:
+        if not self.is_enabled():
+            return {}
+
+        user_prompt = (
+            "你是“人物印象整理器”，需要把聊天中某个人的信息整理成稳定记忆。\n"
+            "请只输出 JSON 对象，字段固定为：keywords, impression, facts, events, relations。\n"
+            "字段约束：\n"
+            "1) keywords: 字符串数组，1-10 项，每项 <=16 字。\n"
+            "2) impression: 一句话中文总结，<=220 字。\n"
+            "3) facts/events/relations: 字符串数组，每个字段最多 8 项。\n"
+            "4) 不要编造，宁缺毋滥；同义内容去重。\n\n"
+            f"人物名: {name or '未知'}\n"
+            f"别名候选: {', '.join(aliases) if aliases else '无'}\n"
+            f"会话备注线索: {' | '.join(notes) if notes else '无'}\n"
+            f"来源会话: {', '.join(sessions) if sessions else '无'}\n"
+            f"提及频次: {max(0, int(mentions))}\n"
+            f"相关事实: {' | '.join(facts) if facts else '无'}\n"
+            f"相关事件: {' | '.join(events) if events else '无'}\n"
+            f"相关关系: {' | '.join(relations) if relations else '无'}"
+        )
+        payload: dict[str, object] = {
+            "model": self.cfg.model,
+            "temperature": 0.1,
+            "response_format": {"type": "json_object"},
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "你是记忆整理器。只输出 JSON，不要 markdown，不要解释。"
+                    ),
+                },
+                {"role": "user", "content": user_prompt},
+            ],
+        }
+        max_tokens = self._effective_text_max_tokens(self.cfg.max_tokens)
+        if max_tokens is not None:
+            payload["max_tokens"] = max(220, min(900, max_tokens))
+        raw = self._post_chat(payload)
+        parsed = self._extract_json_payload(raw)
+        if not isinstance(parsed, dict):
+            return {}
+
+        def _normalize_list(raw_value: object, *, limit: int, item_limit: int) -> list[str]:
+            values: list[object]
+            if isinstance(raw_value, list):
+                values = raw_value
+            elif isinstance(raw_value, str):
+                values = re.split(r"[\n,，;；|]+", raw_value)
+            else:
+                values = []
+            out: list[str] = []
+            seen: set[str] = set()
+            for value in values:
+                clean = re.sub(r"\s+", " ", str(value or "")).strip()
+                if not clean:
+                    continue
+                clean = clean[: max(1, int(item_limit))]
+                key = clean.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(clean)
+                if len(out) >= max(1, int(limit)):
+                    break
+            return out
+
+        impression = re.sub(
+            r"\s+",
+            " ",
+            str(parsed.get("impression", "") or parsed.get("summary", "")).strip(),
+        )[:220]
+        keywords = _normalize_list(parsed.get("keywords"), limit=10, item_limit=16)
+        facts_out = _normalize_list(parsed.get("facts"), limit=8, item_limit=70)
+        events_out = _normalize_list(parsed.get("events"), limit=8, item_limit=90)
+        relations_out = _normalize_list(parsed.get("relations"), limit=8, item_limit=90)
+        return {
+            "keywords": keywords,
+            "impression": impression,
+            "facts": facts_out,
+            "events": events_out,
+            "relations": relations_out,
         }
 
     def heartbeat_memory_digest(
