@@ -4,13 +4,13 @@
 
 ## 1. 读取规则
 
-- 默认值来自 `AppConfig` / `LlmConfig` / `VisionConfig` / `EmbeddingConfig` / `RerankConfig`。
+- 默认值来自 `AppConfig` / `LlmConfig` / `VisionConfig` / `EmbeddingConfig` / `RerankConfig` / `ImageGenerationConfig`。
 - `config.toml` 只覆盖你显式填写的项。
 - `config.toml.example` 是一份“可运行示例”，其值不等于代码默认值。
 
 关键回退规则：
 
-- `llm/vision/embedding/rerank` 的 `base_url` 为空时，会尝试读取 `base_url_env` 指向的环境变量。
+- `llm/vision/embedding/rerank/image_generation` 的 `base_url` 为空时，会尝试读取 `base_url_env` 指向的环境变量。
 - `vision.base_url/api_key/model` 为空时，会回退到 `llm` 对应字段。
 - `llm_reply/llm_decision/llm_planner/llm_summary/llm_heartbeat` 会在未填写字段时继承 `[llm]`。
 
@@ -39,6 +39,7 @@
 | `click_move_duration_sec` | `0.18` | 鼠标移动耗时 |
 | `mouse_down_hold_sec` | `0.03` | 鼠标按下保持 |
 | `post_select_wait_sec` | `0.35` | 点击会话后等待 UI 稳定 |
+| `send_after_paste_delay_sec` | `0.5` | 粘贴后延迟回车发送（文本与文件发送共用） |
 | `focus_verify_enabled` | `true` | 是否做标题校验 |
 | `focus_verify_max_clicks` | `3` | 校验重试次数 |
 | `focus_verify_wait_sec` | `0.20` | 校验重试间隔 |
@@ -85,12 +86,19 @@
 | `admin_command_prefix` | `"/"` | 命令前缀 |
 | `agent_actions_enabled` | `true` | 工具动作执行开关 |
 | `agent_actions_max_per_turn` | `2` | 单轮最多动作数 |
+| `agent_reply_max_messages_per_turn` | `3` | 单次触发最多连续发送条数（planner 通过 `send_reply` 自行结束） |
 | `agent_actions_fail_open` | `true` | 动作规划失败是否继续主流程 |
 | `agent_plan_loop_enabled` | `true` | 多轮规划循环开关 |
 | `agent_plan_max_rounds` | `3` | 最多规划轮数 |
 | `agent_plan_max_total_actions` | `6` | 单次触发总动作预算 |
 | `agent_plan_repeat_limit` | `2` | 相同 tool+args 重复上限 |
 | `agent_plan_observation_max_chars` | `5200` | 规划可见 observation 长度上限 |
+
+普通消息 planner 的常用内置工具（当前实现）：
+
+- 记忆类：`remember_session_fact` / `remember_session_event` / `set_session_summary` / `search_memory`
+- 工作区文件类（需 `workspace_enabled=true`）：`workspace_list_files` / `workspace_read_file` / `workspace_write_file`
+- 可选联网/生图：`web_search` / `web_search_volc` / `generate_image`（按配置可用性动态暴露）
 
 管理员命令（当前实现）：
 
@@ -106,7 +114,7 @@
 
 | Key | 默认值 | 说明 |
 |---|---:|---|
-| `web_search_provider` | `tavily` | `tavily` / `brave` / `agent_reach` |
+| `web_search_provider` | `tavily` | `tavily` / `brave` / `agent_reach` / `volc_ark`（自动分流：`volc_ark`=LLM检索模式，其它=机器检索模式） |
 | `tavily_enabled` | `false` | Tavily 开关 |
 | `tavily_base_url` | `https://api.tavily.com` | Tavily 地址 |
 | `tavily_api_key` | `""` | Tavily key |
@@ -119,6 +127,14 @@
 | `brave_api_key_env` | `BRAVE_SEARCH_API_KEY` | Brave 环境变量名 |
 | `brave_max_results` | `3` | 返回条数上限 |
 | `brave_timeout_sec` | `8.0` | 超时 |
+| `volc_ark_enabled` | `false` | 火山方舟内置检索工具 `web_search_volc` 开关 |
+| `volc_ark_base_url` | `https://ark.cn-beijing.volces.com/api/v3` | Ark Responses API 基础地址 |
+| `volc_ark_api_key` | `""` | Ark API Key |
+| `volc_ark_api_key_env` | `ARK_API_KEY` | Ark 环境变量名 |
+| `volc_ark_model` | `doubao-seed-1-8-251228` | Ark 模型 ID（需支持 web_search） |
+| `volc_ark_limit` | `8` | 单次搜索返回条数（1-20） |
+| `volc_ark_max_keyword` | `3` | 单轮关键词数上限（1-50） |
+| `volc_ark_timeout_sec` | `20.0` | 请求超时 |
 | `agent_reach_enabled` | `false` | Agent Reach 开关 |
 | `agent_reach_mcporter_cmd` | `mcporter` | 外部命令名（需在 PATH） |
 | `agent_reach_max_results` | `5` | 返回条数上限 |
@@ -270,7 +286,26 @@
 
 - 当前链路中 Vision 失败（`fail_open=true`）时，会返回空 context 并继续；不会回退“聊天区 OCR 解析”。
 
-## 8. `[embedding]` 与 `[rerank]`
+## 8. `[image_generation]` 配置
+
+| Key | 默认值 | 说明 |
+|---|---:|---|
+| `enabled` | `false` | planner 工具 `generate_image` 开关 |
+| `base_url/base_url_env` | `https://api.siliconflow.cn/v1` / `SILICONFLOW_BASE_URL` | OpenAI 兼容 `images/generations` 地址 |
+| `api_key/api_key_env` | `""` / `SILICONFLOW_API_KEY` | 鉴权 |
+| `model` | `black-forest-labs/FLUX.1-dev` | 生图模型 |
+| `timeout_sec` | `90.0` | 生成请求超时 |
+| `download_timeout_sec` | `45.0` | 下载图片超时 |
+| `default_size` | `1024x1024` | 默认尺寸 |
+| `output_dir` | `data/generated_images` | 本地落盘目录 |
+
+注意：
+
+- 工具可用条件：`enabled=true` 且 `base_url/model/api_key` 可解析。
+- 该工具会先生成图片，再下载到本地，然后按“文件消息”发送到微信会话。
+- 生成历史会追加到 `output_dir/history.jsonl`（每行一条 JSON，含文件名、prompt、size、seed、时间戳）。
+
+## 9. `[embedding]` 与 `[rerank]`
 
 两者字段结构一致：
 
@@ -285,21 +320,22 @@
 - `embedding`：记忆召回相似度加权
 - `rerank`：候选记忆精排
 
-## 9. 常用环境变量
+## 10. 常用环境变量
 
 - `OPENAI_API_KEY`、`OPENAI_BASE_URL`
 - `SILICONFLOW_API_KEY`、`SILICONFLOW_BASE_URL`
 - `TAVILY_API_KEY`
 - `BRAVE_SEARCH_API_KEY`
+- `ARK_API_KEY`
 - `WEAUTO_OCR_BACKEND`
 - `WEAUTO_OCR_ENHANCE`
 - `WEAUTO_LOG_WIDTH`（日志宽度）
 - `WEAUTO_LOG_FILE`（由启动脚本注入，用于 debug 附加日志）
 - `FORCE_COLOR` / `NO_COLOR`
 
-## 10. 建议流程
+## 11. 建议流程
 
 1. 从 `config.toml.example` 复制并跑完校准
 2. 先 `dry_run=true` 观察日志
 3. 再调整 `group_*`、`decision_*`、`agent_*`
-4. 最后按需要开启 `workspace_memory_sqlite_*`、`embedding/rerank`
+4. 最后按需要开启 `workspace_memory_sqlite_*`、`embedding/rerank`、`image_generation`

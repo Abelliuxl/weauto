@@ -67,6 +67,7 @@ class LlmConfig:
     api_key: str = ""
     api_key_env: str = "OPENAI_API_KEY"
     model: str = "gpt-4o-mini"
+    api_format: str = "openai"
     ollama_native: bool = False
     ollama_think: str = ""
     # Controls think mode when using OpenAI-compatible /chat/completions.
@@ -166,6 +167,21 @@ class RerankConfig:
 
 
 @dataclass
+class ImageGenerationConfig:
+    enabled: bool = False
+    provider: str = "openai_compat"
+    base_url: str = "https://api.siliconflow.cn/v1"
+    base_url_env: str = "SILICONFLOW_BASE_URL"
+    api_key: str = ""
+    api_key_env: str = "SILICONFLOW_API_KEY"
+    model: str = "black-forest-labs/FLUX.1-dev"
+    timeout_sec: float = 90.0
+    download_timeout_sec: float = 45.0
+    default_size: str = "1024x1024"
+    output_dir: str = "data/generated_images"
+
+
+@dataclass
 class AppConfig:
     app_name: str = "WeChat"
     poll_interval_sec: float = 2.0
@@ -176,6 +192,7 @@ class AppConfig:
     click_move_duration_sec: float = 0.18
     mouse_down_hold_sec: float = 0.03
     post_select_wait_sec: float = 0.35
+    send_after_paste_delay_sec: float = 0.5
     focus_verify_enabled: bool = True
     focus_verify_max_clicks: int = 3
     focus_verify_wait_sec: float = 0.20
@@ -213,6 +230,8 @@ class AppConfig:
     admin_command_prefix: str = "/"
     agent_actions_enabled: bool = True
     agent_actions_max_per_turn: int = 2
+    # Max reply messages planner can emit in one trigger cycle.
+    agent_reply_max_messages_per_turn: int = 3
     agent_actions_fail_open: bool = True
     agent_plan_loop_enabled: bool = True
     agent_plan_max_rounds: int = 3
@@ -232,6 +251,15 @@ class AppConfig:
     brave_api_key_env: str = "BRAVE_SEARCH_API_KEY"
     brave_max_results: int = 3
     brave_timeout_sec: float = 8.0
+    # Volcengine Ark built-in web search (independent tool: web_search_volc)
+    volc_ark_enabled: bool = False
+    volc_ark_base_url: str = "https://ark.cn-beijing.volces.com/api/v3"
+    volc_ark_api_key: str = ""
+    volc_ark_api_key_env: str = "ARK_API_KEY"
+    volc_ark_model: str = "doubao-seed-1-8-251228"
+    volc_ark_limit: int = 8
+    volc_ark_max_keyword: int = 3
+    volc_ark_timeout_sec: float = 20.0
     # Agent Reach provider (via mcporter + Exa MCP)
     agent_reach_enabled: bool = False
     agent_reach_mcporter_cmd: str = "mcporter"
@@ -322,6 +350,7 @@ class AppConfig:
     vision: VisionConfig = field(default_factory=VisionConfig)
     embedding: EmbeddingConfig = field(default_factory=EmbeddingConfig)
     rerank: RerankConfig = field(default_factory=RerankConfig)
+    image_generation: ImageGenerationConfig = field(default_factory=ImageGenerationConfig)
 
 
 def _load_region(data: dict, key: str, default: RegionRatio) -> RegionRatio:
@@ -382,7 +411,31 @@ def _load_web_search_provider(raw: object, default: str = "tavily") -> str:
         return "brave"
     if value in ("agent_reach", "agent-reach", "agentreach", "reach", "exa"):
         return "agent_reach"
+    if value in ("volc_ark", "volc-ark", "ark", "volc", "volces"):
+        return "volc_ark"
     return _load_web_search_provider(default, "tavily") if value != default else "tavily"
+
+
+def _load_api_format(raw: object, default: str = "openai") -> str:
+    value = str(raw if raw is not None else default).strip().lower()
+    if value in ("openai", "openai_compat", "openai-compatible", "chat_completions"):
+        return "openai"
+    if value in ("anthropic", "anthropic_compat", "anthropic-compatible", "messages"):
+        return "anthropic"
+    return _load_api_format(default, "openai") if value != default else "openai"
+
+
+def _load_image_generation_provider(raw: object, default: str = "openai_compat") -> str:
+    value = str(raw if raw is not None else default).strip().lower()
+    if value in ("openai", "openai_compat", "openai-compatible"):
+        return "openai_compat"
+    if value in ("dashscope", "dashscope_z_image", "dashscope-z-image", "aliyun", "bailian"):
+        return "dashscope_z_image"
+    return (
+        _load_image_generation_provider(default, "openai_compat")
+        if value != default
+        else "openai_compat"
+    )
 
 
 def _load_llm_config(raw_obj: object, default: LlmConfig) -> LlmConfig:
@@ -398,6 +451,7 @@ def _load_llm_config(raw_obj: object, default: LlmConfig) -> LlmConfig:
         api_key=str(raw.get("api_key", default.api_key)),
         api_key_env=str(raw.get("api_key_env", default.api_key_env)),
         model=str(raw.get("model", default.model)),
+        api_format=_load_api_format(raw.get("api_format", default.api_format), default.api_format),
         ollama_native=bool(raw.get("ollama_native", default.ollama_native)),
         ollama_think=_load_ollama_think(
             raw.get("ollama_think", default.ollama_think),
@@ -471,6 +525,9 @@ def load_config(path: str | Path | None) -> AppConfig:
     )
     cfg.mouse_down_hold_sec = float(data.get("mouse_down_hold_sec", cfg.mouse_down_hold_sec))
     cfg.post_select_wait_sec = float(data.get("post_select_wait_sec", cfg.post_select_wait_sec))
+    cfg.send_after_paste_delay_sec = float(
+        data.get("send_after_paste_delay_sec", cfg.send_after_paste_delay_sec)
+    )
     cfg.focus_verify_enabled = bool(data.get("focus_verify_enabled", cfg.focus_verify_enabled))
     cfg.focus_verify_max_clicks = int(
         data.get("focus_verify_max_clicks", cfg.focus_verify_max_clicks)
@@ -582,6 +639,12 @@ def load_config(path: str | Path | None) -> AppConfig:
     cfg.agent_actions_max_per_turn = int(
         data.get("agent_actions_max_per_turn", cfg.agent_actions_max_per_turn)
     )
+    cfg.agent_reply_max_messages_per_turn = int(
+        data.get(
+            "agent_reply_max_messages_per_turn",
+            cfg.agent_reply_max_messages_per_turn,
+        )
+    )
     cfg.agent_actions_fail_open = bool(
         data.get("agent_actions_fail_open", cfg.agent_actions_fail_open)
     )
@@ -611,6 +674,8 @@ def load_config(path: str | Path | None) -> AppConfig:
         cfg.agent_plan_repeat_limit = 1
     if cfg.agent_plan_observation_max_chars < 1200:
         cfg.agent_plan_observation_max_chars = 1200
+    if cfg.agent_reply_max_messages_per_turn < 1:
+        cfg.agent_reply_max_messages_per_turn = 1
     cfg.web_search_provider = _load_web_search_provider(
         data.get("web_search_provider", cfg.web_search_provider),
         cfg.web_search_provider,
@@ -627,6 +692,20 @@ def load_config(path: str | Path | None) -> AppConfig:
     cfg.brave_api_key_env = str(data.get("brave_api_key_env", cfg.brave_api_key_env))
     cfg.brave_max_results = int(data.get("brave_max_results", cfg.brave_max_results))
     cfg.brave_timeout_sec = float(data.get("brave_timeout_sec", cfg.brave_timeout_sec))
+    cfg.volc_ark_enabled = bool(data.get("volc_ark_enabled", cfg.volc_ark_enabled))
+    cfg.volc_ark_base_url = str(
+        data.get("volc_ark_base_url", cfg.volc_ark_base_url)
+    ).rstrip("/")
+    cfg.volc_ark_api_key = str(data.get("volc_ark_api_key", cfg.volc_ark_api_key))
+    cfg.volc_ark_api_key_env = str(data.get("volc_ark_api_key_env", cfg.volc_ark_api_key_env))
+    cfg.volc_ark_model = str(data.get("volc_ark_model", cfg.volc_ark_model)).strip()
+    cfg.volc_ark_limit = int(data.get("volc_ark_limit", cfg.volc_ark_limit))
+    cfg.volc_ark_max_keyword = int(
+        data.get("volc_ark_max_keyword", cfg.volc_ark_max_keyword)
+    )
+    cfg.volc_ark_timeout_sec = float(
+        data.get("volc_ark_timeout_sec", cfg.volc_ark_timeout_sec)
+    )
     cfg.agent_reach_enabled = bool(data.get("agent_reach_enabled", cfg.agent_reach_enabled))
     cfg.agent_reach_mcporter_cmd = str(
         data.get("agent_reach_mcporter_cmd", cfg.agent_reach_mcporter_cmd)
@@ -637,6 +716,16 @@ def load_config(path: str | Path | None) -> AppConfig:
     cfg.agent_reach_timeout_sec = float(
         data.get("agent_reach_timeout_sec", cfg.agent_reach_timeout_sec)
     )
+    if cfg.volc_ark_limit < 1:
+        cfg.volc_ark_limit = 1
+    if cfg.volc_ark_limit > 20:
+        cfg.volc_ark_limit = 20
+    if cfg.volc_ark_max_keyword < 1:
+        cfg.volc_ark_max_keyword = 1
+    if cfg.volc_ark_max_keyword > 50:
+        cfg.volc_ark_max_keyword = 50
+    if cfg.volc_ark_timeout_sec < 1.0:
+        cfg.volc_ark_timeout_sec = 1.0
     cfg.heartbeat_enabled = bool(data.get("heartbeat_enabled", cfg.heartbeat_enabled))
     cfg.heartbeat_interval_sec = float(
         data.get("heartbeat_interval_sec", cfg.heartbeat_interval_sec)
@@ -886,6 +975,54 @@ def load_config(path: str | Path | None) -> AppConfig:
     )
     if not cfg.rerank.base_url:
         cfg.rerank.base_url = "https://api.siliconflow.cn/v1"
+
+    image_gen_raw = data.get("image_generation", {})
+    image_gen_base_url = str(
+        image_gen_raw.get("base_url", cfg.image_generation.base_url)
+    ).strip().rstrip("/")
+    image_gen_base_url_env = str(
+        image_gen_raw.get("base_url_env", cfg.image_generation.base_url_env)
+    ).strip()
+    if (not image_gen_base_url) and image_gen_base_url_env:
+        image_gen_base_url = str(os.getenv(image_gen_base_url_env, "")).strip().rstrip("/")
+    cfg.image_generation = ImageGenerationConfig(
+        enabled=bool(image_gen_raw.get("enabled", cfg.image_generation.enabled)),
+        provider=_load_image_generation_provider(
+            image_gen_raw.get("provider", cfg.image_generation.provider),
+            cfg.image_generation.provider,
+        ),
+        base_url=image_gen_base_url,
+        base_url_env=image_gen_base_url_env,
+        api_key=str(image_gen_raw.get("api_key", cfg.image_generation.api_key)),
+        api_key_env=str(image_gen_raw.get("api_key_env", cfg.image_generation.api_key_env)),
+        model=str(image_gen_raw.get("model", cfg.image_generation.model)).strip(),
+        timeout_sec=float(image_gen_raw.get("timeout_sec", cfg.image_generation.timeout_sec)),
+        download_timeout_sec=float(
+            image_gen_raw.get(
+                "download_timeout_sec",
+                cfg.image_generation.download_timeout_sec,
+            )
+        ),
+        default_size=str(
+            image_gen_raw.get("default_size", cfg.image_generation.default_size)
+        ).strip(),
+        output_dir=str(image_gen_raw.get("output_dir", cfg.image_generation.output_dir)).strip(),
+    )
+    if not cfg.image_generation.base_url:
+        cfg.image_generation.base_url = "https://api.siliconflow.cn/v1"
+    if not cfg.image_generation.model:
+        cfg.image_generation.model = "black-forest-labs/FLUX.1-dev"
+    if not cfg.image_generation.default_size:
+        cfg.image_generation.default_size = "1024x1024"
+    if not cfg.image_generation.output_dir:
+        cfg.image_generation.output_dir = "data/generated_images"
+    if cfg.image_generation.timeout_sec < 5.0:
+        cfg.image_generation.timeout_sec = 5.0
+    if cfg.image_generation.download_timeout_sec < 5.0:
+        cfg.image_generation.download_timeout_sec = 5.0
+    if cfg.send_after_paste_delay_sec < 0.0:
+        cfg.send_after_paste_delay_sec = 0.0
+
     if cfg.heartbeat_interval_sec < 5.0:
         cfg.heartbeat_interval_sec = 5.0
     if cfg.heartbeat_min_idle_sec < 0.0:

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from collections import defaultdict
+import base64
 import concurrent.futures
 from dataclasses import dataclass
 from datetime import datetime
 from difflib import SequenceMatcher
 import builtins
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -1611,6 +1613,20 @@ class WeChatGuiRpaBot:
             "set_session_summary",
             "search_memory",
         ]
+        if self.cfg.workspace_enabled:
+            tools.extend(
+                [
+                    "workspace_list_files",
+                    "workspace_read_file",
+                    "workspace_write_file",
+                ]
+            )
+        if self._has_image_generation_tool():
+            tools.append("generate_image")
+        # Keep planner whitelist aligned with runtime capability checks:
+        # expose each search tool independently when it is actually usable.
+        if self._has_volc_web_search_tool():
+            tools.append("web_search_volc")
         if self._has_web_search_tool():
             tools.append("web_search")
         if is_admin:
@@ -1625,11 +1641,16 @@ class WeChatGuiRpaBot:
 
     def _active_web_search_provider(self) -> str:
         provider = str(self.cfg.web_search_provider or "").strip().lower()
+        if provider in ("volc_ark", "volc-ark", "ark", "volc", "volces"):
+            return "volc_ark"
         if provider == "brave":
             return "brave"
         if provider in ("agent_reach", "agent-reach", "agentreach", "reach", "exa"):
             return "agent_reach"
         return "tavily"
+
+    def _active_search_mode(self) -> str:
+        return "llm" if self._active_web_search_provider() == "volc_ark" else "machine"
 
     def _resolve_tavily_api_key(self) -> str:
         if self.cfg.tavily_api_key:
@@ -1647,7 +1668,25 @@ class WeChatGuiRpaBot:
             return ""
         return os.getenv(env_name, "")
 
+    def _resolve_volc_ark_api_key(self) -> str:
+        if self.cfg.volc_ark_api_key:
+            return self.cfg.volc_ark_api_key
+        env_name = (self.cfg.volc_ark_api_key_env or "").strip()
+        if not env_name:
+            return ""
+        return os.getenv(env_name, "")
+
+    def _resolve_image_generation_api_key(self) -> str:
+        if self.cfg.image_generation.api_key:
+            return self.cfg.image_generation.api_key
+        env_name = (self.cfg.image_generation.api_key_env or "").strip()
+        if not env_name:
+            return ""
+        return os.getenv(env_name, "")
+
     def _resolve_web_search_api_key(self, provider: str) -> str:
+        if provider == "volc_ark":
+            return ""
         if provider == "brave":
             return self._resolve_brave_api_key()
         if provider == "agent_reach":
@@ -1655,6 +1694,8 @@ class WeChatGuiRpaBot:
         return self._resolve_tavily_api_key()
 
     def _web_search_enabled(self, provider: str) -> bool:
+        if provider == "volc_ark":
+            return False
         if provider == "agent_reach":
             return bool(self.cfg.agent_reach_enabled)
         if provider == "brave":
@@ -1662,6 +1703,8 @@ class WeChatGuiRpaBot:
         return bool(self.cfg.tavily_enabled)
 
     def _web_search_max_results(self, provider: str) -> int:
+        if provider == "volc_ark":
+            return max(1, int(self.cfg.volc_ark_limit))
         if provider == "agent_reach":
             return max(1, int(self.cfg.agent_reach_max_results))
         if provider == "brave":
@@ -1669,6 +1712,8 @@ class WeChatGuiRpaBot:
         return max(1, int(self.cfg.tavily_max_results))
 
     def _web_search_key_hint(self, provider: str) -> str:
+        if provider == "volc_ark":
+            return "use tool=web_search_volc in llm mode"
         if provider == "agent_reach":
             return "install/configure mcporter + exa (via agent-reach install)"
         if provider == "brave":
@@ -1687,6 +1732,8 @@ class WeChatGuiRpaBot:
 
     def _has_web_search_tool(self) -> bool:
         provider = self._active_web_search_provider()
+        if provider == "volc_ark":
+            return False
         if not self._web_search_enabled(provider):
             return False
         if provider == "agent_reach":
@@ -1694,27 +1741,101 @@ class WeChatGuiRpaBot:
             return bool(cmd and shutil.which(cmd))
         return bool(self._resolve_web_search_api_key(provider))
 
+    def _volc_web_search_key_hint(self) -> str:
+        env_name = (self.cfg.volc_ark_api_key_env or "").strip()
+        return (
+            f"config.volc_ark_api_key or env {env_name}"
+            if env_name
+            else "config.volc_ark_api_key"
+        )
+
+    def _has_volc_web_search_tool(self) -> bool:
+        if not bool(self.cfg.volc_ark_enabled):
+            return False
+        if not str(self.cfg.volc_ark_model or "").strip():
+            return False
+        return bool(self._resolve_volc_ark_api_key())
+
+    def _image_generation_key_hint(self) -> str:
+        env_name = (self.cfg.image_generation.api_key_env or "").strip()
+        return (
+            f"config.image_generation.api_key or env {env_name}"
+            if env_name
+            else "config.image_generation.api_key"
+        )
+
+    def _has_image_generation_tool(self) -> bool:
+        if not bool(self.cfg.image_generation.enabled):
+            return False
+        if not str(self.cfg.image_generation.base_url or "").strip():
+            return False
+        if not str(self.cfg.image_generation.model or "").strip():
+            return False
+        return bool(self._resolve_image_generation_api_key())
+
+    def _image_generation_status_text(self) -> str:
+        if not bool(self.cfg.image_generation.enabled):
+            return "disabled (tool=generate_image image_generation.enabled=false)"
+        if not str(self.cfg.image_generation.base_url or "").strip():
+            return "blocked (tool=generate_image missing base_url)"
+        if not str(self.cfg.image_generation.model or "").strip():
+            return "blocked (tool=generate_image missing model)"
+        if not self._resolve_image_generation_api_key():
+            return (
+                "blocked (tool=generate_image missing api key: "
+                f"{self._image_generation_key_hint()})"
+            )
+        return (
+            "available (tool=generate_image "
+            f"model={self.cfg.image_generation.model} "
+            f"default_size={self.cfg.image_generation.default_size})"
+        )
+
+    def _volc_web_search_status_text(self) -> str:
+        if not bool(self.cfg.volc_ark_enabled):
+            return "disabled (tool=web_search_volc provider=volc_ark volc_ark_enabled=false)"
+        if not str(self.cfg.volc_ark_model or "").strip():
+            return "blocked (tool=web_search_volc missing volc_ark_model)"
+        if self._resolve_volc_ark_api_key():
+            return (
+                "available (tool=web_search_volc provider=volc_ark "
+                f"model={self.cfg.volc_ark_model} limit={max(1, min(20, int(self.cfg.volc_ark_limit)))})"
+            )
+        return f"blocked (tool=web_search_volc missing api key: {self._volc_web_search_key_hint()})"
+
     def _web_search_status_text(self) -> str:
         provider = self._active_web_search_provider()
-        if not self._web_search_enabled(provider):
-            return f"disabled (provider={provider} {provider}_enabled=false)"
-        if provider == "agent_reach":
+        mode = self._active_search_mode()
+        base_status = ""
+        if provider == "volc_ark":
+            base_status = "disabled (tool=web_search switched_to=web_search_volc)"
+        elif not self._web_search_enabled(provider):
+            base_status = f"disabled (tool=web_search provider={provider} {provider}_enabled=false)"
+        elif provider == "agent_reach":
             cmd = str(self.cfg.agent_reach_mcporter_cmd or "").strip()
             if cmd and shutil.which(cmd):
-                return (
+                base_status = (
                     f"available (tool=web_search provider={provider} "
                     f"mcporter={cmd} max_results={self._web_search_max_results(provider)})"
                 )
-            return (
-                f"blocked (missing command: {cmd or 'mcporter'}; "
-                f"{self._web_search_key_hint(provider)})"
-            )
-        if self._resolve_web_search_api_key(provider):
-            return (
+            else:
+                base_status = (
+                    f"blocked (tool=web_search missing command: {cmd or 'mcporter'}; "
+                    f"{self._web_search_key_hint(provider)})"
+                )
+        elif self._resolve_web_search_api_key(provider):
+            base_status = (
                 f"available (tool=web_search provider={provider} "
                 f"max_results={self._web_search_max_results(provider)})"
             )
-        return f"blocked (missing api key: {self._web_search_key_hint(provider)})"
+        else:
+            base_status = (
+                f"blocked (tool=web_search missing api key: {self._web_search_key_hint(provider)})"
+            )
+        return (
+            f"mode={mode} provider={provider}; "
+            f"{base_status}; {self._volc_web_search_status_text()}"
+        )
 
     @staticmethod
     def _plan_has_tool(actions: list[dict] | None, tool_name: str) -> bool:
@@ -1775,11 +1896,12 @@ class WeChatGuiRpaBot:
             "攻略",
             "词缀",
         )
-        temporal = ("今天", "最新", "最近", "刚刚")
+        temporal = ("今天", "最新", "最近", "刚刚", "什么时候", "何时", "几号", "哪天")
         has_verb = any(v in raw for v in verbs)
         has_topic = any(t in raw for t in topics) or any(t in lowered for t in topics)
         has_temporal = any(t in raw for t in temporal)
-        has_version = bool(re.search(r"\b\d+\.\d+\b", raw))
+        # NOTE: \b is unreliable around CJK text (e.g. "魔兽12.0"), so use digit-boundaries.
+        has_version = bool(re.search(r"(?<!\d)\d+\.\d+(?:\.\d+)?(?!\d)", raw))
         explicit_lookup = (
             ("检索" in raw)
             or ("搜索" in raw)
@@ -2022,9 +2144,9 @@ class WeChatGuiRpaBot:
         lookup_intent: bool,
         lookup_query: str,
         enforce_lookup_round1: bool,
-    ) -> tuple[str, str, int]:
+    ) -> tuple[str, str, int, bool]:
         if not tools:
-            return memory_recall, "", 0
+            return memory_recall, "", 0, True
 
         rounds = 1
         if self.cfg.agent_plan_loop_enabled:
@@ -2040,6 +2162,7 @@ class WeChatGuiRpaBot:
         action_repeat: dict[str, int] = {}
         total_actions = 0
         final_hint = ""
+        planner_send_reply = True
 
         for round_idx in range(1, rounds + 1):
             remaining = total_limit - total_actions
@@ -2056,7 +2179,6 @@ class WeChatGuiRpaBot:
                         f"title={self._fit_col(row.title, 14)} "
                         f"max={this_round_max:>2} timeout={float(planner.cfg.timeout_sec):.1f}s"
                     )
-
                 plan_request = {
                     "title": row.title,
                     "is_group": is_group,
@@ -2069,6 +2191,11 @@ class WeChatGuiRpaBot:
                     "memory_recall": merged_memory,
                     "available_tools": tools,
                     "max_actions": this_round_max,
+                    "planner_round_idx": round_idx,
+                    "planner_round_total": rounds,
+                    "planner_total_actions_limit": total_limit,
+                    "planner_total_actions_used": total_actions,
+                    "planner_total_actions_remaining": remaining,
                 }
                 plan = self._plan_actions_with_live_progress(
                     planner=planner,
@@ -2084,14 +2211,24 @@ class WeChatGuiRpaBot:
                     if isinstance(plan, dict) and isinstance(plan.get("actions"), list)
                     else []
                 )
+                raw_send_reply = plan.get("send_reply", True) if isinstance(plan, dict) else True
+                if isinstance(raw_send_reply, bool):
+                    send_reply_now = raw_send_reply
+                elif isinstance(raw_send_reply, str):
+                    send_reply_now = raw_send_reply.strip().lower() not in {"0", "false", "no", "off"}
+                else:
+                    send_reply_now = bool(raw_send_reply)
+                planner_send_reply = send_reply_now
                 raw_hint = str(plan.get("reply_hint", "")).strip() if isinstance(plan, dict) else ""
                 hint = self._normalize_planner_reply_hint(
                     raw_hint,
                     reason=reason,
                     latest_message=latest_message or row.preview or row.text or "",
                 )
-                if hint:
+                if send_reply_now and hint:
                     final_hint = hint
+                elif not send_reply_now:
+                    final_hint = ""
                 if self.cfg.log_verbose:
                     names = ",".join(
                         str(item.get("tool", "")).strip()
@@ -2109,6 +2246,7 @@ class WeChatGuiRpaBot:
                         )
                     elif raw_hint:
                         print("             hint=(dropped by normalize)")
+                    print(f"             send_reply={send_reply_now}")
 
                 if (
                     enforce_lookup_round1
@@ -2116,8 +2254,30 @@ class WeChatGuiRpaBot:
                     and lookup_intent
                     and lookup_query
                 ):
+                    if self.cfg.log_verbose:
+                        print(
+                            f"[agent] round1-lookup-enforce intent={lookup_intent} "
+                            f"query={self._fit_col(lookup_query, max(24, self._term_width() - 35))}"
+                        )
                     enforced: list[dict] = []
-                    if self._has_web_search_tool() and ("web_search" in tools):
+                    planned_tool_names = {
+                        str(x.get("tool", "")).strip()
+                        for x in planned_actions
+                        if isinstance(x, dict)
+                    }
+                    has_lookup_tool = ("web_search_volc" in planned_tool_names) or (
+                        "web_search" in planned_tool_names
+                    )
+                    if (not has_lookup_tool) and self._has_volc_web_search_tool() and ("web_search_volc" in tools):
+                        if not self._plan_has_tool(planned_actions, "web_search_volc"):
+                            enforced.append(
+                                {
+                                    "tool": "web_search_volc",
+                                    "args": {"query": lookup_query},
+                                    "reason": "auto lookup intent (trusted)",
+                                }
+                            )
+                    elif (not has_lookup_tool) and self._has_web_search_tool() and ("web_search" in tools):
                         if not self._plan_has_tool(planned_actions, "web_search"):
                             enforced.append(
                                 {
@@ -2126,7 +2286,13 @@ class WeChatGuiRpaBot:
                                     "reason": "auto lookup intent",
                                 }
                             )
-                    if "search_memory" in tools:
+                    enforced_tool_names = [str(x.get("tool", "")).strip() for x in enforced]
+                    if (
+                        (not has_lookup_tool)
+                        and ("web_search_volc" not in enforced_tool_names)
+                        and ("web_search" not in enforced_tool_names)
+                        and ("search_memory" in tools)
+                    ):
                         if not self._plan_has_tool(planned_actions, "search_memory"):
                             enforced.append(
                                 {
@@ -2218,22 +2384,31 @@ class WeChatGuiRpaBot:
                 print(f"[warn] agent action planner failed, fail-open: {exc}")
                 if lookup_intent and lookup_query:
                     fallback_actions: list[dict] = []
-                    if "search_memory" in tools:
+                    if self._has_volc_web_search_tool() and ("web_search_volc" in tools):
                         fallback_actions.append(
                             {
-                                "tool": "search_memory",
+                                "tool": "web_search_volc",
                                 "args": {"query": lookup_query},
                                 "reason": "planner fail fallback",
                             }
                         )
-                    if self._has_web_search_tool() and ("web_search" in tools):
-                        fallback_actions.append(
-                            {
-                                "tool": "web_search",
-                                "args": {"query": lookup_query},
-                                "reason": "planner fail fallback",
-                            }
-                        )
+                    else:
+                        if "search_memory" in tools:
+                            fallback_actions.append(
+                                {
+                                    "tool": "search_memory",
+                                    "args": {"query": lookup_query},
+                                    "reason": "planner fail fallback",
+                                }
+                            )
+                        if self._has_web_search_tool() and ("web_search" in tools):
+                            fallback_actions.append(
+                                {
+                                    "tool": "web_search",
+                                    "args": {"query": lookup_query},
+                                    "reason": "planner fail fallback",
+                                }
+                            )
                     fallback_actions = fallback_actions[:per_round_limit]
                     if fallback_actions:
                         trace, observations = self._execute_agent_actions(
@@ -2305,7 +2480,9 @@ class WeChatGuiRpaBot:
         if final_hint and not planned_reply:
             fallback = self.cfg.reply_on_mention if reason == "mention" else self.cfg.reply_on_new_message
             planned_reply = self._sanitize_generated_reply(final_hint, fallback=fallback)
-        return merged_memory, planned_reply, total_actions
+        if not planner_send_reply:
+            planned_reply = ""
+        return merged_memory, planned_reply, total_actions, planner_send_reply
 
     @staticmethod
     def _clean_web_query(query: str) -> str:
@@ -2314,6 +2491,145 @@ class WeChatGuiRpaBot:
     @staticmethod
     def _compact_web_text(raw: object, *, limit: int) -> str:
         return re.sub(r"\s+", " ", str(raw or "")).strip()[:limit]
+
+    def _resolve_workspace_path(self, raw_path: str, *, allow_dir: bool) -> Path:
+        root = Path(self.cfg.workspace_dir).expanduser().resolve()
+        rel = str(raw_path or "").strip().replace("\\", "/")
+        target = root if (not rel) else (root / rel).resolve()
+        if target != root and root not in target.parents:
+            raise RuntimeError("workspace path escapes root")
+        if target.exists() and target.is_symlink():
+            raise RuntimeError("workspace symlink path is not allowed")
+        if target.exists() and (not allow_dir) and target.is_dir():
+            raise RuntimeError("workspace path points to a directory")
+        return target
+
+    def _workspace_list_files(
+        self,
+        *,
+        rel_path: str,
+        recursive: bool,
+        max_entries: int,
+    ) -> str:
+        root = Path(self.cfg.workspace_dir).expanduser().resolve()
+        target = self._resolve_workspace_path(rel_path, allow_dir=True)
+        if not target.exists():
+            return f"path not found: {rel_path or '.'}"
+
+        if target.is_file():
+            try:
+                rel = target.relative_to(root)
+            except Exception:
+                rel = Path(target.name)
+            size = int(target.stat().st_size)
+            return f"f {rel.as_posix()} ({size}B)"
+
+        rows: list[str] = []
+        limit = max(1, min(200, int(max_entries)))
+        if recursive:
+            for cur, dirnames, filenames in os.walk(target):
+                dirnames.sort()
+                filenames.sort()
+                cur_path = Path(cur)
+                for name in dirnames:
+                    item = cur_path / name
+                    try:
+                        rel = item.relative_to(root).as_posix()
+                    except Exception:
+                        rel = item.name
+                    rows.append(f"d {rel}/")
+                    if len(rows) >= limit:
+                        break
+                if len(rows) >= limit:
+                    break
+                for name in filenames:
+                    item = cur_path / name
+                    try:
+                        rel = item.relative_to(root).as_posix()
+                    except Exception:
+                        rel = item.name
+                    try:
+                        size = int(item.stat().st_size)
+                    except Exception:
+                        size = -1
+                    rows.append(f"f {rel} ({size}B)" if size >= 0 else f"f {rel}")
+                    if len(rows) >= limit:
+                        break
+                if len(rows) >= limit:
+                    break
+        else:
+            items = sorted(target.iterdir(), key=lambda p: p.name.lower())
+            for item in items:
+                try:
+                    rel = item.relative_to(root).as_posix()
+                except Exception:
+                    rel = item.name
+                if item.is_dir():
+                    rows.append(f"d {rel}/")
+                else:
+                    try:
+                        size = int(item.stat().st_size)
+                    except Exception:
+                        size = -1
+                    rows.append(f"f {rel} ({size}B)" if size >= 0 else f"f {rel}")
+                if len(rows) >= limit:
+                    break
+        if not rows:
+            return f"path is empty: {rel_path or '.'}"
+        return "\n".join(rows)[:3200]
+
+    def _workspace_read_file(self, *, rel_path: str, max_chars: int = 4000) -> str:
+        root = Path(self.cfg.workspace_dir).expanduser().resolve()
+        target = self._resolve_workspace_path(rel_path, allow_dir=False)
+        if not target.exists():
+            raise RuntimeError(f"workspace file not found: {rel_path}")
+        if not target.is_file():
+            raise RuntimeError(f"workspace path is not a file: {rel_path}")
+        try:
+            text = target.read_text(encoding="utf-8")
+        except Exception as exc:
+            raise RuntimeError(f"workspace read failed: {exc}") from exc
+        try:
+            rel = target.relative_to(root).as_posix()
+        except Exception:
+            rel = target.name
+        clipped = str(text)[: max(200, int(max_chars))]
+        return f"[{rel}]\n{clipped}"
+
+    def _workspace_write_file(
+        self,
+        *,
+        rel_path: str,
+        content: str,
+        mode: str = "overwrite",
+    ) -> str:
+        root = Path(self.cfg.workspace_dir).expanduser().resolve()
+        target = self._resolve_workspace_path(rel_path, allow_dir=False)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        payload = str(content or "")
+        if not payload.strip():
+            raise RuntimeError("workspace write content is empty")
+        write_mode = str(mode or "overwrite").strip().lower()
+        try:
+            if write_mode == "append":
+                with target.open("a", encoding="utf-8") as fh:
+                    fh.write(payload)
+                    if not payload.endswith("\n"):
+                        fh.write("\n")
+            else:
+                target.write_text(payload + ("" if payload.endswith("\n") else "\n"), encoding="utf-8")
+        except Exception as exc:
+            raise RuntimeError(f"workspace write failed: {exc}") from exc
+        try:
+            self._workspace._mark_sqlite_dirty()  # keep sqlite memory index in sync with manual file edits
+        except Exception:
+            pass
+        try:
+            rel = target.relative_to(root).as_posix()
+        except Exception:
+            rel = target.name
+        size = int(target.stat().st_size)
+        return f"written {rel} ({size}B, mode={write_mode})"
 
     def _format_web_search_text(
         self,
@@ -2342,8 +2658,335 @@ class WeChatGuiRpaBot:
                 lines.append(row)
         return "\n".join(lines)[:1200]
 
+    @staticmethod
+    def _clean_image_prompt(raw: object, *, limit: int = 280) -> str:
+        return re.sub(r"\s+", " ", str(raw or "")).strip()[:limit]
+
+    def _normalize_image_size(self, raw: object) -> str:
+        value = re.sub(
+            r"\s+",
+            "",
+            str(raw or self.cfg.image_generation.default_size).strip().lower(),
+        )
+        if not re.fullmatch(r"\d{2,4}x\d{2,4}", value):
+            return self.cfg.image_generation.default_size
+        try:
+            width_txt, height_txt = value.split("x", 1)
+            width = int(width_txt)
+            height = int(height_txt)
+        except Exception:
+            return self.cfg.image_generation.default_size
+        if width < 256 or height < 256 or width > 2048 or height > 2048:
+            return self.cfg.image_generation.default_size
+        return f"{width}x{height}"
+
+    @staticmethod
+    def _dashscope_image_size(size: str) -> str:
+        clean = re.sub(r"\s+", "", str(size or "")).lower()
+        if re.fullmatch(r"\d{2,4}x\d{2,4}", clean):
+            width_txt, height_txt = clean.split("x", 1)
+            return f"{int(width_txt)}*{int(height_txt)}"
+        return "1024*1024"
+
+    @staticmethod
+    def _guess_image_suffix(url_text: str, content_type: str = "") -> str:
+        parsed = urllib.parse.urlparse(str(url_text or ""))
+        ext = Path(parsed.path).suffix.lower()
+        if ext in (".png", ".jpg", ".jpeg", ".webp", ".gif"):
+            return ext
+        clean_type = str(content_type or "").lower()
+        if "webp" in clean_type:
+            return ".webp"
+        if "jpeg" in clean_type or "jpg" in clean_type:
+            return ".jpg"
+        if "gif" in clean_type:
+            return ".gif"
+        return ".png"
+
+    def _next_image_output_path(self, output_dir: Path, *, prompt: str, suffix: str) -> Path:
+        digest = hashlib.sha1(prompt.encode("utf-8")).hexdigest()[:10]
+        now = time.time()
+        stamp = time.strftime("%Y%m%d_%H%M%S", time.localtime(now))
+        millis = int((now - int(now)) * 1000)
+        nonce = hashlib.sha1(f"{time.time_ns()}|{os.getpid()}".encode("utf-8")).hexdigest()[:6]
+        base = f"image_{stamp}_{millis:03d}_{digest}_{nonce}"
+        out = output_dir / f"{base}{suffix}"
+        idx = 1
+        while out.exists():
+            out = output_dir / f"{base}_{idx}{suffix}"
+            idx += 1
+        return out
+
+    def _append_generated_image_history(
+        self,
+        *,
+        output_dir: Path,
+        file_path: Path,
+        prompt: str,
+        size: str,
+        model: str,
+        seed: int | None = None,
+    ) -> None:
+        history_path = output_dir / "history.jsonl"
+        payload = {
+            "ts": int(time.time()),
+            "file": str(file_path),
+            "name": file_path.name,
+            "size_bytes": int(file_path.stat().st_size),
+            "model": str(model or "").strip(),
+            "size": str(size or "").strip(),
+            "seed": seed,
+            "prompt": str(prompt or "").strip(),
+        }
+        try:
+            with history_path.open("a", encoding="utf-8") as fp:
+                fp.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        except Exception:
+            if self.cfg.log_verbose:
+                print(f"[warn] image history append failed: {history_path}")
+
+    def _download_generated_image_bytes(
+        self,
+        *,
+        image_url: str,
+        b64_json: str,
+        cfg,
+    ) -> tuple[bytes, str]:
+        image_bytes = b""
+        suffix = ".png"
+        if image_url:
+            image_req = urllib.request.Request(
+                url=image_url,
+                method="GET",
+                headers={"User-Agent": "weauto-image-downloader/1.0"},
+            )
+            try:
+                ssl_ctx = ssl.create_default_context()
+                with urllib.request.urlopen(
+                    image_req,
+                    timeout=max(5.0, float(cfg.download_timeout_sec)),
+                    context=ssl_ctx,
+                ) as resp:
+                    image_bytes = resp.read()
+                    content_type = str(resp.headers.get("Content-Type", "")).strip()
+                    suffix = self._guess_image_suffix(image_url, content_type)
+            except Exception as exc:
+                if not b64_json:
+                    raise RuntimeError(f"image download failed: {exc}") from exc
+
+        if (not image_bytes) and b64_json:
+            try:
+                image_bytes = base64.b64decode(b64_json, validate=True)
+            except Exception as exc:
+                raise RuntimeError(f"image decode failed: {exc}") from exc
+            suffix = ".png"
+        return image_bytes, suffix
+
+    def _generate_image_file_openai_compat(
+        self,
+        *,
+        cfg,
+        api_key: str,
+        clean_prompt: str,
+        requested_size: str,
+    ) -> tuple[bytes, str, int | None]:
+        base_url = str(cfg.base_url or "").rstrip("/")
+        endpoint = (
+            base_url if base_url.endswith("/images/generations") else f"{base_url}/images/generations"
+        )
+        request_payload = {
+            "model": str(cfg.model or "").strip(),
+            "prompt": clean_prompt,
+            "size": requested_size,
+            "n": 1,
+        }
+        req = urllib.request.Request(
+            url=endpoint,
+            data=json.dumps(request_payload).encode("utf-8"),
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}",
+            },
+        )
+        try:
+            ssl_ctx = ssl.create_default_context()
+            with urllib.request.urlopen(
+                req,
+                timeout=max(5.0, float(cfg.timeout_sec)),
+                context=ssl_ctx,
+            ) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            compact = self._compact_web_text(detail, limit=260)
+            raise RuntimeError(f"image generation http error: {exc.code} {compact}") from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"image generation network error: {exc}") from exc
+
+        try:
+            data = json.loads(raw)
+        except Exception as exc:
+            raise RuntimeError("image generation response is not valid json") from exc
+
+        candidates = data.get("images")
+        if not isinstance(candidates, list) or not candidates:
+            candidates = data.get("data")
+        if not isinstance(candidates, list) or not candidates:
+            raise RuntimeError("image generation response missing images/data")
+        first = candidates[0] if isinstance(candidates[0], dict) else {}
+        if not isinstance(first, dict):
+            raise RuntimeError("image generation response item invalid")
+
+        image_url = str(first.get("url", "")).strip()
+        b64_json = str(first.get("b64_json", "")).strip()
+        image_bytes, suffix = self._download_generated_image_bytes(
+            image_url=image_url,
+            b64_json=b64_json,
+            cfg=cfg,
+        )
+        try:
+            seed = int(data.get("seed")) if data.get("seed") is not None else None
+        except Exception:
+            seed = None
+        return image_bytes, suffix, seed
+
+    def _generate_image_file_dashscope(
+        self,
+        *,
+        cfg,
+        api_key: str,
+        clean_prompt: str,
+        requested_size: str,
+    ) -> tuple[bytes, str, int | None]:
+        base_url = str(cfg.base_url or "").rstrip("/")
+        endpoint = (
+            base_url
+            if base_url.endswith("/multimodal-generation/generation")
+            else f"{base_url}/multimodal-generation/generation"
+        )
+        request_payload = {
+            "model": str(cfg.model or "").strip(),
+            "input": {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [{"text": clean_prompt}],
+                    }
+                ]
+            },
+            "parameters": {
+                "size": self._dashscope_image_size(requested_size),
+                "prompt_extend": False,
+            },
+        }
+        req = urllib.request.Request(
+            url=endpoint,
+            data=json.dumps(request_payload).encode("utf-8"),
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}",
+            },
+        )
+        try:
+            ssl_ctx = ssl.create_default_context()
+            with urllib.request.urlopen(
+                req,
+                timeout=max(5.0, float(cfg.timeout_sec)),
+                context=ssl_ctx,
+            ) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            compact = self._compact_web_text(detail, limit=260)
+            raise RuntimeError(f"dashscope image generation http error: {exc.code} {compact}") from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"dashscope image generation network error: {exc}") from exc
+
+        try:
+            data = json.loads(raw)
+        except Exception as exc:
+            raise RuntimeError("dashscope image generation response is not valid json") from exc
+
+        output = data.get("output") if isinstance(data.get("output"), dict) else {}
+        choices = output.get("choices") if isinstance(output.get("choices"), list) else []
+        first_choice = choices[0] if choices and isinstance(choices[0], dict) else {}
+        message = first_choice.get("message") if isinstance(first_choice.get("message"), dict) else {}
+        content = message.get("content") if isinstance(message.get("content"), list) else []
+        image_url = ""
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            candidate = str(item.get("image", "")).strip()
+            if candidate:
+                image_url = candidate
+                break
+        if not image_url:
+            raise RuntimeError("dashscope image generation response missing image url")
+
+        image_bytes, suffix = self._download_generated_image_bytes(
+            image_url=image_url,
+            b64_json="",
+            cfg=cfg,
+        )
+        try:
+            seed = int(output.get("seed")) if output.get("seed") is not None else None
+        except Exception:
+            seed = None
+        return image_bytes, suffix, seed
+
+    def _generate_image_file(self, *, prompt: str, size: str = "") -> Path:
+        clean_prompt = self._clean_image_prompt(prompt, limit=280)
+        if not clean_prompt:
+            raise RuntimeError("image prompt is empty")
+        if not self._has_image_generation_tool():
+            raise RuntimeError(self._image_generation_status_text())
+
+        cfg = self.cfg.image_generation
+        api_key = self._resolve_image_generation_api_key()
+        requested_size = self._normalize_image_size(size)
+        provider = str(getattr(cfg, "provider", "openai_compat") or "openai_compat").strip().lower()
+        if provider == "dashscope_z_image":
+            image_bytes, suffix, seed = self._generate_image_file_dashscope(
+                cfg=cfg,
+                api_key=api_key,
+                clean_prompt=clean_prompt,
+                requested_size=requested_size,
+            )
+        else:
+            image_bytes, suffix, seed = self._generate_image_file_openai_compat(
+                cfg=cfg,
+                api_key=api_key,
+                clean_prompt=clean_prompt,
+                requested_size=requested_size,
+            )
+
+        if not image_bytes:
+            raise RuntimeError("image generation returned empty image payload")
+
+        output_dir = Path(cfg.output_dir or "data/generated_images")
+        output_dir.mkdir(parents=True, exist_ok=True)
+        out = self._next_image_output_path(
+            output_dir,
+            prompt=clean_prompt,
+            suffix=suffix,
+        )
+        out.write_bytes(image_bytes)
+        self._append_generated_image_history(
+            output_dir=output_dir,
+            file_path=out,
+            prompt=clean_prompt,
+            size=requested_size,
+            model=str(cfg.model or "").strip(),
+            seed=seed,
+        )
+        return out
+
     def _web_search(self, query: str) -> tuple[str, str]:
         provider = self._active_web_search_provider()
+        if provider == "volc_ark":
+            return provider, self._volc_web_search(query)
         if provider == "agent_reach":
             return provider, self._agent_reach_search(query)
         if provider == "brave":
@@ -2660,6 +3303,117 @@ class WeChatGuiRpaBot:
         summary = self._compact_web_text("；".join(summary_parts), limit=240)
         return self._format_web_search_text(summary=summary, rows=rows, max_results=max_results)
 
+    def _volc_web_search(self, query: str) -> str:
+        clean_query = self._clean_web_query(query)
+        if not clean_query:
+            return ""
+
+        api_key = self._resolve_volc_ark_api_key()
+        if not api_key:
+            raise RuntimeError("volc_ark api key missing")
+        model = str(self.cfg.volc_ark_model or "").strip()
+        if not model:
+            raise RuntimeError("volc_ark model missing")
+
+        limit = max(1, min(20, int(self.cfg.volc_ark_limit)))
+        max_keyword = max(1, min(50, int(self.cfg.volc_ark_max_keyword)))
+        timeout_sec = max(1.0, float(self.cfg.volc_ark_timeout_sec))
+        base = (self.cfg.volc_ark_base_url or "https://ark.cn-beijing.volces.com/api/v3").rstrip("/")
+        url = base if base.endswith("/responses") else (base + "/responses")
+
+        payload = {
+            "model": model,
+            # Trusted single-search mode: do not allow multiple search rounds in one response.
+            "max_tool_calls": 1,
+            "tools": [
+                {
+                    "type": "web_search",
+                    "max_keyword": max_keyword,
+                    "limit": limit,
+                }
+            ],
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": clean_query,
+                        }
+                    ],
+                }
+            ],
+        }
+        req = urllib.request.Request(
+            url=url,
+            data=json.dumps(payload).encode("utf-8"),
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}",
+            },
+        )
+        try:
+            ssl_ctx = ssl.create_default_context()
+            with urllib.request.urlopen(
+                req,
+                timeout=timeout_sec,
+                context=ssl_ctx,
+            ) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"volc_ark http error: {exc.code} {detail}") from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"volc_ark network error: {exc}") from exc
+
+        data = json.loads(raw)
+        output = data.get("output") if isinstance(data.get("output"), list) else []
+        answer = ""
+        rows: list[tuple[str, str, str]] = []
+        seen_urls: set[str] = set()
+
+        for item in output:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("type", "")).strip() != "message":
+                continue
+            content = item.get("content")
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                if not answer:
+                    answer = self._compact_web_text(block.get("text", ""), limit=240)
+                annotations = block.get("annotations")
+                if not isinstance(annotations, list):
+                    continue
+                for ann in annotations:
+                    if not isinstance(ann, dict):
+                        continue
+                    url_item = self._compact_web_text(
+                        ann.get("url", ann.get("website_url", ann.get("source_url", ""))),
+                        limit=160,
+                    )
+                    if (not url_item) or (url_item in seen_urls):
+                        continue
+                    seen_urls.add(url_item)
+                    title = self._compact_web_text(
+                        ann.get("title", ann.get("source_title", "")),
+                        limit=90,
+                    )
+                    rows.append((title, url_item, ""))
+
+        if (not answer) and rows:
+            answer = self._compact_web_text(
+                "；".join(x[0] or x[1] for x in rows if (x[0] or x[1])),
+                limit=240,
+            )
+        if (not answer) and (not rows):
+            raise RuntimeError("volc_ark response missing message/annotations")
+        return self._format_web_search_text(summary=answer, rows=rows, max_results=limit)
+
     def _execute_agent_actions(
         self,
         row: ChatRowState,
@@ -2781,6 +3535,65 @@ class WeChatGuiRpaBot:
                             status = "ok (no-hit)"
                             obs = f"记忆检索[{query}]无命中"
                         ok = True
+                elif tool == "workspace_list_files":
+                    rel_path = re.sub(r"\s+", " ", str(args.get("path", "")).strip())[:200]
+                    recursive_raw = args.get("recursive", False)
+                    if isinstance(recursive_raw, str):
+                        recursive = recursive_raw.strip().lower() in {"1", "true", "yes", "on"}
+                    else:
+                        recursive = bool(recursive_raw)
+                    max_entries_raw = args.get("max_entries", 80)
+                    try:
+                        max_entries = int(max_entries_raw)
+                    except Exception:
+                        max_entries = 80
+                    max_entries = max(1, min(200, max_entries))
+                    listing = self._workspace_list_files(
+                        rel_path=rel_path,
+                        recursive=recursive,
+                        max_entries=max_entries,
+                    )
+                    status = "ok"
+                    obs = (
+                        f"工作区目录[{rel_path or '.'}] "
+                        f"(recursive={recursive}, max={max_entries}):\n{listing}"
+                    )[:1800]
+                    ok = True
+                elif tool == "workspace_read_file":
+                    rel_path = re.sub(
+                        r"\s+",
+                        " ",
+                        str(args.get("path", "") or args.get("file", "")).strip(),
+                    )[:200]
+                    if not rel_path:
+                        status = "skip (empty path)"
+                    else:
+                        text = self._workspace_read_file(rel_path=rel_path, max_chars=4000)
+                        status = "ok"
+                        obs = f"工作区文件读取[{rel_path}]:\n{text}"[:1800]
+                        ok = True
+                elif tool == "workspace_write_file":
+                    rel_path = re.sub(
+                        r"\s+",
+                        " ",
+                        str(args.get("path", "") or args.get("file", "")).strip(),
+                    )[:200]
+                    content = str(args.get("content", "") or args.get("text", "")).strip()[:4000]
+                    mode_raw = str(args.get("mode", "overwrite")).strip().lower()
+                    mode = "append" if mode_raw in {"append", "a", "追加"} else "overwrite"
+                    if not rel_path:
+                        status = "skip (empty path)"
+                    elif not content:
+                        status = "skip (empty content)"
+                    else:
+                        detail = self._workspace_write_file(
+                            rel_path=rel_path,
+                            content=content,
+                            mode=mode,
+                        )
+                        status = "ok"
+                        obs = f"工作区写入成功: {detail}"
+                        ok = True
                 elif tool == "web_search":
                     query = re.sub(r"\s+", " ", str(args.get("query", "")).strip())[:80]
                     provider = self._active_web_search_provider()
@@ -2807,6 +3620,75 @@ class WeChatGuiRpaBot:
                             status = "ok (no-hit)"
                             obs = f"网页检索[{query}]({active_provider})无命中"
                         ok = True
+                elif tool == "web_search_volc":
+                    query = re.sub(r"\s+", " ", str(args.get("query", "")).strip())[:80]
+                    if not query:
+                        status = "skip (empty query)"
+                    elif not bool(self.cfg.volc_ark_enabled):
+                        status = "skip (volc_ark disabled)"
+                    elif not str(self.cfg.volc_ark_model or "").strip():
+                        status = "skip (missing volc_ark_model)"
+                    elif not self._resolve_volc_ark_api_key():
+                        status = "skip (missing volc_ark api key)"
+                    else:
+                        search_text = self._volc_web_search(query)
+                        if search_text:
+                            status = "ok"
+                            obs = f"网页检索[{query}](volc_ark): {search_text}"
+                            summary_line = ""
+                            for line in str(search_text).splitlines():
+                                clean_line = self._compact_web_text(line, limit=120)
+                                if not clean_line:
+                                    continue
+                                if clean_line.startswith("摘要:"):
+                                    summary_line = self._compact_web_text(
+                                        clean_line.replace("摘要:", "", 1),
+                                        limit=90,
+                                    )
+                                    break
+                                if not summary_line:
+                                    summary_line = clean_line
+                            fact = self._compact_web_text(
+                                f"{query}：{summary_line}",
+                                limit=120,
+                            )
+                            if fact:
+                                self._workspace.remember_structured(
+                                    session_key=key,
+                                    title=row.title,
+                                    facts=[fact],
+                                )
+                        else:
+                            status = "ok (no-hit)"
+                            obs = f"网页检索[{query}](volc_ark)无命中"
+                        ok = True
+                elif tool == "generate_image":
+                    prompt = self._clean_image_prompt(args.get("prompt", ""), limit=280)
+                    if not prompt:
+                        status = "skip (empty prompt)"
+                    elif not self._has_image_generation_tool():
+                        status = f"skip ({self._image_generation_status_text()})"
+                    else:
+                        requested_size = self._normalize_image_size(args.get("size", ""))
+                        image_path = self._generate_image_file(
+                            prompt=prompt,
+                            size=requested_size,
+                        )
+                        sent_ok = self._send_generated_file(row, image_path)
+                        compact_prompt = self._compact_web_text(prompt, limit=52)
+                        if sent_ok:
+                            status = "ok"
+                            obs = (
+                                f"已生成并发送图片文件[{requested_size}]: "
+                                f"{image_path.name} (prompt={compact_prompt})"
+                            )
+                        else:
+                            status = "ok (generated, send-failed)"
+                            obs = (
+                                f"图片已生成但发送失败: {image_path.name} "
+                                f"(prompt={compact_prompt})"
+                            )
+                        ok = True
                 elif tool == "mute_session":
                     if not is_admin:
                         status = "deny (admin only)"
@@ -2832,12 +3714,24 @@ class WeChatGuiRpaBot:
             except Exception as exc:
                 err = self._compact_web_text(exc, limit=240)
                 status = f"error ({err})"
-                if tool == "web_search":
+                if tool in ("web_search", "web_search_volc"):
                     query = re.sub(r"\s+", " ", str(args.get("query", "")).strip())[:80]
                     obs = f"网页检索[{query}]失败: {err}"
                 elif tool == "search_memory":
                     query = re.sub(r"\s+", " ", str(args.get("query", "")).strip())[:80]
                     obs = f"记忆检索[{query}]失败: {err}"
+                elif tool == "workspace_list_files":
+                    rel_path = re.sub(r"\s+", " ", str(args.get("path", "")).strip())[:120]
+                    obs = f"工作区目录[{rel_path or '.'}]失败: {err}"
+                elif tool == "workspace_read_file":
+                    rel_path = re.sub(r"\s+", " ", str(args.get("path", "")).strip())[:120]
+                    obs = f"工作区读取[{rel_path}]失败: {err}"
+                elif tool == "workspace_write_file":
+                    rel_path = re.sub(r"\s+", " ", str(args.get("path", "")).strip())[:120]
+                    obs = f"工作区写入[{rel_path}]失败: {err}"
+                elif tool == "generate_image":
+                    prompt = self._clean_image_prompt(args.get("prompt", ""), limit=60)
+                    obs = f"图片生成[{prompt}]失败: {err}"
             action_elapsed = time.monotonic() - action_started
             if self.cfg.log_verbose:
                 print(
@@ -3144,6 +4038,8 @@ class WeChatGuiRpaBot:
         ]
         if self.cfg.admin_commands_enabled:
             tools.append("remember_long_term")
+        if self._has_volc_web_search_tool():
+            tools.append("web_search_volc")
         if self._has_web_search_tool():
             tools.append("web_search")
         return tools
@@ -3220,7 +4116,7 @@ class WeChatGuiRpaBot:
 
         lookup_seed = tasks_text.split("\n", 1)[0][:80]
         lookup_intent = self._is_web_lookup_intent(tasks_text)
-        memory_recall, _, action_count = self._run_agent_planner_loop(
+        memory_recall, _, action_count, _ = self._run_agent_planner_loop(
             planner=self.llm_heartbeat,
             row=row,
             reason="heartbeat",
@@ -4303,15 +5199,31 @@ class WeChatGuiRpaBot:
             remaining -= step
             time.sleep(0.015)
 
+    def _send_delay_sec(self) -> float:
+        return max(0.0, float(self.cfg.send_after_paste_delay_sec))
+
+    @staticmethod
+    def _apple_quote(raw: str) -> str:
+        return str(raw or "").replace("\\", "\\\\").replace('"', '\\"')
+
     def _paste_and_send(self, message: str) -> None:
         pyperclip.copy(message)
         time.sleep(0.05)
+        delay_sec = self._send_delay_sec()
 
         # Prefer AppleScript paste on macOS to reduce occasional literal "v" input.
         paste_script = 'tell application "System Events" to keystroke "v" using command down'
         enter_script = 'tell application "System Events" to key code 36'
         proc = subprocess.run(
-            ["osascript", "-e", paste_script, "-e", enter_script],
+            [
+                "osascript",
+                "-e",
+                paste_script,
+                "-e",
+                f"delay {delay_sec:.3f}",
+                "-e",
+                enter_script,
+            ],
             capture_output=True,
             text=True,
         )
@@ -4322,8 +5234,106 @@ class WeChatGuiRpaBot:
         pyautogui.keyDown("command")
         pyautogui.press("v")
         pyautogui.keyUp("command")
-        time.sleep(0.06)
+        time.sleep(delay_sec)
         pyautogui.press("enter")
+
+    def _paste_file_and_send(self, file_path: Path) -> bool:
+        target = Path(file_path).expanduser().resolve()
+        if not target.exists():
+            print(f"[warn] file-send skipped, file not found: {target}")
+            return False
+
+        delay_sec = self._send_delay_sec()
+        set_clip_script = f'set the clipboard to (POSIX file "{self._apple_quote(str(target))}")'
+        paste_script = 'tell application "System Events" to keystroke "v" using command down'
+        enter_script = 'tell application "System Events" to key code 36'
+        proc = subprocess.run(
+            [
+                "osascript",
+                "-e",
+                set_clip_script,
+                "-e",
+                paste_script,
+                "-e",
+                f"delay {delay_sec:.3f}",
+                "-e",
+                enter_script,
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if proc.returncode == 0:
+            return True
+
+        print(f"[warn] osascript file paste failed, fallback to pyautogui: {proc.stderr.strip()}")
+        clip_proc = subprocess.run(
+            ["osascript", "-e", set_clip_script],
+            capture_output=True,
+            text=True,
+        )
+        if clip_proc.returncode != 0:
+            print(f"[warn] osascript set file clipboard failed: {clip_proc.stderr.strip()}")
+            return False
+        pyautogui.keyDown("command")
+        pyautogui.press("v")
+        pyautogui.keyUp("command")
+        time.sleep(delay_sec)
+        pyautogui.press("enter")
+        return True
+
+    def _send_generated_file(
+        self,
+        row: ChatRowState,
+        file_path: Path,
+        *,
+        focused_bounds=None,
+    ) -> bool:
+        if self.cfg.dry_run:
+            print(f"[dry-run] file={str(file_path)}")
+            return True
+
+        if focused_bounds is not None:
+            bounds = focused_bounds
+        else:
+            focus_result = self._focus_chat(
+                row,
+                ensure_unread_clear=False,
+            )
+            if (not focus_result.matched) or (focus_result.resolved_row is None):
+                seen_w = max(24, self._term_width() - 17)
+                print(
+                    f"[skip-focus] row={row.row_idx:>2} | "
+                    f"expect={self._fit_col(row.title, 14)}"
+                )
+                if focus_result.seen_header:
+                    print(f"            seen={self._fit_col(focus_result.seen_header, seen_w)}")
+                return False
+            bounds = focus_result.bounds
+
+        if self.cfg.focus_verify_enabled:
+            seen = self._extract_chat_header_text(
+                bounds, is_group=self._is_group_chat(row)
+            )
+            if not self._is_chat_header_matched(row.title, seen):
+                seen_w = max(24, self._term_width() - 17)
+                print(
+                    f"[skip-focus] row={row.row_idx:>2} | "
+                    f"expect={self._fit_col(row.title, 14)}"
+                )
+                print(f"            seen={self._fit_col(seen, seen_w)}")
+                return False
+
+        input_x = bounds.x + int(bounds.width * self.cfg.input_point.x)
+        input_y = bounds.y + int(bounds.height * self.cfg.input_point.y)
+        self._safe_click(input_x, input_y)
+        time.sleep(0.08)
+
+        ok = self._paste_file_and_send(file_path)
+        if not ok:
+            return False
+        file_w = max(24, self._term_width() - 13)
+        print(f"[sent] file={self._fit_col(str(file_path), file_w)}")
+        return True
 
     def _reply(
         self,
@@ -4934,6 +5944,7 @@ class WeChatGuiRpaBot:
             f"[start] cadence: poll={self.cfg.poll_interval_sec:.1f}s "
             f"cooldown={self.cfg.action_cooldown_sec:.1f}s "
             f"normal_reply={self.cfg.normal_reply_interval_sec:.1f}s "
+            f"send_delay={self.cfg.send_after_paste_delay_sec:.2f}s "
             f"(immediate=private/@)"
         )
         print(
@@ -4958,6 +5969,7 @@ class WeChatGuiRpaBot:
         print(
             f"[start] agent-actions: enabled={self.cfg.agent_actions_enabled} "
             f"max={self.cfg.agent_actions_max_per_turn} "
+            f"reply_max={self.cfg.agent_reply_max_messages_per_turn} "
             f"fail_open={self.cfg.agent_actions_fail_open} "
             f"loop={self.cfg.agent_plan_loop_enabled} "
             f"rounds={self.cfg.agent_plan_max_rounds} "
@@ -4970,6 +5982,7 @@ class WeChatGuiRpaBot:
             f"max_actions={self.cfg.heartbeat_max_actions}"
         )
         print(f"[start] web-search: {self._web_search_status_text()}")
+        print(f"[start] image-gen: {self._image_generation_status_text()}")
         print(f"[start] memory-sqlite: {self._workspace.sqlite_status_text()}")
         print(f"[start] rerank: {self._workspace.rerank_status_text()}")
         print(f"        admin={self._fit_col(admin_titles, admin_w)}")
@@ -5247,7 +6260,6 @@ class WeChatGuiRpaBot:
                     time.sleep(self.cfg.poll_interval_sec)
                     continue
 
-                planned_reply = ""
                 lookup_query = re.sub(
                     r"\s+",
                     " ",
@@ -5259,52 +6271,138 @@ class WeChatGuiRpaBot:
                     if topic_query:
                         lookup_query = topic_query[:80]
                         lookup_intent = True
-                if self.cfg.agent_actions_enabled:
-                    tools = self._available_agent_tools(is_admin=is_admin)
-                    if tools:
-                        memory_recall, planned_reply, _ = self._run_agent_planner_loop(
-                            planner=self.llm_planner,
-                            row=row,
-                            reason=reason,
-                            is_group=is_group,
-                            is_admin=is_admin,
-                            latest_message=latest_user_message,
-                            chat_context=chat_context,
-                            environment_context=environment_context,
-                            session_context=session_context,
-                            workspace_context=workspace_context,
-                            memory_recall=memory_recall,
-                            tools=tools,
-                            per_round_max_actions=self.cfg.agent_actions_max_per_turn,
-                            lookup_intent=lookup_intent,
-                            lookup_query=lookup_query,
-                            enforce_lookup_round1=True,
-                        )
-                message = self._reply(
-                    row,
-                    reason,
-                    focused_bounds=focused_bounds,
-                    chat_context=chat_context,
-                    environment_context=environment_context,
-                    session_context=session_context,
-                    workspace_context=workspace_context,
-                    memory_recall=memory_recall,
-                    latest_message=latest_user_message,
-                    force_message=planned_reply,
-                )
-                mem = self._baseline.get(row.row_idx)
-                if mem is not None:
-                    mem.last_replied_at = now
+                if self.cfg.log_verbose:
+                    print(
+                        f"[agent] lookup-intent={lookup_intent} "
+                        f"query={self._fit_col(lookup_query, max(24, self._term_width() - 28))}"
+                    )
+                reply_budget = max(1, int(self.cfg.agent_reply_max_messages_per_turn))
+                sent_in_event = 0
+                skip_event_reply = False
+                sent_norm_in_event: set[str] = set()
+                follow_reason = reason
+                follow_lookup_intent = lookup_intent
+                follow_lookup_query = lookup_query
+
+                while sent_in_event < reply_budget:
+                    planner_hint = ""
+                    planner_send_reply = True
+                    if self.cfg.agent_actions_enabled:
+                        tools = self._available_agent_tools(is_admin=is_admin)
+                        if tools:
+                            memory_recall, planner_hint, _, planner_send_reply = self._run_agent_planner_loop(
+                                planner=self.llm_planner,
+                                row=row,
+                                reason=follow_reason,
+                                is_group=is_group,
+                                is_admin=is_admin,
+                                latest_message=latest_user_message,
+                                chat_context=chat_context,
+                                environment_context=environment_context,
+                                session_context=session_context,
+                                workspace_context=workspace_context,
+                                memory_recall=memory_recall,
+                                tools=tools,
+                                per_round_max_actions=self.cfg.agent_actions_max_per_turn,
+                                lookup_intent=follow_lookup_intent,
+                                lookup_query=follow_lookup_query,
+                                enforce_lookup_round1=(sent_in_event == 0),
+                            )
+                        if planner_hint and self.cfg.log_verbose:
+                            print(
+                                f"[agent] planner hint ignored (reply by llm) row={row.row_idx:>2} "
+                                f"hint={self._fit_col(planner_hint, max(24, self._term_width() - 45))}"
+                            )
+                        if not planner_send_reply:
+                            if sent_in_event == 0:
+                                if self.cfg.log_verbose:
+                                    print(
+                                        f"[agent] planner requested hold-send row={row.row_idx:>2} "
+                                        f"title={self._fit_col(row.title, 14)}"
+                                    )
+                                mem = self._baseline.get(row.row_idx)
+                                if mem is not None:
+                                    mem.last_replied_at = now
+                                    mem.pending_unread = False
+                                    mem.pending_normal = False
+                                    mem.pending_mention = False
+                                self._save_persistent_memory()
+                                time.sleep(self.cfg.poll_interval_sec)
+                                skip_event_reply = True
+                            elif self.cfg.log_verbose:
+                                print(
+                                    f"[agent] planner stop after sent={sent_in_event} "
+                                    f"row={row.row_idx:>2}"
+                                )
+                            break
+                        if sent_in_event > 0:
+                            if self.cfg.log_verbose:
+                                print(
+                                    f"[agent] stop follow-up (planner direct reply disabled) row={row.row_idx:>2} "
+                                    f"sent={sent_in_event}"
+                                )
+                            break
+
+                    message = self._reply(
+                        row,
+                        reason,
+                        focused_bounds=focused_bounds,
+                        chat_context=chat_context,
+                        environment_context=environment_context,
+                        session_context=session_context,
+                        workspace_context=workspace_context,
+                        memory_recall=memory_recall,
+                        latest_message=latest_user_message,
+                        force_message="",
+                    )
+                    if not (message or "").strip():
+                        if self.cfg.log_verbose:
+                            print(
+                                f"[agent] stop empty reply row={row.row_idx:>2} "
+                                f"sent={sent_in_event}"
+                            )
+                        break
+                    mem = self._baseline.get(row.row_idx)
                     sent_norm = self._normalize_preview(message)
-                    mem.last_sent_norm = sent_norm
-                    mem.pending_unread = False
-                    mem.pending_normal = False
-                    mem.pending_mention = False
-                    self._remember_sent_for_row(row, sent_norm, now)
-                    if message and self._is_normal_reply_event(row, reason):
-                        self._last_normal_reply_at = now
-                self._append_session_item(row, "A", message)
-                self._save_persistent_memory()
+                    if mem is not None:
+                        mem.last_replied_at = now
+                        mem.last_sent_norm = sent_norm
+                        mem.pending_unread = False
+                        mem.pending_normal = False
+                        mem.pending_mention = False
+                        self._remember_sent_for_row(row, sent_norm, now)
+                        if message and self._is_normal_reply_event(row, reason):
+                            self._last_normal_reply_at = now
+                    self._append_session_item(row, "A", message)
+                    self._save_persistent_memory()
+                    if sent_norm:
+                        sent_norm_in_event.add(sent_norm)
+                    sent_in_event += 1
+                    if not self.cfg.agent_actions_enabled:
+                        break
+                    if sent_in_event >= reply_budget:
+                        if self.cfg.log_verbose:
+                            print(
+                                f"[agent] reply budget reached row={row.row_idx:>2} "
+                                f"budget={reply_budget}"
+                            )
+                        break
+
+                    # Give planner a fresh view after each sent message and let it decide
+                    # whether to continue with another message.
+                    chat_context = self._build_session_history_text(row)
+                    session_context = self._build_session_context(row)
+                    follow_reason = "planner_follow_up"
+                    follow_lookup_intent = False
+                    follow_lookup_query = ""
+                    if self.cfg.log_verbose:
+                        print(
+                            f"[agent] multi-send continue row={row.row_idx:>2} "
+                            f"next={sent_in_event + 1}/{reply_budget}"
+                        )
+
+                if skip_event_reply:
+                    continue
             else:
                 self._idle_streak += 1
                 if self.cfg.log_verbose:

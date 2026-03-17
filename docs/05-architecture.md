@@ -100,6 +100,7 @@
 - `set_session_summary`
 - `search_memory`
 - `web_search`
+- `web_search_volc`
 - 管理员额外：`remember_long_term`、`mute_session`、`unmute_session`
 
 Heartbeat 额外支持：

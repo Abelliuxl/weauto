@@ -89,28 +89,52 @@ tools = [
     "search_memory",
 ]
 provider = str(getattr(cfg, "web_search_provider", "tavily") or "").strip().lower()
-if provider not in {"tavily", "brave"}:
+if provider in {"agent-reach", "agentreach", "reach", "exa"}:
+    provider = "agent_reach"
+elif provider in {"volc-ark", "ark", "volc", "volces"}:
+    provider = "volc_ark"
+elif provider not in {"tavily", "brave", "agent_reach", "volc_ark"}:
     provider = "tavily"
-if provider == "brave":
-    web_enabled = bool(getattr(cfg, "brave_enabled", False))
-    web_api_ok = bool(
-        getattr(cfg, "brave_api_key", "")
-        or (
-            getattr(cfg, "brave_api_key_env", "")
-            and os.getenv(getattr(cfg, "brave_api_key_env"))
-        )
+
+volc_enabled = bool(getattr(cfg, "volc_ark_enabled", False))
+volc_api_ok = bool(
+    getattr(cfg, "volc_ark_api_key", "")
+    or (
+        getattr(cfg, "volc_ark_api_key_env", "")
+        and os.getenv(getattr(cfg, "volc_ark_api_key_env"))
     )
+)
+volc_model_ok = bool(str(getattr(cfg, "volc_ark_model", "") or "").strip())
+
+if provider == "volc_ark":
+    if volc_enabled and volc_api_ok and volc_model_ok:
+        tools.append("web_search_volc")
 else:
-    web_enabled = bool(getattr(cfg, "tavily_enabled", False))
-    web_api_ok = bool(
-        getattr(cfg, "tavily_api_key", "")
-        or (
-            getattr(cfg, "tavily_api_key_env", "")
-            and os.getenv(getattr(cfg, "tavily_api_key_env"))
+    if provider == "brave":
+        web_enabled = bool(getattr(cfg, "brave_enabled", False))
+        web_api_ok = bool(
+            getattr(cfg, "brave_api_key", "")
+            or (
+                getattr(cfg, "brave_api_key_env", "")
+                and os.getenv(getattr(cfg, "brave_api_key_env"))
+            )
         )
-    )
-if web_enabled and web_api_ok:
-    tools.append("web_search")
+    elif provider == "agent_reach":
+        web_enabled = bool(getattr(cfg, "agent_reach_enabled", False))
+        cmd = str(getattr(cfg, "agent_reach_mcporter_cmd", "") or "").strip()
+        web_api_ok = bool(cmd)
+    else:
+        web_enabled = bool(getattr(cfg, "tavily_enabled", False))
+        web_api_ok = bool(
+            getattr(cfg, "tavily_api_key", "")
+            or (
+                getattr(cfg, "tavily_api_key_env", "")
+                and os.getenv(getattr(cfg, "tavily_api_key_env"))
+            )
+        )
+    if web_enabled and web_api_ok:
+        tools.append("web_search")
+
 tools.extend(["remember_long_term", "mute_session", "unmute_session"])
 
 chat_context = "U: 你能联网查一下吗 | U: 最好带上来源"

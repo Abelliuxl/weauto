@@ -121,6 +121,12 @@ class LlmReplyGenerator:
             return self.vision_cfg.api_key
         return os.getenv(self.vision_cfg.api_key_env, "")
 
+    def _api_format(self) -> str:
+        value = str(getattr(self.cfg, "api_format", "openai") or "openai").strip().lower()
+        if value == "anthropic":
+            return "anthropic"
+        return "openai"
+
     def _is_debug_payload_enabled(self, label: str) -> bool:
         if label == "vision":
             return bool(self.vision_cfg and self.vision_cfg.debug_log_payload)
@@ -316,8 +322,10 @@ class LlmReplyGenerator:
             return
         if label == "vision":
             base = (self.vision_cfg.base_url if self.vision_cfg else "") or ""
+            api_format = "openai"
         else:
             base = self.cfg.base_url or ""
+            api_format = self._api_format()
         provider = "openrouter" if "openrouter.ai" in base.lower() else "other"
         think_value = self._ollama_think_value(think_raw)
         normalized_mode = (compat_think_mode or "default").strip().lower()
@@ -327,11 +335,119 @@ class LlmReplyGenerator:
             (not native) and normalized_mode in ("on", "off")
         )
         print(
-            f"[debug-{label}] transport={'ollama_native' if native else 'openai_compat'} "
+            f"[debug-{label}] transport={'ollama_native' if native else f'{api_format}_compat'} "
             f"think_raw={think_raw!r} compat_think_mode={normalized_mode!r} "
             f"think_effective={think_effective} "
             f"reasoning_controls_applied={controlled} provider={provider}"
         )
+
+    @staticmethod
+    def _anthropic_messages_url(base_url: str) -> str:
+        root = str(base_url or "").strip().rstrip("/")
+        if root.endswith("/messages"):
+            return root
+        return f"{root}/messages"
+
+    @staticmethod
+    def _anthropic_text_block(text: str) -> dict[str, str]:
+        return {"type": "text", "text": str(text or "")}
+
+    def _openai_content_to_anthropic(self, content: object) -> list[dict]:
+        blocks: list[dict] = []
+        if isinstance(content, str):
+            clean = content.strip()
+            if clean:
+                blocks.append(self._anthropic_text_block(clean))
+            return blocks
+        if not isinstance(content, list):
+            return blocks
+        for part in content:
+            if isinstance(part, str):
+                clean = part.strip()
+                if clean:
+                    blocks.append(self._anthropic_text_block(clean))
+                continue
+            if not isinstance(part, dict):
+                continue
+            part_type = str(part.get("type", "")).strip().lower()
+            text = str(part.get("text", "") or "").strip()
+            if text and part_type in ("", "text", "output_text", "input_text"):
+                blocks.append(self._anthropic_text_block(text))
+        return blocks
+
+    def _anthropic_payload_from_chat(self, payload: dict) -> dict:
+        messages = payload.get("messages") or []
+        system_parts: list[str] = []
+        anthropic_messages: list[dict] = []
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            raw_role = str(message.get("role", "")).strip().lower()
+            role = "system" if raw_role == "system" else self._norm_role(raw_role)
+            blocks = self._openai_content_to_anthropic(message.get("content"))
+            if not blocks:
+                continue
+            text_for_system = "\n".join(
+                str(item.get("text", "")).strip() for item in blocks if str(item.get("text", "")).strip()
+            ).strip()
+            if role == "system":
+                if text_for_system:
+                    system_parts.append(text_for_system)
+                continue
+            if role not in ("user", "assistant"):
+                role = "user"
+            anthropic_messages.append({"role": role, "content": blocks})
+
+        max_tokens = self._effective_text_max_tokens(payload.get("max_tokens"))
+        if max_tokens is None:
+            max_tokens = self._effective_text_max_tokens(self.cfg.max_tokens)
+        if max_tokens is None:
+            max_tokens = 4096
+
+        out: dict[str, object] = {
+            "model": str(payload.get("model", self.cfg.model) or self.cfg.model),
+            "messages": anthropic_messages,
+            "max_tokens": max_tokens,
+        }
+        if system_parts:
+            out["system"] = "\n\n".join(system_parts)
+        temperature = payload.get("temperature")
+        try:
+            if temperature is not None:
+                out["temperature"] = max(0.0, float(temperature))
+        except Exception:
+            pass
+        return out
+
+    @staticmethod
+    def _anthropic_retry_payload_with_more_tokens(payload: dict) -> dict:
+        patched = dict(payload)
+        current = LlmReplyGenerator._effective_text_max_tokens(patched.get("max_tokens"))
+        if current is None:
+            current = 0
+        bumped = max(512, current * 4 if current > 0 else 512)
+        patched["max_tokens"] = min(4096, bumped)
+        return patched
+
+    @staticmethod
+    def _anthropic_response_has_text(data: dict) -> bool:
+        content = data.get("content")
+        if not isinstance(content, list):
+            return False
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            text = str(part.get("text", "") or part.get("content", "") or "").strip()
+            if text and str(part.get("type", "")).strip().lower() in ("", "text", "output_text"):
+                return True
+        return False
+
+    @staticmethod
+    def _anthropic_needs_more_tokens(data: dict) -> bool:
+        stop_reason = str(data.get("stop_reason", "") or "").strip().lower()
+        if stop_reason not in ("max_tokens", "length"):
+            return False
+        return not LlmReplyGenerator._anthropic_response_has_text(data)
 
     def _extract_json_payload(self, raw: str):
         original = (raw or "").strip()
@@ -357,10 +473,19 @@ class LlmReplyGenerator:
             candidates.append(text[text.find("[") : text.rfind("]") + 1].strip())
 
         # Try parse with a few lightweight repair passes.
+        decoder = json.JSONDecoder()
         for cand in candidates:
             for attempt in self._json_repair_attempts(cand):
+                clean_attempt = attempt.lstrip("\ufeff \n\r\t")
                 try:
-                    data = json.loads(attempt)
+                    data = json.loads(clean_attempt)
+                    if isinstance(data, (dict, list)):
+                        return data
+                except Exception:
+                    pass
+                # Be tolerant to providers adding trailing text after a valid JSON object/array.
+                try:
+                    data, _ = decoder.raw_decode(clean_attempt)
                     if isinstance(data, (dict, list)):
                         return data
                 except Exception:
@@ -496,15 +621,25 @@ class LlmReplyGenerator:
         t3 = (
             t2.replace("，", ",")
             .replace("：", ":")
-            .replace("“", '"')
-            .replace("”", '"')
         )
         attempts.append(t3)
 
-        # 4) Fix stray quote before comma between object close and next key.
-        # Example: {"args":{"query":"x"}","reason":"..."} -> {"args":{"query":"x"},"reason":"..."}
-        t4 = re.sub(r'}\s*"\s*,\s*"', '},"', t3)
+        # 4) Normalize curly quotes only in key positions (avoid corrupting literal content).
+        t4 = re.sub(r'([{\[,]\s*)[“”]([^“”]+)[“”]\s*:', r'\1"\2":', t3)
         attempts.append(t4)
+
+        # 5) Unwrap quoted JSON blobs, e.g. '{"a":1}' or "{\"a\":1}".
+        t5 = t4
+        if len(t5) >= 2 and t5[0] == t5[-1] and t5[0] in ("'", '"'):
+            inner = t5[1:-1].strip()
+            if inner.startswith("{") or inner.startswith("["):
+                t5 = inner
+                attempts.append(t5)
+
+        # 6) Fix stray quote before comma between object close and next key.
+        # Example: {"args":{"query":"x"}","reason":"..."} -> {"args":{"query":"x"},"reason":"..."}
+        t6 = re.sub(r'}\s*"\s*,\s*"', '},"', t5)
+        attempts.append(t6)
 
         # De-duplicate while preserving order.
         out: list[str] = []
@@ -708,6 +843,8 @@ class LlmReplyGenerator:
         label: str,
         extra_headers: dict[str, str] | None = None,
         request_model: str = "",
+        auth_mode: str = "bearer",
+        keep_token_limits: bool = False,
     ) -> dict:
         model_name = str(request_model or payload.get("model", "")).strip()
         last_error: RuntimeError | None = None
@@ -720,6 +857,8 @@ class LlmReplyGenerator:
                 label=label,
                 extra_headers=extra_headers,
                 model=model_name,
+                auth_mode=auth_mode,
+                keep_token_limits=keep_token_limits,
             )
             clean = str(resp_text or "").strip()
             if not clean:
@@ -760,8 +899,10 @@ class LlmReplyGenerator:
         label: str,
         extra_headers: dict[str, str] | None = None,
         model: str = "",
+        auth_mode: str = "bearer",
+        keep_token_limits: bool = False,
     ) -> str:
-        request_payload = self._drop_token_limits(payload)
+        request_payload = dict(payload) if keep_token_limits else self._drop_token_limits(payload)
         if self._is_debug_payload_enabled(label):
             safe_payload = self._sanitize_payload_for_log(request_payload)
             preview = self._preview_text(
@@ -777,8 +918,10 @@ class LlmReplyGenerator:
         headers = {
             "Content-Type": "application/json",
         }
-        if api_key:
+        if api_key and auth_mode == "bearer":
             headers["Authorization"] = f"Bearer {api_key}"
+        elif api_key and auth_mode == "x-api-key":
+            headers["x-api-key"] = api_key
         if extra_headers:
             headers.update(extra_headers)
         req = urllib.request.Request(
@@ -872,6 +1015,31 @@ class LlmReplyGenerator:
         return resp_text
 
     def _extract_content_from_completion(self, data: dict) -> str:
+        direct_content = data.get("content")
+        if isinstance(direct_content, str):
+            clean = self._strip_provider_think_content(direct_content)
+            if clean:
+                return clean.strip()
+        content_blocks = data.get("content")
+        if isinstance(content_blocks, list):
+            chunks: list[str] = []
+            for part in content_blocks:
+                if isinstance(part, str) and part.strip():
+                    chunks.append(part.strip())
+                    continue
+                if not isinstance(part, dict):
+                    continue
+                part_type = str(part.get("type", "")).strip().lower()
+                text = str(part.get("text", "") or part.get("content", "") or "").strip()
+                if part_type not in ("", "text", "output_text", "input_text", "thinking") and (not text):
+                    continue
+                if text:
+                    chunks.append(text)
+            if chunks:
+                merged = self._strip_provider_think_content("\n".join(chunks))
+                if merged:
+                    return merged.strip()
+
         choices = data.get("choices") or []
         if not choices:
             return ""
@@ -883,6 +1051,12 @@ class LlmReplyGenerator:
             clean = self._strip_provider_think_content(content)
             if clean:
                 return clean.strip()
+        if isinstance(content, dict):
+            text = str(content.get("text", "") or content.get("content", "") or "").strip()
+            if text:
+                clean = self._strip_provider_think_content(text)
+                if clean:
+                    return clean.strip()
         if isinstance(content, list):
             chunks: list[str] = []
             for part in content:
@@ -892,10 +1066,9 @@ class LlmReplyGenerator:
                     continue
                 if not isinstance(part, dict):
                     continue
-                if "text" in part and str(part.get("text", "")).strip():
-                    chunks.append(str(part.get("text", "")).strip())
-                elif part.get("type") == "output_text" and str(part.get("text", "")).strip():
-                    chunks.append(str(part.get("text", "")).strip())
+                text = str(part.get("text", "") or part.get("content", "") or "").strip()
+                if text:
+                    chunks.append(text)
             if chunks:
                 merged = self._strip_provider_think_content("\n".join(chunks))
                 if merged:
@@ -947,6 +1120,47 @@ class LlmReplyGenerator:
                 label="llm",
             )
             content = self._extract_content_from_ollama_chat(data)
+            if content:
+                return content
+            raise RuntimeError("llm returned empty content")
+
+        if self._api_format() == "anthropic":
+            url = self._anthropic_messages_url(self.cfg.base_url)
+            anthropic_payload = self._anthropic_payload_from_chat(payload)
+            self._log_transport_debug(
+                label="llm",
+                native=False,
+                think_raw=self.cfg.ollama_think,
+                compat_think_mode=self.cfg.openai_compat_think_mode,
+                controlled=False,
+            )
+            data = self._request_completion(
+                url=url,
+                api_key=api_key,
+                timeout_sec=self.cfg.timeout_sec,
+                payload=anthropic_payload,
+                label="llm",
+                extra_headers={"anthropic-version": "2023-06-01"},
+                auth_mode="x-api-key",
+                keep_token_limits=True,
+            )
+            if self._anthropic_needs_more_tokens(data):
+                retry_payload = self._anthropic_retry_payload_with_more_tokens(anthropic_payload)
+                print(
+                    "[warn] anthropic response exhausted max_tokens before final text, "
+                    f"retrying with max_tokens={retry_payload['max_tokens']}"
+                )
+                data = self._request_completion(
+                    url=url,
+                    api_key=api_key,
+                    timeout_sec=self.cfg.timeout_sec,
+                    payload=retry_payload,
+                    label="llm",
+                    extra_headers={"anthropic-version": "2023-06-01"},
+                    auth_mode="x-api-key",
+                    keep_token_limits=True,
+                )
+            content = self._extract_content_from_completion(data)
             if content:
                 return content
             raise RuntimeError("llm returned empty content")
@@ -1981,21 +2195,48 @@ class LlmReplyGenerator:
         memory_recall: str = "",
         available_tools: list[str] | None = None,
         max_actions: int = 2,
+        planner_round_idx: int = 1,
+        planner_round_total: int = 1,
+        planner_total_actions_limit: int = 2,
+        planner_total_actions_used: int = 0,
+        planner_total_actions_remaining: int = 2,
     ) -> dict:
         if not self.is_enabled():
-            return {"actions": [], "reply_hint": ""}
+            return {"actions": [], "reply_hint": "", "send_reply": True}
 
         tools = [str(x).strip() for x in (available_tools or []) if str(x).strip()]
         if not tools:
-            return {"actions": [], "reply_hint": ""}
+            return {"actions": [], "reply_hint": "", "send_reply": True}
         tool_set = set(tools)
+        round_idx = max(1, int(planner_round_idx))
+        round_total = max(1, int(planner_round_total))
+        total_limit = max(1, int(planner_total_actions_limit))
+        total_used = max(0, int(planner_total_actions_used))
+        total_remaining = max(0, min(total_limit, int(planner_total_actions_remaining)))
 
         tool_specs = {
             "remember_session_fact": "args={\"fact\":\"<=120字\"} 记录当前会话稳定事实",
             "remember_session_event": "args={\"event\":\"<=120字\"} 记录当前会话近期事件",
             "set_session_summary": "args={\"summary\":\"<=200字\"} 更新当前会话画像摘要",
             "search_memory": "args={\"query\":\"<=80字\"} 在记忆库检索相关片段",
+            "workspace_list_files": (
+                "args={\"path\":\"<=120字,可空\",\"recursive\":false,\"max_entries\":1-200} "
+                "列出 agent_workspace 目录内容"
+            ),
+            "workspace_read_file": (
+                "args={\"path\":\"相对 agent_workspace 的文件路径\"} "
+                "读取 agent_workspace 文件"
+            ),
+            "workspace_write_file": (
+                "args={\"path\":\"相对路径\",\"content\":\"<=4000字\",\"mode\":\"overwrite|append\"} "
+                "写入 agent_workspace 文件"
+            ),
             "web_search": "args={\"query\":\"<=80字\"} 联网检索公开网页信息（provider 可配置）",
+            "web_search_volc": "args={\"query\":\"<=80字\"} 联网检索（火山方舟内置搜索，单次可信模式）",
+            "generate_image": (
+                "args={\"prompt\":\"<=280字\",\"size\":\"可选，如1024x1024\"} "
+                "生成图片并发送本地文件"
+            ),
             "remember_long_term": "args={\"note\":\"<=200字\"} 写入长期记忆（仅管理员）",
             "maintain_memory": "args={\"days\":1-14} 整理近期记忆到 MEMORY.md",
             "refine_persona_files": "args={} 整理 SOUL/IDENTITY/USER/TOOLS 设定文件",
@@ -2009,10 +2250,12 @@ class LlmReplyGenerator:
             "你只能从给定工具白名单中选择动作，不允许发明新工具。"
             "你必须严格输出一个 JSON 对象，不要输出 markdown、解释或前缀。"
             "输出格式必须是："
-            '{"actions":[{"tool":"...","args":{},"reason":"<=40字"}],"reply_hint":"<=120字"}。'
+            '{"actions":[{"tool":"...","args":{},"reason":"<=40字"}],"reply_hint":"<=120字","send_reply":true|false}。'
             "如果不需要动作，actions 返回空数组。reply_hint 可空串。"
             "若输入中已包含工具观察结果，可继续规划下一步动作；"
             "但禁止重复输出同一个 tool+args。"
+            "检索证据优先级默认是：web_search_volc > web_search > search_memory。"
+            "若不同来源冲突，优先采用更高优先级来源，不要回退到低优先级覆盖高优先级结论。"
         )
         user_prompt = (
             f"会话类型: {'群聊' if is_group else '私聊'}\n"
@@ -2024,6 +2267,8 @@ class LlmReplyGenerator:
             f"该会话历史上下文: {session_context or '无'}\n"
             f"工作区规则与人格: {workspace_context or '无'}\n"
             f"相关记忆检索: {memory_recall or '无'}\n"
+            f"规划轮次: 第{round_idx}/{round_total}轮\n"
+            f"工具总预算: 总上限{total_limit}，已执行{total_used}，剩余{total_remaining}\n"
             "可用工具白名单:\n"
             + "\n".join(tool_lines)
             + "\n动作约束：\n"
@@ -2033,7 +2278,14 @@ class LlmReplyGenerator:
             + "4) reply_hint 必须是可直接发送给对方的中文短句；不能写策略说明、语气说明、风格说明，"
             + "不能写类似“顺着这个话题调侃”“用轻松语气回一句”“符合群聊氛围”这样的元提示。\n"
             + "5) reply_hint 不能索要红包/稿费/转账，不能以先给条件为前提拒绝回答。\n"
-            + "6) 如果已有检索结果仍不足，请换关键词继续检索，不要机械重复同一参数。"
+            + "6) 如果已有检索结果仍不足，请换关键词继续检索，不要机械重复同一参数。\n"
+            + "7) 若选择 web_search_volc，本轮只保留它一个检索动作，不要再同时规划 search_memory/web_search。\n"
+            + "8) 若工具观察中已有网页检索结果（web_search 或 web_search_volc），默认直接信任该结果；"
+            + "除非明确失败/无结果，否则不要再追加 search_memory 或记忆写入动作。\n"
+            + "9) 当 web_search_volc 与其他来源冲突时，以 web_search_volc 为准，并优先结束动作规划（actions 为空）。\n"
+            + "10) send_reply=false 表示当前不要对用户发送最终回复；send_reply=true 表示本轮可发送最终回复。\n"
+            + "11) 当用户明确要求作图/海报/配图时可用 generate_image，prompt 要具体且可执行；"
+            + "若需求是纯文本答复，不要调用 generate_image。"
         )
         payload = {
             "model": self.cfg.model,
@@ -2061,7 +2313,7 @@ class LlmReplyGenerator:
             ):
                 parsed = parsed_any[0]
             else:
-                parsed = {"actions": parsed_any, "reply_hint": ""}
+                parsed = {"actions": parsed_any, "reply_hint": "", "send_reply": True}
         else:
             raise RuntimeError(
                 f"agent action planner returned unsupported json type: {type(parsed_any)}"
@@ -2070,6 +2322,13 @@ class LlmReplyGenerator:
         reply_hint = re.sub(r"\s+", " ", str(parsed.get("reply_hint", "") or "")).strip()[:180]
         if self._is_payment_gate_text(reply_hint):
             reply_hint = ""
+        raw_send_reply = parsed.get("send_reply", True)
+        if isinstance(raw_send_reply, bool):
+            send_reply = raw_send_reply
+        elif isinstance(raw_send_reply, str):
+            send_reply = raw_send_reply.strip().lower() not in {"0", "false", "no", "off"}
+        else:
+            send_reply = bool(raw_send_reply)
 
         normalized: list[dict] = []
         raw_actions = parsed.get("actions")
@@ -2128,6 +2387,49 @@ class LlmReplyGenerator:
                     if not query:
                         continue
                     args = {"query": query}
+                elif tool == "workspace_list_files":
+                    rel_path = re.sub(
+                        r"\s+",
+                        " ",
+                        str(args_obj.get("path", "") or args_obj.get("dir", "")).strip(),
+                    )[:120]
+                    recursive_raw = args_obj.get("recursive", False)
+                    if isinstance(recursive_raw, str):
+                        recursive = recursive_raw.strip().lower() in {"1", "true", "yes", "on"}
+                    else:
+                        recursive = bool(recursive_raw)
+                    max_entries_raw = args_obj.get("max_entries", 80)
+                    try:
+                        max_entries = int(max_entries_raw)
+                    except Exception:
+                        max_entries = 80
+                    max_entries = max(1, min(200, max_entries))
+                    args = {
+                        "path": rel_path,
+                        "recursive": recursive,
+                        "max_entries": max_entries,
+                    }
+                elif tool == "workspace_read_file":
+                    rel_path = re.sub(
+                        r"\s+",
+                        " ",
+                        str(args_obj.get("path", "") or args_obj.get("file", "")).strip(),
+                    )[:200]
+                    if not rel_path:
+                        continue
+                    args = {"path": rel_path}
+                elif tool == "workspace_write_file":
+                    rel_path = re.sub(
+                        r"\s+",
+                        " ",
+                        str(args_obj.get("path", "") or args_obj.get("file", "")).strip(),
+                    )[:200]
+                    content = str(args_obj.get("content", "") or args_obj.get("text", "")).strip()[:4000]
+                    if (not rel_path) or (not content):
+                        continue
+                    mode_raw = str(args_obj.get("mode", "overwrite")).strip().lower()
+                    mode = "append" if mode_raw in {"append", "a", "追加"} else "overwrite"
+                    args = {"path": rel_path, "content": content, "mode": mode}
                 elif tool == "web_search":
                     query = re.sub(
                         r"\s+",
@@ -2137,6 +2439,27 @@ class LlmReplyGenerator:
                     if not query:
                         continue
                     args = {"query": query}
+                elif tool == "web_search_volc":
+                    query = re.sub(
+                        r"\s+",
+                        " ",
+                        str(args_obj.get("query", "") or args_obj.get("text", "")).strip(),
+                    )[:80]
+                    if not query:
+                        continue
+                    args = {"query": query}
+                elif tool == "generate_image":
+                    prompt = re.sub(
+                        r"\s+",
+                        " ",
+                        str(args_obj.get("prompt", "") or args_obj.get("text", "")).strip(),
+                    )[:280]
+                    if not prompt:
+                        continue
+                    args = {"prompt": prompt}
+                    size_raw = re.sub(r"\s+", "", str(args_obj.get("size", "")).strip().lower())
+                    if re.fullmatch(r"\d{2,4}x\d{2,4}", size_raw):
+                        args["size"] = size_raw
                 elif tool == "maintain_memory":
                     days_raw = args_obj.get("days", 3)
                     try:
@@ -2163,6 +2486,7 @@ class LlmReplyGenerator:
         return {
             "actions": normalized,
             "reply_hint": reply_hint,
+            "send_reply": send_reply,
         }
 
     def heartbeat_memory_digest(
