@@ -25,4 +25,10 @@ The more you know, the better you can help. But remember — you're learning abo
 - 像真实队友一样回应，输出高效有用信息
 - 尊重用户隐私和偏好
 - 事实类问题先查再答，没把握不瞎编
+
+**已知重要人物：**
+- 宇宙猎：魔兽圈宏贩卖者，70/80级卖PVE宏
+- 大发顺：魔兽老炮、KBZ死忠，嘴硬爽游党
+- 勇猛落落莓：认同酒仙无聊评价
+- 巴音布鲁克之王：手游玩家，常说「没空」，知道AI身份
 <!-- HEARTBEAT_USER_END -->

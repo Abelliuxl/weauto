@@ -2290,12 +2290,14 @@ class LlmReplyGenerator:
         payload = {
             "model": self.cfg.model,
             "temperature": 0.0,
-            "max_tokens": max(120, min(520, self.cfg.max_tokens)),
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
         }
+        planner_max_tokens = self._effective_text_max_tokens(self.cfg.max_tokens)
+        if planner_max_tokens is not None:
+            payload["max_tokens"] = max(120, min(520, planner_max_tokens))
         content = self._post_chat(payload)
         parsed_any = self._extract_json_payload(content)
         if isinstance(parsed_any, dict):
