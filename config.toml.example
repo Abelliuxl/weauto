@@ -63,7 +63,7 @@ memory_summary_update_every = 4
 memory_summary_recent_items = 10
 memory_summary_max_chars = 500
 memory_history_context_items = 24
-memory_history_max_items = 0
+memory_history_max_items = 1000
 
 # --------------------
 # Workspace Memory
@@ -82,6 +82,7 @@ workspace_memory_sqlite_sync_interval_sec = 20.0
 workspace_memory_sqlite_fts_limit = 64
 workspace_memory_sqlite_vector_limit = 24
 workspace_memory_sqlite_chunk_chars = 320
+workspace_embedding_cache_max_items = 1024
 
 # --------------------
 # Admin Session

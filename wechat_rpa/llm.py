@@ -675,9 +675,12 @@ class LlmReplyGenerator:
 
         reasoning_obj: dict[str, object] = {}
         if normalized_effort in ("minimal", "low", "medium", "high"):
-            # Chat API-style effort control (e.g. some Doubao/OpenAI-compatible endpoints).
-            updated["reasoning_effort"] = normalized_effort
-            # Keep nested compatibility for providers that still parse reasoning.effort.
+            # OpenRouter expects nested reasoning controls; avoid the extra
+            # top-level compatibility field there so we keep effort=high
+            # without triggering a raw-payload fallback.
+            if "openrouter.ai" not in provider:
+                updated["reasoning_effort"] = normalized_effort
+            # Keep nested compatibility for providers that parse reasoning.effort.
             reasoning_obj["effort"] = normalized_effort
             controlled = True
 

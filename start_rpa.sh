@@ -88,6 +88,10 @@ if [[ "$LOG_KEEP_MAX_FILES" =~ ^[0-9]+$ && "$LOG_KEEP_MAX_TOTAL_MB" =~ ^[0-9]+$ 
 fi
 LOG_FILE="$LOG_DIR/rpa_$(date +%Y%m%d_%H%M%S).log"
 export WEAUTO_LOG_FILE="$LOG_FILE"
+# High-res Quartz capture leaks native memory in long-running loops on some
+# macOS builds. Keep it off by default; users can still override with
+# WEAUTO_SCREENSHOT_HIGH_RES=1 when they explicitly need it.
+export WEAUTO_SCREENSHOT_HIGH_RES="${WEAUTO_SCREENSHOT_HIGH_RES:-0}"
 
 # Preserve interactive terminal width for aligned logs even when piped to tee.
 if [[ -t 1 ]]; then

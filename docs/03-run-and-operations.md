@@ -28,6 +28,21 @@ python run.py --config config.toml
 
 说明：`run.py` 在 Python >= 3.13 且项目存在 `.venv312/bin/python` 时，会优先重启到该解释器。
 
+### 1.3 定期重启守护：`start_rpa_watchdog.sh`
+
+```bash
+./start_rpa_watchdog.sh config.toml
+```
+
+默认每 6 小时（`21600s`）重启一次主进程，适合长时间运行时做兜底。
+
+可选环境变量：
+
+- `RESTART_INTERVAL_SEC`：重启间隔秒数（默认 `21600`）
+- `RESTART_COOLDOWN_SEC`：每次重启后的冷却秒数（默认 `8`）
+- `CHECK_INTERVAL_SEC`：守护检测间隔（默认 `5`）
+- `FORCE_KILL_AFTER_SEC`：`TERM` 后强杀等待秒数（默认 `30`）
+
 ## 2. 运行模式
 
 普通模式：

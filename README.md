@@ -34,6 +34,14 @@ WeAuto 是一个仅基于 GUI 的微信自动化项目（不 Hook、不注入、
 ./start_rpa.sh config.toml
 ```
 
+需要“定期重启兜底”时：
+
+```bash
+./start_rpa_watchdog.sh config.toml
+# 默认每 6 小时重启一次
+# 可用环境变量调整：RESTART_INTERVAL_SEC / RESTART_COOLDOWN_SEC
+```
+
 `start_rpa.sh` 会自动：
 
 - 创建/使用 `.venv312`
@@ -56,6 +64,12 @@ python run.py --config config.toml
 
 ```bash
 ./start_rpa.sh config.toml
+```
+
+定期重启守护（推荐用于长时间跑）：
+
+```bash
+./start_rpa_watchdog.sh config.toml
 ```
 
 recover（手动翻页）：

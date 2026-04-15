@@ -199,6 +199,7 @@ class WeChatGuiRpaBot:
             memory_sqlite_fts_limit=self.cfg.workspace_memory_sqlite_fts_limit,
             memory_sqlite_vector_limit=self.cfg.workspace_memory_sqlite_vector_limit,
             memory_sqlite_chunk_chars=self.cfg.workspace_memory_sqlite_chunk_chars,
+            memory_embedding_cache_max_items=self.cfg.workspace_embedding_cache_max_items,
         )
         self._workspace.ensure_bootstrap_files()
         self._cycle = 0
@@ -209,7 +210,21 @@ class WeChatGuiRpaBot:
         self._load_persistent_memory()
 
     def _to_np_rgb(self, pil_image) -> np.ndarray:
-        return np.asarray(pil_image.convert("RGB"), dtype=np.uint8)
+        rgb_image = None
+        try:
+            rgb_image = pil_image.convert("RGB")
+            # Detach from PIL internal buffers so images can be closed promptly.
+            return np.array(rgb_image, dtype=np.uint8, copy=True)
+        finally:
+            if rgb_image is not None:
+                try:
+                    rgb_image.close()
+                except Exception:
+                    pass
+            try:
+                pil_image.close()
+            except Exception:
+                pass
 
     def _normalize_preview(self, text: str) -> str:
         s = re.sub(r"\s+", "", text or "")
@@ -559,17 +574,28 @@ class WeChatGuiRpaBot:
         if changed:
             print("[memory] coalesced legacy session keys with normalized group titles")
 
-    def _canonical_session_key(self, title: str, row_idx: int) -> str:
+    def _canonical_session_key(
+        self,
+        title: str,
+        row_idx: int,
+        *,
+        remember: bool = True,
+    ) -> str:
         key = self._title_key(title)
         if not key:
             return f"row-{row_idx}"
         canonical = self._session_aliases.get(key, key)
-        self._remember_session_alias(key, canonical)
-        self._remember_session_title(canonical, title)
+        if remember:
+            self._remember_session_alias(key, canonical)
+            self._remember_session_title(canonical, title)
         return canonical
 
-    def _session_key_for_row(self, row: ChatRowState) -> str:
-        return self._canonical_session_key(row.title, row.row_idx)
+    def _session_key_for_row(self, row: ChatRowState, *, remember: bool = True) -> str:
+        return self._canonical_session_key(
+            row.title,
+            row.row_idx,
+            remember=remember,
+        )
 
     def _session_record_key(self, record: dict) -> str:
         role = str(record.get("role", "unknown")).strip().lower()
@@ -1361,7 +1387,9 @@ class WeChatGuiRpaBot:
         h = int(bounds.height * region.h)
         if w <= 0 or h <= 0:
             return "", 0, 0, (x, y, w, h), region
-        shot = screenshot_region(x, y, w, h, high_res=True)
+        # Header probe runs frequently during focus verification; avoid
+        # high-res capture here to reduce long-run memory growth.
+        shot = screenshot_region(x, y, w, h, high_res=False)
         bgr = self._to_np_rgb(shot)[:, :, ::-1]
         lines = self.ocr_engine.detect_lines(bgr)
         raw_count = len(lines)
@@ -1513,7 +1541,7 @@ class WeChatGuiRpaBot:
         return None
 
     def _is_row_muted(self, row: ChatRowState) -> bool:
-        key = self._session_key_for_row(row)
+        key = self._session_key_for_row(row, remember=False)
         sess = self._sessions.get(key)
         return bool(sess and sess.muted)
 
@@ -3431,7 +3459,11 @@ class WeChatGuiRpaBot:
         if max_actions_override is None:
             max_actions = max(1, int(self.cfg.agent_actions_max_per_turn))
         else:
-            max_actions = max(1, int(max_actions_override))
+            override = int(max_actions_override)
+            if override <= 0:
+                max_actions = max(1, len(actions))
+            else:
+                max_actions = max(1, override)
         traces: list[str] = []
         observations: list[str] = []
 
@@ -4321,11 +4353,14 @@ class WeChatGuiRpaBot:
 
         planned_actions = self._parse_heartbeat_direct_actions(tasks_text)
         if planned_actions:
+            heartbeat_limit = int(self.cfg.heartbeat_max_actions)
+            if heartbeat_limit <= 0:
+                heartbeat_limit = len(planned_actions)
             trace, observations = self._execute_agent_actions(
                 row,
                 planned_actions,
                 is_admin=is_admin,
-                max_actions_override=self.cfg.heartbeat_max_actions,
+                max_actions_override=heartbeat_limit,
             )
             print(
                 f"[heartbeat] ran actions={len(planned_actions):>2} "
@@ -4363,7 +4398,11 @@ class WeChatGuiRpaBot:
             workspace_context=workspace_context,
             memory_recall=memory_recall,
             tools=tools,
-            per_round_max_actions=self.cfg.heartbeat_max_actions,
+            per_round_max_actions=(
+                self.cfg.heartbeat_max_actions
+                if int(self.cfg.heartbeat_max_actions) > 0
+                else 999
+            ),
             lookup_intent=lookup_intent,
             lookup_query=lookup_seed,
             enforce_lookup_round1=False,
@@ -4548,7 +4587,9 @@ class WeChatGuiRpaBot:
             bounds.y,
             bounds.width,
             bounds.height,
-            high_res=True,
+            # Sidebar scanning is high-frequency; keep capture in normal
+            # resolution to avoid runaway native memory usage.
+            high_res=False,
         )
         shot_rgb = self._to_np_rgb(shot)
         detected = detect_chat_rows(shot_rgb, bounds, self.cfg, self.ocr_engine)
@@ -4799,7 +4840,9 @@ class WeChatGuiRpaBot:
         if w <= 0 or h <= 0:
             return ChatContextSnapshot(text="", last_side="unknown", last_line="", source="none")
 
-        shot = screenshot_region(x, y, w, h, high_res=True)
+        # Vision context capture may run frequently in busy chats; keep normal
+        # resolution to avoid runaway memory growth on macOS capture pipeline.
+        shot = screenshot_region(x, y, w, h, high_res=False)
         try:
             parsed = self.llm.analyze_chat_image(
                 image=shot,
@@ -4901,6 +4944,11 @@ class WeChatGuiRpaBot:
                 print(f"[warn] vision parse failed: {exc}")
                 return ChatContextSnapshot(text="", last_side="unknown", last_line="", source="vision")
             raise
+        finally:
+            try:
+                shot.close()
+            except Exception:
+                pass
 
     def _log_cycle_snapshot(self, rows: list[ChatRowState], now: float) -> None:
         if not self.cfg.log_verbose:
@@ -4913,7 +4961,7 @@ class WeChatGuiRpaBot:
         limit = max(1, self.cfg.log_snapshot_rows)
         for row in rows[:limit]:
             group = self._is_group_chat(row)
-            key = self._session_key_for_row(row)
+            key = self._session_key_for_row(row, remember=False)
             preview_w = max(16, self._term_width() - 76)
             print(
                 f"[row]   idx={row.row_idx:>2} | grp={self._yn(group)} | "
@@ -4925,7 +4973,7 @@ class WeChatGuiRpaBot:
     def _set_baseline(self, rows: list[ChatRowState], now: float) -> None:
         self._baseline = {
             row.row_idx: RowMemory(
-                session_key=self._session_key_for_row(row),
+                session_key=self._session_key_for_row(row, remember=False),
                 fingerprint=row.fingerprint,
                 preview_norm=self._normalize_preview(row.preview),
                 last_sent_norm="",
@@ -4956,7 +5004,7 @@ class WeChatGuiRpaBot:
             prev = self._baseline.get(row.row_idx)
             if prev is None:
                 self._baseline[row.row_idx] = RowMemory(
-                    session_key=self._session_key_for_row(row),
+                    session_key=self._session_key_for_row(row, remember=False),
                     fingerprint=row.fingerprint,
                     preview_norm=self._normalize_preview(row.preview),
                     last_sent_norm="",
@@ -4969,7 +5017,7 @@ class WeChatGuiRpaBot:
                 )
                 continue
 
-            row_key = self._session_key_for_row(row)
+            row_key = self._session_key_for_row(row, remember=False)
             if prev.session_key != row_key:
                 # Row index got rebound to another session after list reordering.
                 # Reset row memory to avoid carrying unread/pending state across chats.
@@ -5020,12 +5068,13 @@ class WeChatGuiRpaBot:
             self_echo = self._is_self_echo(preview_norm, prev.last_sent_norm) or self._is_self_echo(
                 preview_norm, recent_sent_norm
             )
-            self_preview_refresh = preview_changed and self._is_preview_refresh_from_self(
+            recent_self_preview = self._is_preview_refresh_from_self(
                 row=row,
                 preview_norm=preview_norm,
                 prev_sent_norm=prev.last_sent_norm,
                 recent_sent_norm=recent_sent_norm,
             )
+            self_preview_refresh = preview_changed and recent_self_preview
 
             if self.cfg.debug_scan and (preview_changed or unread_rise or mention_rise):
                 print(
@@ -5052,6 +5101,16 @@ class WeChatGuiRpaBot:
 
             # Prevent reply loops when the preview is our own last sent text.
             if self_echo:
+                continue
+            if row.has_unread_badge and recent_self_preview:
+                if self.cfg.log_verbose or self.cfg.debug_scan:
+                    print(
+                        f"[skip-self-unread] row={row.row_idx:>2} | "
+                        f"title={self._fit_col(row.title, 14)}"
+                    )
+                    print(
+                        f"                  preview={self._fit_col(row.preview, max(24, self._term_width() - 27))}"
+                    )
                 continue
             if self_preview_refresh:
                 if self.cfg.log_verbose or self.cfg.debug_scan:
@@ -6010,8 +6069,23 @@ class WeChatGuiRpaBot:
         h = int(bounds.height * self.cfg.chat_context_region.h)
         if w <= 0 or h <= 0:
             return np.zeros((1, 1), dtype=np.uint8)
-        shot = screenshot_region(x, y, w, h, high_res=True)
-        gray = np.asarray(shot.convert("L"), dtype=np.uint8)
+        # Scroll probe is high-frequency in recover mode; normal resolution is
+        # enough for diff checks and keeps memory stable.
+        shot = screenshot_region(x, y, w, h, high_res=False)
+        gray_img = None
+        try:
+            gray_img = shot.convert("L")
+            gray = np.array(gray_img, dtype=np.uint8, copy=True)
+        finally:
+            if gray_img is not None:
+                try:
+                    gray_img.close()
+                except Exception:
+                    pass
+            try:
+                shot.close()
+            except Exception:
+                pass
         if gray.ndim != 2 or gray.size == 0:
             return np.zeros((1, 1), dtype=np.uint8)
         pad_y = max(1, int(gray.shape[0] * 0.04))
@@ -6230,7 +6304,15 @@ class WeChatGuiRpaBot:
                 time.sleep(self.cfg.poll_interval_sec)
                 continue
 
-            shot = screenshot_region(bounds.x, bounds.y, bounds.width, bounds.height, high_res=True)
+            # Main loop capture is high-frequency (poll interval), so avoid
+            # high-res mode to keep memory stable in long-running sessions.
+            shot = screenshot_region(
+                bounds.x,
+                bounds.y,
+                bounds.width,
+                bounds.height,
+                high_res=False,
+            )
             shot_rgb = self._to_np_rgb(shot)
 
             detected = detect_chat_rows(shot_rgb, bounds, self.cfg, self.ocr_engine)

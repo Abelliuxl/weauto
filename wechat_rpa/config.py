@@ -225,6 +225,8 @@ class AppConfig:
     workspace_memory_sqlite_fts_limit: int = 64
     workspace_memory_sqlite_vector_limit: int = 24
     workspace_memory_sqlite_chunk_chars: int = 320
+    # In-process embedding cache cap to prevent unbounded RAM growth.
+    workspace_embedding_cache_max_items: int = 1024
     admin_commands_enabled: bool = True
     admin_session_titles: list[str] = field(default_factory=lambda: ["example_admin"])
     admin_command_prefix: str = "/"
@@ -618,6 +620,9 @@ def load_config(path: str | Path | None) -> AppConfig:
             cfg.workspace_memory_sqlite_chunk_chars,
         )
     )
+    cfg.workspace_embedding_cache_max_items = int(
+        data.get("workspace_embedding_cache_max_items", cfg.workspace_embedding_cache_max_items)
+    )
     if cfg.workspace_memory_rerank_shortlist < 1:
         cfg.workspace_memory_rerank_shortlist = 1
     if cfg.workspace_memory_rerank_weight < 0.0:
@@ -630,6 +635,8 @@ def load_config(path: str | Path | None) -> AppConfig:
         cfg.workspace_memory_sqlite_vector_limit = 1
     if cfg.workspace_memory_sqlite_chunk_chars < 120:
         cfg.workspace_memory_sqlite_chunk_chars = 120
+    if cfg.workspace_embedding_cache_max_items < 64:
+        cfg.workspace_embedding_cache_max_items = 64
     cfg.admin_commands_enabled = bool(
         data.get("admin_commands_enabled", cfg.admin_commands_enabled)
     )
@@ -1046,8 +1053,8 @@ def load_config(path: str | Path | None) -> AppConfig:
         cfg.heartbeat_interval_sec = 5.0
     if cfg.heartbeat_min_idle_sec < 0.0:
         cfg.heartbeat_min_idle_sec = 0.0
-    if cfg.heartbeat_max_actions < 1:
-        cfg.heartbeat_max_actions = 1
+    if cfg.heartbeat_max_actions < 0:
+        cfg.heartbeat_max_actions = 0
     if cfg.person_impression_days < 1:
         cfg.person_impression_days = 1
     if cfg.person_impression_days > 3650:

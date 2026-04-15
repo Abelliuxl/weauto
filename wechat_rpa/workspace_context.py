@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime
 import hashlib
@@ -141,6 +142,7 @@ class WorkspaceContextManager:
         memory_sqlite_fts_limit: int = 64,
         memory_sqlite_vector_limit: int = 24,
         memory_sqlite_chunk_chars: int = 320,
+        memory_embedding_cache_max_items: int = 1024,
     ) -> None:
         self.enabled = bool(enabled)
         self.root = Path(root)
@@ -154,7 +156,8 @@ class WorkspaceContextManager:
         self.memory_rerank_enabled = bool(memory_rerank_enabled)
         self.memory_rerank_shortlist = max(1, int(memory_rerank_shortlist))
         self.memory_rerank_weight = max(0.0, float(memory_rerank_weight))
-        self._embedding_cache: dict[str, list[float] | None] = {}
+        self.memory_embedding_cache_max_items = max(64, int(memory_embedding_cache_max_items))
+        self._embedding_cache: OrderedDict[str, list[float] | None] = OrderedDict()
         self._embedding_warned = False
         self._rerank_warned = False
         self.memory_sqlite_enabled = bool(memory_sqlite_enabled)
@@ -2511,7 +2514,9 @@ class WorkspaceContextManager:
             if not clean:
                 continue
             if clean in self._embedding_cache:
-                results[idx] = self._embedding_cache[clean]
+                cached = self._embedding_cache.pop(clean)
+                self._embedding_cache[clean] = cached
+                results[idx] = cached
                 continue
             misses.append(clean)
             miss_positions.append(idx)
@@ -2595,7 +2600,11 @@ class WorkspaceContextManager:
                 ordered[index] = vector
 
         for miss, pos, vector in zip(misses, miss_positions, ordered):
+            if miss in self._embedding_cache:
+                self._embedding_cache.pop(miss)
             self._embedding_cache[miss] = vector
+            while len(self._embedding_cache) > self.memory_embedding_cache_max_items:
+                self._embedding_cache.popitem(last=False)
             results[pos] = vector
         return results
 
