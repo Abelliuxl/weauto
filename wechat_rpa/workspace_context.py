@@ -56,6 +56,40 @@ _DEFAULT_FILES: dict[str, str] = {
 - 当前项目：weauto
 - 能力：检测微信窗口、截图、识别新消息、自动回复
 """,
+    "SKILLS.md": """# SKILLS.md
+
+这里定义工作区技能系统。
+
+- 技能目录：`skills/<skill_name>/SKILL.md`
+- 一个技能就是一份可复用规则，适合放“遇到什么任务、按什么步骤做”
+- 当用户要求“给自己加能力 / 写个 skill / 以后遇到某类事按固定流程做”时，可以新建或更新 skill
+- 优先把稳定流程写成 skill，而不是只在当前回复里临时记住
+
+推荐格式：
+
+```md
+# skill-name
+
+- 用途: 这个 skill 解决什么问题
+- 触发词: 逗号分隔的关键词
+
+## 规则
+- 关键约束 1
+- 关键约束 2
+
+## 步骤
+1. 第一步
+2. 第二步
+3. 第三步
+```
+
+写 skill 时要求：
+
+- 名字短、稳定、可复用
+- 规则写清楚触发条件、边界和禁止事项
+- 步骤尽量可执行，不写空话
+- 如果技能只适用于某个会话或某个联系人，要在内容里写明范围
+""",
     "MEMORY.md": """# MEMORY.md
 
 这里放长期记忆。
@@ -147,6 +181,7 @@ class WorkspaceContextManager:
         self.enabled = bool(enabled)
         self.root = Path(root)
         self.memory_dir = self.root / "memory"
+        self.skills_dir = self.root / "skills"
         self.session_dir = self.memory_dir / "sessions"
         self.session_state_dir = self.memory_dir / "session_state"
         self.people_dir = self.memory_dir / "people"
@@ -198,6 +233,7 @@ class WorkspaceContextManager:
         touched = False
         self.root.mkdir(parents=True, exist_ok=True)
         self.memory_dir.mkdir(parents=True, exist_ok=True)
+        self.skills_dir.mkdir(parents=True, exist_ok=True)
         self.session_dir.mkdir(parents=True, exist_ok=True)
         self.session_state_dir.mkdir(parents=True, exist_ok=True)
         self.people_dir.mkdir(parents=True, exist_ok=True)
@@ -328,10 +364,138 @@ class WorkspaceContextManager:
             return canonical_clean
         return clean
 
-    def build_prompt_context(self, *, include_long_term: bool) -> str:
+    def _iter_skill_paths(self) -> list[Path]:
+        if not self.enabled:
+            return []
+        paths: list[Path] = []
+        seen: set[str] = set()
+        for path in sorted(self.skills_dir.glob("*/SKILL.md")):
+            key = str(path.resolve())
+            if key not in seen:
+                seen.add(key)
+                paths.append(path)
+        for path in sorted(self.skills_dir.glob("*.md")):
+            if path.name.upper() == "README.MD":
+                continue
+            key = str(path.resolve())
+            if key not in seen:
+                seen.add(key)
+                paths.append(path)
+        return paths
+
+    def _skill_meta_from_path(self, path: Path) -> dict:
+        try:
+            rel = path.relative_to(self.root).as_posix()
+        except Exception:
+            rel = path.name
+        content = self._safe_read(path)
+        lines = [line.strip() for line in content.splitlines() if line.strip()]
+        title = path.parent.name if path.name.upper() == "SKILL.MD" else path.stem
+        summary = ""
+        keywords: list[str] = []
+        for line in lines[:12]:
+            if line.startswith("# "):
+                title = line[2:].strip() or title
+                continue
+            if line.startswith("- 用途:") or line.startswith("- 说明:"):
+                summary = line.split(":", 1)[1].strip()[:120]
+                continue
+            if (
+                line.startswith("- 触发词:")
+                or line.startswith("- 关键词:")
+                or line.startswith("- tags:")
+                or line.startswith("- keywords:")
+            ):
+                raw = line.split(":", 1)[1].strip()
+                keywords = [
+                    token.strip()[:24]
+                    for token in re.split(r"[，,、；;|]", raw)
+                    if token.strip()
+                ][:10]
+                continue
+            if (not summary) and (not line.startswith("#")) and (not line.startswith("##")):
+                summary = line.lstrip("- ").strip()[:120]
+        return {
+            "name": self._clip_text(title, 40) or title,
+            "path": rel,
+            "summary": self._clip_text(summary, 120),
+            "keywords": keywords,
+            "content": content,
+        }
+
+    def list_skills(self) -> list[dict]:
+        if not self.enabled:
+            return []
+        out: list[dict] = []
+        for path in self._iter_skill_paths():
+            meta = self._skill_meta_from_path(path)
+            out.append(
+                {
+                    "name": meta.get("name", ""),
+                    "path": meta.get("path", ""),
+                    "summary": meta.get("summary", ""),
+                    "keywords": list(meta.get("keywords", []) or []),
+                }
+            )
+        return out
+
+    def select_skills(self, *, query: str, limit: int = 2) -> list[dict]:
+        if not self.enabled:
+            return []
+        clean_query = self._clip_text(query, 240)
+        if not clean_query:
+            return []
+        q_norm = self._norm(clean_query)
+        q_tokens = self._tokens(clean_query)
+        ranked: list[tuple[float, dict]] = []
+        for path in self._iter_skill_paths():
+            meta = self._skill_meta_from_path(path)
+            hay = " ".join(
+                [
+                    str(meta.get("name", "")),
+                    str(meta.get("summary", "")),
+                    " ".join(str(x) for x in (meta.get("keywords", []) or [])),
+                    str(meta.get("content", ""))[:800],
+                ]
+            )
+            hay_norm = self._norm(hay)
+            score = 0.0
+            if q_norm and hay_norm:
+                score += 2.0 * self._rough_ratio(q_norm, hay_norm)
+            score += 0.6 * sum(1.0 for token in q_tokens if token in hay_norm)
+            for keyword in meta.get("keywords", []) or []:
+                norm_keyword = self._norm(str(keyword))
+                if not norm_keyword:
+                    continue
+                if norm_keyword in q_norm or q_norm in norm_keyword:
+                    score += 1.8
+            if score <= 0.45:
+                continue
+            ranked.append((score, meta))
+        ranked.sort(key=lambda item: item[0], reverse=True)
+        return [meta for _, meta in ranked[: max(1, int(limit))]]
+
+    def _skills_index_text(self, *, limit: int = 12) -> str:
+        rows: list[str] = []
+        for meta in self.list_skills()[: max(1, int(limit))]:
+            row = f"- {meta.get('name', '')}: {meta.get('summary', '') or '无摘要'}"
+            keywords = [str(x).strip() for x in (meta.get("keywords", []) or []) if str(x).strip()]
+            if keywords:
+                row += f" | 触发词: {', '.join(keywords[:6])}"
+            row += f" | 路径: {meta.get('path', '')}"
+            rows.append(row[:220])
+        return "\n".join(rows)[:2200]
+
+    def build_prompt_context(
+        self,
+        *,
+        include_long_term: bool,
+        skill_query: str = "",
+        max_skills: int = 2,
+    ) -> str:
         if not self.enabled:
             return ""
-        names = ["AGENTS.md", "SOUL.md", "IDENTITY.md", "USER.md", "TOOLS.md"]
+        names = ["AGENTS.md", "SOUL.md", "IDENTITY.md", "USER.md", "TOOLS.md", "SKILLS.md"]
         if include_long_term:
             names.append("MEMORY.md")
         parts: list[str] = []
@@ -341,6 +505,17 @@ class WorkspaceContextManager:
             if not content:
                 continue
             parts.append(f"[{name}]\n{content[:4000]}")
+        skills_index = self._skills_index_text()
+        if skills_index:
+            parts.append(f"[skills_index]\n{skills_index}")
+        selected_skills = self.select_skills(query=skill_query, limit=max_skills)
+        for meta in selected_skills:
+            name = self._clip_text(meta.get("name", ""), 40) or "skill"
+            path = self._clip_text(meta.get("path", ""), 120)
+            content = str(meta.get("content", "") or "").strip()
+            if not content:
+                continue
+            parts.append(f"[SKILL:{name} path={path}]\n{content[:3200]}")
         return "\n\n".join(parts)[:12000]
 
     def _format_record_line(
@@ -828,6 +1003,72 @@ class WorkspaceContextManager:
         state.setdefault("profile", {})["summary"] = clean
         state["updated_at"] = self._now_iso()
         self._save_session_state(state)
+
+    def get_session_agent_task(self, *, session_key: str, title: str) -> dict:
+        if not self.enabled:
+            return {}
+        state = self._load_session_state(session_key=session_key, title=title)
+        task = state.get("agent_task")
+        if isinstance(task, dict):
+            return dict(task)
+        return {}
+
+    def update_session_agent_task(
+        self,
+        *,
+        session_key: str,
+        title: str,
+        task: dict | None,
+    ) -> dict:
+        if not self.enabled:
+            return {}
+        state = self._load_session_state(session_key=session_key, title=title)
+        clean_task = dict(task) if isinstance(task, dict) else {}
+        status = self._clip_text(clean_task.get("status", ""), 24).lower()
+        if status in {"", "idle"}:
+            state["agent_task"] = {}
+        else:
+            state["agent_task"] = {
+                "status": status,
+                "goal": self._clip_text(clean_task.get("goal", ""), 160),
+                "plan": self._clip_text(clean_task.get("plan", ""), 280),
+                "next_step": self._clip_text(clean_task.get("next_step", ""), 160),
+                "last_result": self._clip_text(clean_task.get("last_result", ""), 280),
+                "blocked_reason": self._clip_text(clean_task.get("blocked_reason", ""), 160),
+                "continue_on_heartbeat": bool(clean_task.get("continue_on_heartbeat", False)),
+                "updated_at": self._now_iso(),
+            }
+        state["updated_at"] = self._now_iso()
+        self._save_session_state(state)
+        task_obj = state.get("agent_task")
+        return dict(task_obj) if isinstance(task_obj, dict) else {}
+
+    def list_pending_agent_tasks(self, *, limit: int = 20) -> list[dict]:
+        if not self.enabled:
+            return []
+        limit = max(1, int(limit))
+        pending: list[dict] = []
+        for path in sorted(self.session_state_dir.glob("*.json")):
+            state = self._safe_json_load(path)
+            if not state:
+                continue
+            task = state.get("agent_task")
+            if not isinstance(task, dict):
+                continue
+            status = self._clip_text(task.get("status", ""), 24).lower()
+            if status != "running":
+                continue
+            if not bool(task.get("continue_on_heartbeat", False)):
+                continue
+            pending.append(
+                {
+                    "session_key": str(state.get("session_key", "")).strip(),
+                    "title": self._clip_text(state.get("title", ""), 80),
+                    "task": dict(task),
+                }
+            )
+        pending.sort(key=lambda item: str(item.get("task", {}).get("updated_at", "")))
+        return pending[:limit]
 
     def _remember_structured_into_state(
         self,
@@ -1796,6 +2037,7 @@ class WorkspaceContextManager:
             "facts": [],
             "relations": [],
             "events": [],
+            "agent_task": {},
         }
 
     def _load_session_state(self, *, session_key: str, title: str) -> dict:
@@ -1812,6 +2054,8 @@ class WorkspaceContextManager:
         state.setdefault("facts", [])
         state.setdefault("relations", [])
         state.setdefault("events", [])
+        if not isinstance(state.get("agent_task"), dict):
+            state["agent_task"] = {}
         return state
 
     def _save_session_state(self, state: dict) -> None:

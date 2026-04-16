@@ -2198,6 +2198,7 @@ class LlmReplyGenerator:
         memory_recall: str = "",
         available_tools: list[str] | None = None,
         max_actions: int = 2,
+        agent_task_state: str = "",
         planner_round_idx: int = 1,
         planner_round_total: int = 1,
         planner_total_actions_limit: int = 2,
@@ -2205,11 +2206,11 @@ class LlmReplyGenerator:
         planner_total_actions_remaining: int = 2,
     ) -> dict:
         if not self.is_enabled():
-            return {"actions": [], "reply_hint": "", "send_reply": True}
+            return {"actions": [], "reply_hint": "", "send_reply": True, "task": {}}
 
         tools = [str(x).strip() for x in (available_tools or []) if str(x).strip()]
         if not tools:
-            return {"actions": [], "reply_hint": "", "send_reply": True}
+            return {"actions": [], "reply_hint": "", "send_reply": True, "task": {}}
         tool_set = set(tools)
         round_idx = max(1, int(planner_round_idx))
         round_total = max(1, int(planner_round_total))
@@ -2229,11 +2230,11 @@ class LlmReplyGenerator:
             ),
             "workspace_read_file": (
                 "args={\"path\":\"相对 agent_workspace 的文件路径\"} "
-                "读取 agent_workspace 文件"
+                "读取 agent_workspace 文件，可用于读取 skills/<name>/SKILL.md"
             ),
             "workspace_write_file": (
                 "args={\"path\":\"相对路径\",\"content\":\"<=4000字\",\"mode\":\"overwrite|append\"} "
-                "写入 agent_workspace 文件"
+                "写入 agent_workspace 文件；创建或更新技能时优先写到 skills/<name>/SKILL.md"
             ),
             "web_search": "args={\"query\":\"<=80字\"} 联网检索公开网页信息（provider 可配置）",
             "web_search_volc": "args={\"query\":\"<=80字\"} 联网检索（火山方舟内置搜索，单次可信模式）",
@@ -2258,8 +2259,9 @@ class LlmReplyGenerator:
             "你只能从给定工具白名单中选择动作，不允许发明新工具。"
             "你必须严格输出一个 JSON 对象，不要输出 markdown、解释或前缀。"
             "输出格式必须是："
-            '{"actions":[{"tool":"...","args":{},"reason":"<=40字"}],"reply_hint":"<=120字","send_reply":true|false}。'
+            '{"actions":[{"tool":"...","args":{},"reason":"<=40字"}],"reply_hint":"<=120字","send_reply":true|false,"task":{"status":"idle|running|blocked|waiting_user|done","goal":"<=120字","plan":"<=200字","next_step":"<=120字","blocked_reason":"<=120字","continue_on_heartbeat":true|false}}。'
             "如果不需要动作，actions 返回空数组。reply_hint 可空串。"
+            "task 字段必须始终给出；若没有持续任务，status=idle。"
             "若输入中已包含工具观察结果，可继续规划下一步动作；"
             "但禁止重复输出同一个 tool+args。"
             "检索证据优先级默认是：web_search_volc > web_search > search_memory。"
@@ -2275,6 +2277,7 @@ class LlmReplyGenerator:
             f"该会话历史上下文: {session_context or '无'}\n"
             f"工作区规则与人格: {workspace_context or '无'}\n"
             f"相关记忆检索: {memory_recall or '无'}\n"
+            f"当前任务状态: {agent_task_state or '无'}\n"
             f"规划轮次: 第{round_idx}/{round_total}轮\n"
             f"工具总预算: 总上限{total_limit}，已执行{total_used}，剩余{total_remaining}\n"
             "可用工具白名单:\n"
@@ -2294,6 +2297,10 @@ class LlmReplyGenerator:
             + "10) send_reply=false 表示当前不要对用户发送最终回复；send_reply=true 表示本轮可发送最终回复。\n"
             + "11) 当用户明确要求作图/海报/配图时可用 generate_image，prompt 要具体且可执行；"
             + "若需求是纯文本答复，不要调用 generate_image。"
+            + "\n12) task.status=running 表示任务未完成，后续还要继续；若希望空闲时后台续跑，设 continue_on_heartbeat=true。"
+            + "\n13) task.status=waiting_user 表示缺用户信息，continue_on_heartbeat 必须为 false。"
+            + "\n14) task.status=done 表示当前任务已完成；task.status=blocked 表示被外部条件卡住，需写 blocked_reason。"
+            + "\n15) 当用户要求你增加能力、沉淀流程、写 skill、以后按固定套路处理某类事时，优先读取/写入 skills 目录，技能文件路径用 skills/<name>/SKILL.md。"
         )
         payload = {
             "model": self.cfg.model,
@@ -2339,6 +2346,44 @@ class LlmReplyGenerator:
             send_reply = raw_send_reply.strip().lower() not in {"0", "false", "no", "off"}
         else:
             send_reply = bool(raw_send_reply)
+
+        task_obj = parsed.get("task")
+        task: dict[str, object] = {}
+        if isinstance(task_obj, dict):
+            status = re.sub(r"\s+", " ", str(task_obj.get("status", "")).strip()).lower()[:24]
+            if status not in {"idle", "running", "blocked", "waiting_user", "done"}:
+                status = "idle"
+            goal = re.sub(r"\s+", " ", str(task_obj.get("goal", "")).strip())[:120]
+            plan_text = task_obj.get("plan", "")
+            if isinstance(plan_text, list):
+                plan = "；".join(
+                    re.sub(r"\s+", " ", str(x).strip())[:40]
+                    for x in plan_text
+                    if str(x).strip()
+                )[:200]
+            else:
+                plan = re.sub(r"\s+", " ", str(plan_text).strip())[:200]
+            next_step = re.sub(r"\s+", " ", str(task_obj.get("next_step", "")).strip())[:120]
+            blocked_reason = re.sub(
+                r"\s+",
+                " ",
+                str(task_obj.get("blocked_reason", "")).strip(),
+            )[:120]
+            raw_continue = task_obj.get("continue_on_heartbeat", False)
+            if isinstance(raw_continue, bool):
+                continue_on_heartbeat = raw_continue
+            elif isinstance(raw_continue, str):
+                continue_on_heartbeat = raw_continue.strip().lower() in {"1", "true", "yes", "on"}
+            else:
+                continue_on_heartbeat = bool(raw_continue)
+            task = {
+                "status": status,
+                "goal": goal,
+                "plan": plan,
+                "next_step": next_step,
+                "blocked_reason": blocked_reason,
+                "continue_on_heartbeat": continue_on_heartbeat,
+            }
 
         normalized: list[dict] = []
         raw_actions = parsed.get("actions")
@@ -2521,6 +2566,7 @@ class LlmReplyGenerator:
             "actions": normalized,
             "reply_hint": reply_hint,
             "send_reply": send_reply,
+            "task": task,
         }
 
     def heartbeat_person_impression_digest(

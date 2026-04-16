@@ -936,10 +936,20 @@ class WeChatGuiRpaBot:
                 lines.append(f"{prefix}:{text[:140]}")
         return " | ".join(lines)[:1600]
 
-    def _workspace_context_for_row(self, row: ChatRowState, *, is_admin: bool) -> str:
+    def _workspace_context_for_row(
+        self,
+        row: ChatRowState,
+        *,
+        is_admin: bool,
+        skill_query: str = "",
+    ) -> str:
         include_long_term = is_admin or (not self.cfg.workspace_memory_main_only)
         try:
-            return self._workspace.build_prompt_context(include_long_term=include_long_term)
+            query = re.sub(r"\s+", " ", str(skill_query or row.preview or row.title or "").strip())[:240]
+            return self._workspace.build_prompt_context(
+                include_long_term=include_long_term,
+                skill_query=query,
+            )
         except Exception as exc:
             if self.cfg.log_verbose:
                 print(f"[warn] workspace context load failed: {exc}")
@@ -1511,6 +1521,117 @@ class WeChatGuiRpaBot:
         if sess and sess.titles:
             return sorted(sess.titles, key=len)[-1]
         return key
+
+    def _normalize_agent_task_state(self, task: object) -> dict:
+        if not isinstance(task, dict):
+            return {}
+        status = re.sub(r"\s+", " ", str(task.get("status", "")).strip()).lower()[:24]
+        if status in {"", "idle"}:
+            return {}
+        if status not in {"running", "blocked", "waiting_user", "done"}:
+            status = "running"
+        normalized = {
+            "status": status,
+            "goal": re.sub(r"\s+", " ", str(task.get("goal", "")).strip())[:160],
+            "plan": re.sub(r"\s+", " ", str(task.get("plan", "")).strip())[:280],
+            "next_step": re.sub(r"\s+", " ", str(task.get("next_step", "")).strip())[:160],
+            "last_result": re.sub(r"\s+", " ", str(task.get("last_result", "")).strip())[:280],
+            "blocked_reason": re.sub(
+                r"\s+",
+                " ",
+                str(task.get("blocked_reason", "")).strip(),
+            )[:160],
+            "continue_on_heartbeat": bool(task.get("continue_on_heartbeat", False)),
+        }
+        if status != "running":
+            normalized["continue_on_heartbeat"] = False
+        return normalized
+
+    def _merge_agent_task_state(
+        self,
+        current: object,
+        planned: object,
+        *,
+        last_result: str = "",
+    ) -> dict:
+        merged = self._normalize_agent_task_state(current)
+        incoming = self._normalize_agent_task_state(planned)
+        if incoming:
+            merged.update({k: v for k, v in incoming.items() if v not in ("", None)})
+            merged["status"] = incoming.get("status", merged.get("status", "running"))
+            merged["continue_on_heartbeat"] = bool(incoming.get("continue_on_heartbeat", False))
+        if last_result:
+            merged["last_result"] = re.sub(r"\s+", " ", str(last_result).strip())[:280]
+        status = str(merged.get("status", "")).strip().lower()
+        if status in {"", "idle"}:
+            return {}
+        if status == "blocked" and (not merged.get("blocked_reason")) and last_result:
+            merged["blocked_reason"] = re.sub(r"\s+", " ", str(last_result).strip())[:160]
+        if status != "running":
+            merged["continue_on_heartbeat"] = False
+        return self._normalize_agent_task_state(merged)
+
+    def _format_agent_task_state_for_prompt(self, task: object) -> str:
+        state = self._normalize_agent_task_state(task)
+        if not state:
+            return ""
+        lines = [
+            f"status={state.get('status', '')}",
+            f"goal={state.get('goal', '') or '无'}",
+        ]
+        if state.get("plan"):
+            lines.append(f"plan={state['plan']}")
+        if state.get("next_step"):
+            lines.append(f"next_step={state['next_step']}")
+        if state.get("last_result"):
+            lines.append(f"last_result={state['last_result']}")
+        if state.get("blocked_reason"):
+            lines.append(f"blocked_reason={state['blocked_reason']}")
+        lines.append(
+            "continue_on_heartbeat="
+            + ("true" if bool(state.get("continue_on_heartbeat", False)) else "false")
+        )
+        return "\n".join(lines)
+
+    def _load_agent_task_state(self, *, session_key: str, title: str) -> dict:
+        return self._normalize_agent_task_state(
+            self._workspace.get_session_agent_task(session_key=session_key, title=title)
+        )
+
+    def _save_agent_task_state(self, *, session_key: str, title: str, task: object) -> dict:
+        normalized = self._normalize_agent_task_state(task)
+        saved = self._workspace.update_session_agent_task(
+            session_key=session_key,
+            title=title,
+            task=normalized,
+        )
+        return self._normalize_agent_task_state(saved)
+
+    def _virtual_session_row(
+        self,
+        *,
+        session_key: str,
+        title: str,
+        preview: str,
+        row_idx: int = -2,
+    ) -> ChatRowState:
+        title_text = (title or session_key or "__agent_task__").strip()[:80]
+        alias = self._title_key(title_text)
+        if alias and session_key:
+            self._remember_session_alias(alias, session_key)
+        if session_key and title_text:
+            self._remember_session_title(session_key, title_text)
+        return ChatRowState(
+            row_idx=row_idx,
+            text=preview[:80] or title_text,
+            title=title_text,
+            preview=preview[:80] or title_text,
+            has_mention=False,
+            has_unread_badge=False,
+            fingerprint=f"agent-task-{session_key or alias or int(time.time())}",
+            click_x_ratio=0.0,
+            click_y_ratio=0.0,
+        )
 
     def _resolve_session_key_by_query(self, query: str) -> str | None:
         q = (query or "").strip()
@@ -2174,9 +2295,9 @@ class WeChatGuiRpaBot:
         lookup_intent: bool,
         lookup_query: str,
         enforce_lookup_round1: bool,
-    ) -> tuple[str, str, int, bool]:
+    ) -> tuple[str, str, int, bool, dict]:
         if not tools:
-            return memory_recall, "", 0, True
+            return memory_recall, "", 0, True, {}
 
         rounds = 1
         if self.cfg.agent_plan_loop_enabled:
@@ -2193,6 +2314,8 @@ class WeChatGuiRpaBot:
         total_actions = 0
         final_hint = ""
         planner_send_reply = True
+        session_key = self._session_key_for_row(row)
+        task_state = self._load_agent_task_state(session_key=session_key, title=row.title)
 
         for round_idx in range(1, rounds + 1):
             remaining = total_limit - total_actions
@@ -2221,6 +2344,7 @@ class WeChatGuiRpaBot:
                     "memory_recall": merged_memory,
                     "available_tools": tools,
                     "max_actions": this_round_max,
+                    "agent_task_state": self._format_agent_task_state_for_prompt(task_state),
                     "planner_round_idx": round_idx,
                     "planner_round_total": rounds,
                     "planner_total_actions_limit": total_limit,
@@ -2250,6 +2374,11 @@ class WeChatGuiRpaBot:
                     send_reply_now = bool(raw_send_reply)
                 planner_send_reply = send_reply_now
                 raw_hint = str(plan.get("reply_hint", "")).strip() if isinstance(plan, dict) else ""
+                planned_task = {}
+                if isinstance(plan, dict):
+                    planned_task = self._normalize_agent_task_state(plan.get("task"))
+                    if planned_task:
+                        task_state = self._merge_agent_task_state(task_state, planned_task)
                 hint = self._normalize_planner_reply_hint(
                     raw_hint,
                     reason=reason,
@@ -2356,6 +2485,11 @@ class WeChatGuiRpaBot:
                         continue
                     filtered_actions.append(action)
                 if not filtered_actions:
+                    task_state = self._save_agent_task_state(
+                        session_key=session_key,
+                        title=row.title,
+                        task=task_state,
+                    )
                     if self.cfg.log_verbose:
                         print(
                             f"[agent-plan] round={round_idx:>2}/{rounds:<2} "
@@ -2392,7 +2526,28 @@ class WeChatGuiRpaBot:
                     merged_memory = (
                         f"{base_memory}\n\n[工具执行结果]\n{observed}".strip()
                     )[:obs_limit]
+                    task_state = self._merge_agent_task_state(
+                        task_state,
+                        planned_task,
+                        last_result=observations,
+                    )
+                    task_state = self._save_agent_task_state(
+                        session_key=session_key,
+                        title=row.title,
+                        task=task_state,
+                    )
                 else:
+                    if trace:
+                        task_state = self._merge_agent_task_state(
+                            task_state,
+                            planned_task,
+                            last_result=trace,
+                        )
+                        task_state = self._save_agent_task_state(
+                            session_key=session_key,
+                            title=row.title,
+                            task=task_state,
+                        )
                     if self.cfg.log_verbose:
                         print(
                             f"[agent-plan] round={round_idx:>2}/{rounds:<2} "
@@ -2461,6 +2616,16 @@ class WeChatGuiRpaBot:
                             merged_memory = (
                                 f"{base_memory}\n\n[工具执行结果]\n{observed}".strip()
                             )[:obs_limit]
+                            task_state = self._merge_agent_task_state(
+                                task_state,
+                                {"status": "running"},
+                                last_result=observations,
+                            )
+                            task_state = self._save_agent_task_state(
+                                session_key=session_key,
+                                title=row.title,
+                                task=task_state,
+                            )
                 break
 
         planned_reply = ""
@@ -2512,7 +2677,12 @@ class WeChatGuiRpaBot:
             planned_reply = self._sanitize_generated_reply(final_hint, fallback=fallback)
         if not planner_send_reply:
             planned_reply = ""
-        return merged_memory, planned_reply, total_actions, planner_send_reply
+        task_state = self._save_agent_task_state(
+            session_key=session_key,
+            title=row.title,
+            task=task_state,
+        )
+        return merged_memory, planned_reply, total_actions, planner_send_reply, task_state
 
     @staticmethod
     def _clean_web_query(query: str) -> str:
@@ -3988,7 +4158,6 @@ class WeChatGuiRpaBot:
         for name, llm in (
             ("heartbeat", self.llm_heartbeat),
             ("summary", self.llm_summary),
-            ("reply", self.llm_reply),
         ):
             if not llm.is_enabled():
                 continue
@@ -4291,6 +4460,107 @@ class WeChatGuiRpaBot:
             click_y_ratio=0.0,
         )
 
+    def _run_heartbeat_pending_agent_task(self, now: float, rows: list[ChatRowState]) -> bool:
+        pending = self._workspace.list_pending_agent_tasks(limit=1)
+        if not pending:
+            return False
+        candidate = pending[0]
+        session_key = str(candidate.get("session_key", "")).strip()
+        title = str(candidate.get("title", "")).strip() or session_key or "__agent_task__"
+        task = self._normalize_agent_task_state(candidate.get("task"))
+        if not session_key or not task:
+            return False
+
+        row = self._virtual_session_row(
+            session_key=session_key,
+            title=title,
+            preview=str(task.get("next_step", "") or task.get("goal", "") or "agent task"),
+            row_idx=-3,
+        )
+        for item in rows:
+            if self._session_key_for_row(item, remember=False) == session_key:
+                row = item
+                break
+
+        is_admin = self._is_admin_session(row)
+        tools = self._available_agent_tools(is_admin=is_admin)
+        if row.row_idx < 0:
+            tools = [name for name in tools if name != "generate_image"]
+        if not tools:
+            return False
+
+        task_seed = (
+            str(task.get("next_step", "")).strip()
+            or str(task.get("goal", "")).strip()
+            or str(task.get("last_result", "")).strip()
+            or "继续处理未完成任务"
+        )[:120]
+        chat_context = self._build_session_history_text(row)
+        session_context = self._build_session_context(row)
+        workspace_context = self._workspace_context_for_row(
+            row,
+            is_admin=is_admin,
+            skill_query=task_seed,
+        )
+        memory_recall = self._workspace_memory_recall_for_row(
+            row,
+            task_seed,
+            is_admin=is_admin,
+        )
+        now_text = datetime.fromtimestamp(now).strftime("%Y-%m-%d %H:%M:%S")
+        environment_context = (
+            "[heartbeat_resume]\n"
+            f"继续会话中的未完成任务，不要重新起题。\n"
+            f"当前时间: {now_text}\n"
+            f"会话: {title}\n"
+            f"任务状态:\n{self._format_agent_task_state_for_prompt(task) or '无'}"
+        )[:2200]
+        status_before = str(task.get("status", "")).strip() or "running"
+        memory_recall, _, action_count, _, task_after = self._run_agent_planner_loop(
+            planner=self.llm_heartbeat,
+            row=row,
+            reason="heartbeat_task",
+            is_group=self._is_group_chat(row),
+            is_admin=is_admin,
+            latest_message=task_seed,
+            chat_context=chat_context,
+            environment_context=environment_context,
+            session_context=session_context,
+            workspace_context=workspace_context,
+            memory_recall=memory_recall,
+            tools=tools,
+            per_round_max_actions=(
+                self.cfg.heartbeat_max_actions
+                if int(self.cfg.heartbeat_max_actions) > 0
+                else 999
+            ),
+            lookup_intent=self._is_web_lookup_intent(task_seed),
+            lookup_query=task_seed[:80],
+            enforce_lookup_round1=False,
+        )
+        status_after = str(task_after.get("status", "")).strip() or "idle"
+        if self.cfg.log_verbose:
+            print(
+                f"[heartbeat] resume session={self._fit_col(title, 14)} "
+                f"status={status_before}->{status_after} actions={action_count:>2}"
+            )
+        marker = "[工具执行结果]"
+        observations = ""
+        if marker in memory_recall:
+            observations = memory_recall.split(marker, 1)[1].strip()[:1800]
+        if observations:
+            self._append_session_record(
+                row,
+                role="assistant",
+                text=f"[heartbeat] {observations}",
+                content_type="text",
+                sender="",
+                source="heartbeat",
+                count_turn=False,
+            )
+        self._memory_dirty = True
+        return action_count > 0 or status_after != status_before
+
     def _available_heartbeat_tools(self) -> list[str]:
         tools = [
             "remember_session_fact",
@@ -4318,6 +4588,9 @@ class WeChatGuiRpaBot:
         if not self.cfg.agent_actions_enabled:
             return False
 
+        if self._run_heartbeat_pending_agent_task(now, rows):
+            return True
+
         tasks_text = self._load_heartbeat_tasks()
         if not tasks_text:
             if self.cfg.log_verbose:
@@ -4338,7 +4611,11 @@ class WeChatGuiRpaBot:
         is_admin = bool(self.cfg.admin_commands_enabled)
         session_context = self._build_session_context(row)
         chat_context = self._build_session_history_text(row)
-        workspace_context = self._workspace_context_for_row(row, is_admin=is_admin)
+        workspace_context = self._workspace_context_for_row(
+            row,
+            is_admin=is_admin,
+            skill_query=tasks_text,
+        )
         memory_recall = self._workspace_memory_recall_for_row(
             row,
             tasks_text,
@@ -4385,7 +4662,7 @@ class WeChatGuiRpaBot:
 
         lookup_seed = tasks_text.split("\n", 1)[0][:80]
         lookup_intent = self._is_web_lookup_intent(tasks_text)
-        memory_recall, _, action_count, _ = self._run_agent_planner_loop(
+        memory_recall, _, action_count, _, task_state = self._run_agent_planner_loop(
             planner=self.llm_heartbeat,
             row=row,
             reason="heartbeat",
@@ -4407,7 +4684,7 @@ class WeChatGuiRpaBot:
             lookup_query=lookup_seed,
             enforce_lookup_round1=False,
         )
-        if action_count <= 0:
+        if action_count <= 0 and not task_state:
             if self.cfg.log_verbose:
                 print("[heartbeat] no actions planned")
             return False
@@ -6010,7 +6287,11 @@ class WeChatGuiRpaBot:
 
         session_context = self._build_session_context(row)
         session_history = self._build_session_history_text(row)
-        workspace_context = self._workspace_context_for_row(row, is_admin=False)
+        workspace_context = self._workspace_context_for_row(
+            row,
+            is_admin=False,
+            skill_query=title or session_key,
+        )
         memory_recall = self._workspace_memory_recall_for_row(
             row,
             title or session_key,
@@ -6427,6 +6708,7 @@ class WeChatGuiRpaBot:
                 workspace_context = self._workspace_context_for_row(
                     row,
                     is_admin=is_admin,
+                    skill_query=row.preview or row.text or row.title,
                 )
                 memory_recall = self._workspace_memory_recall_for_row(
                     row,
@@ -6606,7 +6888,7 @@ class WeChatGuiRpaBot:
                     if self.cfg.agent_actions_enabled:
                         tools = self._available_agent_tools(is_admin=is_admin)
                         if tools:
-                            memory_recall, planner_hint, _, planner_send_reply = self._run_agent_planner_loop(
+                            memory_recall, planner_hint, _, planner_send_reply, _ = self._run_agent_planner_loop(
                                 planner=self.llm_planner,
                                 row=row,
                                 reason=follow_reason,
