@@ -4,13 +4,13 @@
 
 ## 1. 读取规则
 
-- 默认值来自 `AppConfig` / `LlmConfig` / `VisionConfig` / `EmbeddingConfig` / `RerankConfig` / `ImageGenerationConfig`。
+- 默认值来自 `AppConfig` / `LlmConfig` / `VisionConfig` / `EmbeddingConfig` / `RerankConfig` / `ImageGenerationConfig` / `ImageEditingConfig`。
 - `config.toml` 只覆盖你显式填写的项。
 - `config.toml.example` 是一份“可运行示例”，其值不等于代码默认值。
 
 关键回退规则：
 
-- `llm/vision/embedding/rerank/image_generation` 的 `base_url` 为空时，会尝试读取 `base_url_env` 指向的环境变量。
+- `llm/vision/embedding/rerank/image_generation/image_editing` 的 `base_url` 为空时，会尝试读取 `base_url_env` 指向的环境变量。
 - `vision.base_url/api_key/model` 为空时，会回退到 `llm` 对应字段。
 - `llm_reply/llm_decision/llm_planner/llm_summary/llm_heartbeat` 会在未填写字段时继承 `[llm]`。
 
@@ -76,6 +76,10 @@
 | `workspace_memory_sqlite_fts_limit` | `64` | FTS 召回上限 |
 | `workspace_memory_sqlite_vector_limit` | `24` | embedding 加权候选上限 |
 | `workspace_memory_sqlite_chunk_chars` | `320` | 索引切块长度 |
+| `people_aliases_enabled` | `true` | 是否启用人物别名硬映射 |
+| `people_aliases_path` | `agent_workspace/PEOPLE_ALIASES.md` | 标准名到昵称的映射文件 |
+
+`people_aliases_path` 使用 `标准名 -> 别名1, 别名2`，支持 `*cong`、`cong*`、`*cong*` 通配。开启后，OCR 识别出的发送者昵称会先转成标准名，再进入聊天记录、回复上下文、心跳和人物印象；原始昵称会保存在 `sender_raw` 便于排查。
 
 ### 3.3 管理命令与 Agent 动作
 
@@ -96,9 +100,10 @@
 
 普通消息 planner 的常用内置工具（当前实现）：
 
-- 记忆类：`remember_session_fact` / `remember_session_event` / `set_session_summary` / `search_memory`
+- 记忆类：`remember_session_fact` / `remember_session_event` / `set_session_summary` / `search_memory` / `read_impression` / `read_chat_history`
+- 计算类：`run_python`（短数学/统计/日期计算沙盒）
 - 工作区文件类（需 `workspace_enabled=true`）：`workspace_list_files` / `workspace_read_file` / `workspace_write_file`
-- 可选联网/生图：`web_search` / `web_search_volc` / `generate_image`（按配置可用性动态暴露）
+- 可选联网/图像：`web_search` / `web_search_volc` / `generate_image` / `edit_image`（按配置可用性动态暴露）
 
 管理员命令（当前实现）：
 
@@ -145,16 +150,15 @@
 | Key | 默认值 | 说明 |
 |---|---:|---|
 | `heartbeat_enabled` | `false` | 心跳开关 |
-| `heartbeat_interval_sec` | `1800.0` | 心跳间隔 |
+| `heartbeat_interval_sec` | `300.0` | 心跳间隔 |
 | `heartbeat_min_idle_sec` | `20.0` | 最小空闲时间 |
-| `heartbeat_max_actions` | `2` | 单次最多动作数 |
+| `heartbeat_max_actions` | `4` | 单次最多内部动作数 |
 | `heartbeat_fail_open` | `true` | 心跳失败是否不中断主循环 |
 | `heartbeat_prompt` | 内置提示词 | 心跳规划提示词 |
 
-`HEARTBEAT.md` 支持两类执行：
+心跳采用 wx-cli 风格短链路：读取近期聊天活动，维护 `data/memory/core.md`、`data/memory/timeline.md` 和 `data/people/*.md`。
 
-- 直接指令解析：`maintain_memory` / `refine_persona_files`
-- 未命中直接指令时：LLM 规划动作
+可用内部工具固定为 `read_impression`、`write_impression`、`write_memory`。心跳最多跑两轮，用于先读取人物印象再写回；不再依赖 `HEARTBEAT.md` 的旧直接指令。
 
 ### 3.6 回复策略与检测
 
@@ -291,9 +295,10 @@
 | Key | 默认值 | 说明 |
 |---|---:|---|
 | `enabled` | `false` | planner 工具 `generate_image` 开关 |
-| `base_url/base_url_env` | `https://api.siliconflow.cn/v1` / `SILICONFLOW_BASE_URL` | OpenAI 兼容 `images/generations` 地址 |
-| `api_key/api_key_env` | `""` / `SILICONFLOW_API_KEY` | 鉴权 |
-| `model` | `black-forest-labs/FLUX.1-dev` | 生图模型 |
+| `provider` | `dashscope_z_image` | 生图 provider；支持 `dashscope_z_image` / `openai_compat` |
+| `base_url/base_url_env` | `https://dashscope.aliyuncs.com/api/v1/services/aigc` / `DASHSCOPE_BASE_URL` | 百炼 AIGC 地址；`openai_compat` 可改为兼容 `images/generations` 地址 |
+| `api_key/api_key_env` | `""` / `DASHSCOPE_API_KEY` | 鉴权 |
+| `model` | `z-image-turbo` | 生图模型 |
 | `timeout_sec` | `90.0` | 生成请求超时 |
 | `download_timeout_sec` | `45.0` | 下载图片超时 |
 | `default_size` | `1024x1024` | 默认尺寸 |
@@ -304,6 +309,21 @@
 - 工具可用条件：`enabled=true` 且 `base_url/model/api_key` 可解析。
 - 该工具会先生成图片，再下载到本地，然后按“文件消息”发送到微信会话。
 - 生成历史会追加到 `output_dir/history.jsonl`（每行一条 JSON，含文件名、prompt、size、seed、时间戳）。
+
+### 8.1 `[image_editing]` 配置
+
+| Key | 默认值 | 说明 |
+|---|---:|---|
+| `enabled` | `false` | planner 工具 `edit_image` 开关 |
+| `provider` | `dashscope_qwen_image_edit` | 图片编辑 provider |
+| `base_url/base_url_env` | `https://dashscope.aliyuncs.com/api/v1/services/aigc` / `DASHSCOPE_BASE_URL` | 百炼 AIGC 地址 |
+| `api_key/api_key_env` | `""` / `DASHSCOPE_API_KEY` | 鉴权 |
+| `model` | `qwen-image-2.0-pro` | 图片编辑模型 |
+| `default_size` | `""` | 默认输出尺寸；空表示交给 provider |
+| `output_dir` | `data/edited_images` | 本地落盘目录 |
+| `max_input_bytes` | `10485760` | 输入图最大字节数 |
+
+`edit_image` 可使用 planner 明确传入的 `image_path/image_url`；若省略，会尝试使用当前会话最近收到的图片。
 
 ## 9. `[embedding]` 与 `[rerank]`
 
@@ -323,6 +343,7 @@
 ## 10. 常用环境变量
 
 - `OPENAI_API_KEY`、`OPENAI_BASE_URL`
+- `DASHSCOPE_API_KEY`、`DASHSCOPE_BASE_URL`
 - `SILICONFLOW_API_KEY`、`SILICONFLOW_BASE_URL`
 - `TAVILY_API_KEY`
 - `BRAVE_SEARCH_API_KEY`

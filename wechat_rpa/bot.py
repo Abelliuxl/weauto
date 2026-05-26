@@ -1,13 +1,11 @@
 from __future__ import annotations
 
 from collections import defaultdict
-import base64
 import concurrent.futures
 from dataclasses import dataclass
 from datetime import datetime
 from difflib import SequenceMatcher
 import builtins
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -24,12 +22,23 @@ import urllib.request
 
 import numpy as np
 import pyautogui
-import pyperclip
+from PIL import Image
 
+from .action_processor import ActionProcessor
+from .agent_store import MemoryStore, PeopleStore
 from .config import AppConfig
 from .detector import ChatRowState, detect_chat_rows
+from .detached_window_receiver import capture_window_by_id, list_detached_wechat_windows, safe_window_name
+from .heartbeat import HeartbeatRunner
+from .image_editing import ImageEditingError, ImageEditor
+from .image_generation import ImageGenerationError, ImageGenerator
 from .llm import LlmReplyGenerator, prepare_terminal_for_log_line
+from .message_handler import MessageHandler
 from .ocr import OcrEngine
+from .people_aliases import PersonAliasResolver
+from .sender import WeChatGuiSender
+from .visible_message_parser import VisibleMessageParser
+from .visible_message_state import VisibleMessageStateStore
 from .workspace_context import WorkspaceContextManager
 from .window import WindowNotFoundError, get_front_window_bounds, screenshot_region
 
@@ -174,9 +183,27 @@ class WeChatGuiRpaBot:
         self.llm_summary = LlmReplyGenerator(cfg.llm_summary, cfg.vision)
         self.llm_heartbeat = LlmReplyGenerator(cfg.llm_heartbeat, cfg.vision)
         self.llm = self.llm_reply
+        self.image_generator = ImageGenerator(cfg.image_generation)
+        self.image_editor = ImageEditor(cfg.image_editing)
+        self.agent_memory = MemoryStore("data/memory")
+        self.agent_people = PeopleStore("data/people")
+        self.agent_people.cleanup()
+        self.people_alias_resolver = PersonAliasResolver(
+            cfg.people_aliases_path,
+            enabled=cfg.people_aliases_enabled,
+        )
+        self.sender = WeChatGuiSender(cfg)
+        self.heartbeat = HeartbeatRunner(self)
+        self.action_processor = ActionProcessor(self)
+        self.message_handler = MessageHandler(self)
+        self.visible_message_parser = VisibleMessageParser(self.ocr_engine)
+        self.visible_message_state = VisibleMessageStateStore()
+        self._detached_bootstrapped = False
         self._baseline: dict[int, RowMemory] = {}
         # title_key -> (normalized_sent_text, sent_ts)
         self._sent_by_title: dict[str, tuple[str, float]] = {}
+        self._latest_image_by_session: dict[str, str] = {}
+        self._image_vision_by_path: dict[str, str] = {}
         self._sessions: dict[str, SessionState] = {}
         self._session_aliases: dict[str, str] = {}
         self._summary_turn_counter: dict[str, int] = defaultdict(int)
@@ -353,6 +380,21 @@ class WeChatGuiRpaBot:
         t = self._normalize_session_title_token(title)
         return t[:24]
 
+    def _resolve_person_name(self, name: str) -> str:
+        if not bool(self.cfg.people_aliases_enabled):
+            return str(name or "").strip()[:40]
+        return self.people_alias_resolver.resolve(str(name or ""))
+
+    def _canonicalize_sender_pair(self, sender: str) -> tuple[str, str]:
+        raw = str(sender or "").strip()
+        if not raw:
+            return "", ""
+        canonical = self._resolve_person_name(raw)
+        if not canonical:
+            return "", raw[:40]
+        raw_out = raw[:40] if raw != canonical else ""
+        return canonical[:40], raw_out
+
     def _memory_session_relpath(self, key: str) -> str:
         slug = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff_-]+", "-", key or "").strip("-").lower()
         return f"{self._memory_path.stem}.sessions/{(slug[:80] or 'session')}.json"
@@ -384,12 +426,16 @@ class WeChatGuiRpaBot:
                 text = re.sub(r"\s+", " ", str(item.get("text", ""))).strip()
                 if not text:
                     continue
+                sender, sender_raw = self._canonicalize_sender_pair(str(item.get("sender", "")))
+                if not sender_raw:
+                    sender_raw = str(item.get("sender_raw", "")).strip()[:40]
                 history_items.append(
                     {
                         "role": str(item.get("role", "unknown")).strip().lower(),
                         "content_type": str(item.get("content_type", "unknown")).strip().lower(),
                         "text": text[:220],
-                        "sender": str(item.get("sender", "")).strip()[:40],
+                        "sender": sender,
+                        "sender_raw": sender_raw,
                         "source": str(item.get("source", "memory")).strip()[:20],
                         "observed_at": int(item.get("observed_at", 0) or 0),
                     }
@@ -628,14 +674,22 @@ class WeChatGuiRpaBot:
         norm_role = role_map.get(role, "unknown")
         key = self._session_key_for_row(row)
         sess = self._get_or_create_session(key)
+        sender_clean = (sender or "").strip()
+        sender_raw = ""
+        if norm_role == "user":
+            sender_clean, sender_raw = self._canonicalize_sender_pair(sender_clean)
+        else:
+            sender_clean = sender_clean[:40]
         record = {
             "role": norm_role,
             "content_type": (content_type or "text").strip().lower() or "text",
             "text": clean[:220],
-            "sender": (sender or "").strip()[:40],
+            "sender": sender_clean,
             "source": (source or "runtime").strip()[:20],
             "observed_at": int(time.time()),
         }
+        if sender_raw:
+            record["sender_raw"] = sender_raw
         record_key = self._session_record_key(record)
         if sess.history and self._session_record_key(sess.history[-1]) == record_key:
             return
@@ -646,7 +700,7 @@ class WeChatGuiRpaBot:
             del sess.history[:-hist_limit]
 
         short_role = "A" if norm_role == "assistant" else ("U" if norm_role == "user" else "?")
-        short_sender = (sender or "").strip()[:24]
+        short_sender = sender_clean[:24]
         if norm_role == "user" and short_sender:
             item = f"{short_role}({short_sender}):{clean[:128]}"
         else:
@@ -666,7 +720,7 @@ class WeChatGuiRpaBot:
                 title=row.title,
                 role=norm_role,
                 text=clean,
-                sender=(sender or "").strip(),
+                sender=sender_clean,
             )
             self._workspace.remember_structured(
                 session_key=key,
@@ -710,12 +764,16 @@ class WeChatGuiRpaBot:
             text = str(record.get("text", "")).strip()
             if not text:
                 continue
+            sender_clean, sender_raw = self._canonicalize_sender_pair(str(record.get("sender", "")))
+            if not sender_raw:
+                sender_raw = str(record.get("sender_raw", "")).strip()[:40]
             incoming.append(
                 {
                     "role": str(record.get("role", "unknown")).strip().lower(),
                     "content_type": str(record.get("content_type", "unknown")).strip().lower(),
                     "text": text[:220],
-                    "sender": str(record.get("sender", "")).strip()[:40],
+                    "sender": sender_clean,
+                    "sender_raw": sender_raw,
                     "source": source,
                 }
             )
@@ -918,10 +976,10 @@ class WeChatGuiRpaBot:
             return f"[长期摘要]{long_text}"[:1200]
         return short_text[:1200]
 
-    def _build_session_history_text(self, row: ChatRowState) -> str:
+    def _build_session_history_text(self, row: ChatRowState, *, max_items: int | None = None) -> str:
         key = self._session_key_for_row(row)
         sess = self._get_or_create_session(key)
-        limit = max(4, int(self.cfg.memory_history_context_items))
+        limit = max(1, int(max_items)) if max_items is not None else max(4, int(self.cfg.memory_history_context_items))
         lines: list[str] = []
         for item in sess.history[-limit:]:
             role = str(item.get("role", "unknown"))
@@ -1761,6 +1819,9 @@ class WeChatGuiRpaBot:
             "remember_session_event",
             "set_session_summary",
             "search_memory",
+            "read_impression",
+            "read_chat_history",
+            "run_python",
         ]
         if self.cfg.person_impression_enabled:
             tools.append("search_person_impression")
@@ -1774,6 +1835,8 @@ class WeChatGuiRpaBot:
             )
         if self._has_image_generation_tool():
             tools.append("generate_image")
+        if self._has_image_editing_tool():
+            tools.append("edit_image")
         # Keep planner whitelist aligned with runtime capability checks:
         # expose each search tool independently when it is actually usable.
         if self._has_volc_web_search_tool():
@@ -1828,12 +1891,7 @@ class WeChatGuiRpaBot:
         return os.getenv(env_name, "")
 
     def _resolve_image_generation_api_key(self) -> str:
-        if self.cfg.image_generation.api_key:
-            return self.cfg.image_generation.api_key
-        env_name = (self.cfg.image_generation.api_key_env or "").strip()
-        if not env_name:
-            return ""
-        return os.getenv(env_name, "")
+        return self.image_generator.resolve_api_key()
 
     def _resolve_web_search_api_key(self, provider: str) -> str:
         if provider == "volc_ark":
@@ -1908,38 +1966,33 @@ class WeChatGuiRpaBot:
         return bool(self._resolve_volc_ark_api_key())
 
     def _image_generation_key_hint(self) -> str:
-        env_name = (self.cfg.image_generation.api_key_env or "").strip()
-        return (
-            f"config.image_generation.api_key or env {env_name}"
-            if env_name
-            else "config.image_generation.api_key"
-        )
+        return self.image_generator.key_hint()
 
     def _has_image_generation_tool(self) -> bool:
-        if not bool(self.cfg.image_generation.enabled):
-            return False
-        if not str(self.cfg.image_generation.base_url or "").strip():
-            return False
-        if not str(self.cfg.image_generation.model or "").strip():
-            return False
-        return bool(self._resolve_image_generation_api_key())
+        return self.image_generator.is_available()
 
     def _image_generation_status_text(self) -> str:
-        if not bool(self.cfg.image_generation.enabled):
-            return "disabled (tool=generate_image image_generation.enabled=false)"
-        if not str(self.cfg.image_generation.base_url or "").strip():
-            return "blocked (tool=generate_image missing base_url)"
-        if not str(self.cfg.image_generation.model or "").strip():
-            return "blocked (tool=generate_image missing model)"
-        if not self._resolve_image_generation_api_key():
-            return (
-                "blocked (tool=generate_image missing api key: "
-                f"{self._image_generation_key_hint()})"
-            )
-        return (
-            "available (tool=generate_image "
-            f"model={self.cfg.image_generation.model} "
-            f"default_size={self.cfg.image_generation.default_size})"
+        return f"{self.image_generator.status_text()} (tool=generate_image)"
+
+    def _has_image_editing_tool(self) -> bool:
+        return self.image_editor.is_available()
+
+    def _image_editing_status_text(self) -> str:
+        return f"{self.image_editor.status_text()} (tool=edit_image)"
+
+    def _generate_edited_image_file(
+        self,
+        *,
+        prompt: str,
+        image_path: str = "",
+        image_url: str = "",
+        size: str = "",
+    ) -> Path:
+        return self.image_editor.edit_file(
+            prompt=prompt,
+            image_path=image_path,
+            image_url=image_url,
+            size=size,
         )
 
     def _volc_web_search_status_text(self) -> str:
@@ -2295,6 +2348,8 @@ class WeChatGuiRpaBot:
         lookup_intent: bool,
         lookup_query: str,
         enforce_lookup_round1: bool,
+        max_rounds_override: int | None = None,
+        max_total_actions_override: int | None = None,
     ) -> tuple[str, str, int, bool, dict]:
         if not tools:
             return memory_recall, "", 0, True, {}
@@ -2302,8 +2357,12 @@ class WeChatGuiRpaBot:
         rounds = 1
         if self.cfg.agent_plan_loop_enabled:
             rounds = max(1, int(self.cfg.agent_plan_max_rounds))
+        if max_rounds_override is not None:
+            rounds = max(1, min(rounds, int(max_rounds_override)))
         per_round_limit = max(1, int(per_round_max_actions))
         total_limit = max(per_round_limit, int(self.cfg.agent_plan_max_total_actions))
+        if max_total_actions_override is not None:
+            total_limit = max(1, min(total_limit, int(max_total_actions_override)))
         repeat_limit = max(1, int(self.cfg.agent_plan_repeat_limit))
         obs_limit = max(1200, int(self.cfg.agent_plan_observation_max_chars))
 
@@ -2860,328 +2919,41 @@ class WeChatGuiRpaBot:
 
     @staticmethod
     def _clean_image_prompt(raw: object, *, limit: int = 280) -> str:
-        return re.sub(r"\s+", " ", str(raw or "")).strip()[:limit]
+        return ImageGenerator.clean_prompt(raw, limit=limit)
 
     def _normalize_image_size(self, raw: object) -> str:
-        value = re.sub(
-            r"\s+",
-            "",
-            str(raw or self.cfg.image_generation.default_size).strip().lower(),
-        )
-        if not re.fullmatch(r"\d{2,4}x\d{2,4}", value):
-            return self.cfg.image_generation.default_size
-        try:
-            width_txt, height_txt = value.split("x", 1)
-            width = int(width_txt)
-            height = int(height_txt)
-        except Exception:
-            return self.cfg.image_generation.default_size
-        if width < 256 or height < 256 or width > 2048 or height > 2048:
-            return self.cfg.image_generation.default_size
-        return f"{width}x{height}"
-
-    @staticmethod
-    def _dashscope_image_size(size: str) -> str:
-        clean = re.sub(r"\s+", "", str(size or "")).lower()
-        if re.fullmatch(r"\d{2,4}x\d{2,4}", clean):
-            width_txt, height_txt = clean.split("x", 1)
-            return f"{int(width_txt)}*{int(height_txt)}"
-        return "1024*1024"
-
-    @staticmethod
-    def _guess_image_suffix(url_text: str, content_type: str = "") -> str:
-        parsed = urllib.parse.urlparse(str(url_text or ""))
-        ext = Path(parsed.path).suffix.lower()
-        if ext in (".png", ".jpg", ".jpeg", ".webp", ".gif"):
-            return ext
-        clean_type = str(content_type or "").lower()
-        if "webp" in clean_type:
-            return ".webp"
-        if "jpeg" in clean_type or "jpg" in clean_type:
-            return ".jpg"
-        if "gif" in clean_type:
-            return ".gif"
-        return ".png"
-
-    def _next_image_output_path(self, output_dir: Path, *, prompt: str, suffix: str) -> Path:
-        digest = hashlib.sha1(prompt.encode("utf-8")).hexdigest()[:10]
-        now = time.time()
-        stamp = time.strftime("%Y%m%d_%H%M%S", time.localtime(now))
-        millis = int((now - int(now)) * 1000)
-        nonce = hashlib.sha1(f"{time.time_ns()}|{os.getpid()}".encode("utf-8")).hexdigest()[:6]
-        base = f"image_{stamp}_{millis:03d}_{digest}_{nonce}"
-        out = output_dir / f"{base}{suffix}"
-        idx = 1
-        while out.exists():
-            out = output_dir / f"{base}_{idx}{suffix}"
-            idx += 1
-        return out
-
-    def _append_generated_image_history(
-        self,
-        *,
-        output_dir: Path,
-        file_path: Path,
-        prompt: str,
-        size: str,
-        model: str,
-        seed: int | None = None,
-    ) -> None:
-        history_path = output_dir / "history.jsonl"
-        payload = {
-            "ts": int(time.time()),
-            "file": str(file_path),
-            "name": file_path.name,
-            "size_bytes": int(file_path.stat().st_size),
-            "model": str(model or "").strip(),
-            "size": str(size or "").strip(),
-            "seed": seed,
-            "prompt": str(prompt or "").strip(),
-        }
-        try:
-            with history_path.open("a", encoding="utf-8") as fp:
-                fp.write(json.dumps(payload, ensure_ascii=False) + "\n")
-        except Exception:
-            if self.cfg.log_verbose:
-                print(f"[warn] image history append failed: {history_path}")
-
-    def _download_generated_image_bytes(
-        self,
-        *,
-        image_url: str,
-        b64_json: str,
-        cfg,
-    ) -> tuple[bytes, str]:
-        image_bytes = b""
-        suffix = ".png"
-        if image_url:
-            image_req = urllib.request.Request(
-                url=image_url,
-                method="GET",
-                headers={"User-Agent": "weauto-image-downloader/1.0"},
-            )
-            try:
-                ssl_ctx = ssl.create_default_context()
-                with urllib.request.urlopen(
-                    image_req,
-                    timeout=max(5.0, float(cfg.download_timeout_sec)),
-                    context=ssl_ctx,
-                ) as resp:
-                    image_bytes = resp.read()
-                    content_type = str(resp.headers.get("Content-Type", "")).strip()
-                    suffix = self._guess_image_suffix(image_url, content_type)
-            except Exception as exc:
-                if not b64_json:
-                    raise RuntimeError(f"image download failed: {exc}") from exc
-
-        if (not image_bytes) and b64_json:
-            try:
-                image_bytes = base64.b64decode(b64_json, validate=True)
-            except Exception as exc:
-                raise RuntimeError(f"image decode failed: {exc}") from exc
-            suffix = ".png"
-        return image_bytes, suffix
-
-    def _generate_image_file_openai_compat(
-        self,
-        *,
-        cfg,
-        api_key: str,
-        clean_prompt: str,
-        requested_size: str,
-    ) -> tuple[bytes, str, int | None]:
-        base_url = str(cfg.base_url or "").rstrip("/")
-        endpoint = (
-            base_url if base_url.endswith("/images/generations") else f"{base_url}/images/generations"
-        )
-        request_payload = {
-            "model": str(cfg.model or "").strip(),
-            "prompt": clean_prompt,
-            "size": requested_size,
-            "n": 1,
-        }
-        req = urllib.request.Request(
-            url=endpoint,
-            data=json.dumps(request_payload).encode("utf-8"),
-            method="POST",
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {api_key}",
-            },
-        )
-        try:
-            ssl_ctx = ssl.create_default_context()
-            with urllib.request.urlopen(
-                req,
-                timeout=max(5.0, float(cfg.timeout_sec)),
-                context=ssl_ctx,
-            ) as resp:
-                raw = resp.read().decode("utf-8", errors="replace")
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
-            compact = self._compact_web_text(detail, limit=260)
-            raise RuntimeError(f"image generation http error: {exc.code} {compact}") from exc
-        except urllib.error.URLError as exc:
-            raise RuntimeError(f"image generation network error: {exc}") from exc
-
-        try:
-            data = json.loads(raw)
-        except Exception as exc:
-            raise RuntimeError("image generation response is not valid json") from exc
-
-        candidates = data.get("images")
-        if not isinstance(candidates, list) or not candidates:
-            candidates = data.get("data")
-        if not isinstance(candidates, list) or not candidates:
-            raise RuntimeError("image generation response missing images/data")
-        first = candidates[0] if isinstance(candidates[0], dict) else {}
-        if not isinstance(first, dict):
-            raise RuntimeError("image generation response item invalid")
-
-        image_url = str(first.get("url", "")).strip()
-        b64_json = str(first.get("b64_json", "")).strip()
-        image_bytes, suffix = self._download_generated_image_bytes(
-            image_url=image_url,
-            b64_json=b64_json,
-            cfg=cfg,
-        )
-        try:
-            seed = int(data.get("seed")) if data.get("seed") is not None else None
-        except Exception:
-            seed = None
-        return image_bytes, suffix, seed
-
-    def _generate_image_file_dashscope(
-        self,
-        *,
-        cfg,
-        api_key: str,
-        clean_prompt: str,
-        requested_size: str,
-    ) -> tuple[bytes, str, int | None]:
-        base_url = str(cfg.base_url or "").rstrip("/")
-        endpoint = (
-            base_url
-            if base_url.endswith("/multimodal-generation/generation")
-            else f"{base_url}/multimodal-generation/generation"
-        )
-        request_payload = {
-            "model": str(cfg.model or "").strip(),
-            "input": {
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": [{"text": clean_prompt}],
-                    }
-                ]
-            },
-            "parameters": {
-                "size": self._dashscope_image_size(requested_size),
-                "prompt_extend": False,
-            },
-        }
-        req = urllib.request.Request(
-            url=endpoint,
-            data=json.dumps(request_payload).encode("utf-8"),
-            method="POST",
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {api_key}",
-            },
-        )
-        try:
-            ssl_ctx = ssl.create_default_context()
-            with urllib.request.urlopen(
-                req,
-                timeout=max(5.0, float(cfg.timeout_sec)),
-                context=ssl_ctx,
-            ) as resp:
-                raw = resp.read().decode("utf-8", errors="replace")
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
-            compact = self._compact_web_text(detail, limit=260)
-            raise RuntimeError(f"dashscope image generation http error: {exc.code} {compact}") from exc
-        except urllib.error.URLError as exc:
-            raise RuntimeError(f"dashscope image generation network error: {exc}") from exc
-
-        try:
-            data = json.loads(raw)
-        except Exception as exc:
-            raise RuntimeError("dashscope image generation response is not valid json") from exc
-
-        output = data.get("output") if isinstance(data.get("output"), dict) else {}
-        choices = output.get("choices") if isinstance(output.get("choices"), list) else []
-        first_choice = choices[0] if choices and isinstance(choices[0], dict) else {}
-        message = first_choice.get("message") if isinstance(first_choice.get("message"), dict) else {}
-        content = message.get("content") if isinstance(message.get("content"), list) else []
-        image_url = ""
-        for item in content:
-            if not isinstance(item, dict):
-                continue
-            candidate = str(item.get("image", "")).strip()
-            if candidate:
-                image_url = candidate
-                break
-        if not image_url:
-            raise RuntimeError("dashscope image generation response missing image url")
-
-        image_bytes, suffix = self._download_generated_image_bytes(
-            image_url=image_url,
-            b64_json="",
-            cfg=cfg,
-        )
-        try:
-            seed = int(output.get("seed")) if output.get("seed") is not None else None
-        except Exception:
-            seed = None
-        return image_bytes, suffix, seed
+        return self.image_generator.normalize_size(raw)
 
     def _generate_image_file(self, *, prompt: str, size: str = "") -> Path:
-        clean_prompt = self._clean_image_prompt(prompt, limit=280)
-        if not clean_prompt:
-            raise RuntimeError("image prompt is empty")
-        if not self._has_image_generation_tool():
-            raise RuntimeError(self._image_generation_status_text())
+        try:
+            return self.image_generator.generate_file(prompt=prompt, size=size)
+        except ImageGenerationError as exc:
+            raise RuntimeError(str(exc)) from exc
 
-        cfg = self.cfg.image_generation
-        api_key = self._resolve_image_generation_api_key()
-        requested_size = self._normalize_image_size(size)
-        provider = str(getattr(cfg, "provider", "openai_compat") or "openai_compat").strip().lower()
-        if provider == "dashscope_z_image":
-            image_bytes, suffix, seed = self._generate_image_file_dashscope(
-                cfg=cfg,
-                api_key=api_key,
-                clean_prompt=clean_prompt,
-                requested_size=requested_size,
+    def _generate_edited_image_file(
+        self,
+        *,
+        prompt: str,
+        image_path: str = "",
+        image_url: str = "",
+        size: str = "",
+    ) -> Path:
+        try:
+            return self.image_editor.edit_file(
+                prompt=prompt,
+                image_path=image_path,
+                image_url=image_url,
+                size=size,
             )
-        else:
-            image_bytes, suffix, seed = self._generate_image_file_openai_compat(
-                cfg=cfg,
-                api_key=api_key,
-                clean_prompt=clean_prompt,
-                requested_size=requested_size,
-            )
+        except ImageEditingError as exc:
+            raise RuntimeError(str(exc)) from exc
 
-        if not image_bytes:
-            raise RuntimeError("image generation returned empty image payload")
-
-        output_dir = Path(cfg.output_dir or "data/generated_images")
-        output_dir.mkdir(parents=True, exist_ok=True)
-        out = self._next_image_output_path(
-            output_dir,
-            prompt=clean_prompt,
-            suffix=suffix,
-        )
-        out.write_bytes(image_bytes)
-        self._append_generated_image_history(
-            output_dir=output_dir,
-            file_path=out,
-            prompt=clean_prompt,
-            size=requested_size,
-            model=str(cfg.model or "").strip(),
-            seed=seed,
-        )
-        return out
+    def _describe_image_file(self, image_path: str, *, prompt: str = "") -> str:
+        path = Path(image_path).expanduser()
+        if not path.is_file():
+            raise RuntimeError(f"image file not found: {path}")
+        with Image.open(path) as image:
+            return self.llm_reply.describe_image(image.convert("RGB"), prompt=prompt)
 
     def _web_search(self, query: str) -> tuple[str, str]:
         provider = self._active_web_search_provider()
@@ -3622,393 +3394,12 @@ class WeChatGuiRpaBot:
         is_admin: bool,
         max_actions_override: int | None = None,
     ) -> tuple[str, str]:
-        if not actions:
-            return "", ""
-
-        key = self._session_key_for_row(row)
-        if max_actions_override is None:
-            max_actions = max(1, int(self.cfg.agent_actions_max_per_turn))
-        else:
-            override = int(max_actions_override)
-            if override <= 0:
-                max_actions = max(1, len(actions))
-            else:
-                max_actions = max(1, override)
-        traces: list[str] = []
-        observations: list[str] = []
-
-        for idx, action in enumerate(actions[:max_actions], start=1):
-            if not isinstance(action, dict):
-                continue
-            tool = str(action.get("tool", "")).strip()
-            args = action.get("args") if isinstance(action.get("args"), dict) else {}
-            reason = str(action.get("reason", "")).strip()[:40]
-            status = ""
-            obs = ""
-            ok = False
-            action_started = time.monotonic()
-            if self.cfg.log_verbose:
-                arg_preview = self._action_args_preview(args, limit=96)
-                print(
-                    f"[agent] action-start row={row.row_idx:>2} "
-                    f"step={idx:>2}/{max_actions:<2} "
-                    f"tool={tool or '-':<20} "
-                    f"args={self._fit_col(arg_preview, max(20, self._term_width() - 60))}"
-                )
-            try:
-                if tool == "remember_long_term":
-                    if not is_admin:
-                        status = "deny (admin only)"
-                    else:
-                        note = re.sub(r"\s+", " ", str(args.get("note", "")).strip())[:200]
-                        if not note:
-                            status = "skip (empty note)"
-                        else:
-                            self._workspace.append_long_term_memory(note)
-                            status = "ok"
-                            obs = f"长期记忆新增: {note}"
-                            ok = True
-                elif tool == "maintain_memory":
-                    days_raw = args.get("days", 3)
-                    try:
-                        days = int(days_raw)
-                    except Exception:
-                        days = 3
-                    done, detail = self._heartbeat_maintain_memory(days=max(1, min(14, days)))
-                    status = "ok" if done else detail
-                    obs = detail if done else ""
-                    ok = done
-                elif tool == "refine_persona_files":
-                    done, detail = self._heartbeat_refine_persona_files()
-                    status = "ok" if done else detail
-                    obs = detail if done else ""
-                    ok = done
-                elif tool == "remember_session_fact":
-                    fact = re.sub(r"\s+", " ", str(args.get("fact", "")).strip())[:120]
-                    if not fact:
-                        status = "skip (empty fact)"
-                    else:
-                        self._workspace.remember_structured(
-                            session_key=key,
-                            title=row.title,
-                            facts=[fact],
-                        )
-                        status = "ok"
-                        obs = f"会话事实已记录: {fact}"
-                        ok = True
-                elif tool == "remember_session_event":
-                    event = re.sub(r"\s+", " ", str(args.get("event", "")).strip())[:120]
-                    if not event:
-                        status = "skip (empty event)"
-                    else:
-                        self._workspace.remember_structured(
-                            session_key=key,
-                            title=row.title,
-                            events=[event],
-                        )
-                        status = "ok"
-                        obs = f"会话事件已记录: {event}"
-                        ok = True
-                elif tool == "set_session_summary":
-                    summary = re.sub(r"\s+", " ", str(args.get("summary", "")).strip())[:200]
-                    if not summary:
-                        status = "skip (empty summary)"
-                    else:
-                        self._apply_session_summary(row, summary)
-                        status = "ok"
-                        obs = f"会话摘要已更新: {summary}"
-                        ok = True
-                elif tool == "search_memory":
-                    query = re.sub(r"\s+", " ", str(args.get("query", "")).strip())[:80]
-                    if not query:
-                        status = "skip (empty query)"
-                    else:
-                        include_global = is_admin or (not self.cfg.workspace_memory_main_only)
-                        hits = self._workspace.search_memory(
-                            query=query,
-                            session_key=key,
-                            include_global=include_global,
-                            limit=max(1, int(self.cfg.workspace_memory_search_limit)),
-                        )
-                        compact = re.sub(r"\s+", " ", hits or "").strip()
-                        if compact:
-                            compact = compact[:260]
-                            status = "ok"
-                            obs = f"记忆检索[{query}]: {compact}"
-                        else:
-                            status = "ok (no-hit)"
-                            obs = f"记忆检索[{query}]无命中"
-                        ok = True
-                elif tool == "search_person_impression":
-                    query = re.sub(r"\s+", " ", str(args.get("query", "")).strip())[:80]
-                    if not query:
-                        status = "skip (empty query)"
-                    elif not self.cfg.person_impression_enabled:
-                        status = "skip (person impression disabled)"
-                    else:
-                        hits = self._workspace.search_person_impressions(
-                            query=query,
-                            limit=max(1, int(self.cfg.person_impression_search_limit)),
-                        )
-                        compact = re.sub(r"\s+", " ", hits or "").strip()
-                        if compact:
-                            compact = compact[:260]
-                            status = "ok"
-                            obs = f"人物印象检索[{query}]: {compact}"
-                        else:
-                            status = "ok (no-hit)"
-                            obs = f"人物印象检索[{query}]无命中"
-                        ok = True
-                elif tool == "maintain_person_impressions":
-                    days_raw = args.get("days", self.cfg.person_impression_days)
-                    max_people_raw = args.get(
-                        "max_people",
-                        self.cfg.person_impression_max_people_per_run,
-                    )
-                    try:
-                        days = int(days_raw)
-                    except Exception:
-                        days = int(self.cfg.person_impression_days)
-                    try:
-                        max_people = int(max_people_raw)
-                    except Exception:
-                        max_people = int(self.cfg.person_impression_max_people_per_run)
-                    done, detail = self._heartbeat_maintain_person_impressions(
-                        days=max(1, min(3650, days)),
-                        max_people=max(1, min(200, max_people)),
-                    )
-                    status = "ok" if done else detail
-                    obs = detail if done else ""
-                    ok = done
-                elif tool == "workspace_list_files":
-                    rel_path = re.sub(r"\s+", " ", str(args.get("path", "")).strip())[:200]
-                    recursive_raw = args.get("recursive", False)
-                    if isinstance(recursive_raw, str):
-                        recursive = recursive_raw.strip().lower() in {"1", "true", "yes", "on"}
-                    else:
-                        recursive = bool(recursive_raw)
-                    max_entries_raw = args.get("max_entries", 80)
-                    try:
-                        max_entries = int(max_entries_raw)
-                    except Exception:
-                        max_entries = 80
-                    max_entries = max(1, min(200, max_entries))
-                    listing = self._workspace_list_files(
-                        rel_path=rel_path,
-                        recursive=recursive,
-                        max_entries=max_entries,
-                    )
-                    status = "ok"
-                    obs = (
-                        f"工作区目录[{rel_path or '.'}] "
-                        f"(recursive={recursive}, max={max_entries}):\n{listing}"
-                    )[:1800]
-                    ok = True
-                elif tool == "workspace_read_file":
-                    rel_path = re.sub(
-                        r"\s+",
-                        " ",
-                        str(args.get("path", "") or args.get("file", "")).strip(),
-                    )[:200]
-                    if not rel_path:
-                        status = "skip (empty path)"
-                    else:
-                        text = self._workspace_read_file(rel_path=rel_path, max_chars=4000)
-                        status = "ok"
-                        obs = f"工作区文件读取[{rel_path}]:\n{text}"[:1800]
-                        ok = True
-                elif tool == "workspace_write_file":
-                    rel_path = re.sub(
-                        r"\s+",
-                        " ",
-                        str(args.get("path", "") or args.get("file", "")).strip(),
-                    )[:200]
-                    content = str(args.get("content", "") or args.get("text", "")).strip()[:4000]
-                    mode_raw = str(args.get("mode", "overwrite")).strip().lower()
-                    mode = "append" if mode_raw in {"append", "a", "追加"} else "overwrite"
-                    if not rel_path:
-                        status = "skip (empty path)"
-                    elif not content:
-                        status = "skip (empty content)"
-                    else:
-                        detail = self._workspace_write_file(
-                            rel_path=rel_path,
-                            content=content,
-                            mode=mode,
-                        )
-                        status = "ok"
-                        obs = f"工作区写入成功: {detail}"
-                        ok = True
-                elif tool == "web_search":
-                    query = re.sub(r"\s+", " ", str(args.get("query", "")).strip())[:80]
-                    provider = self._active_web_search_provider()
-                    if not query:
-                        status = "skip (empty query)"
-                    elif not self._web_search_enabled(provider):
-                        status = f"skip ({provider} disabled)"
-                    elif (provider in ("tavily", "brave")) and (
-                        not self._resolve_web_search_api_key(provider)
-                    ):
-                        status = f"skip (missing {provider} api key)"
-                    elif provider == "agent_reach" and (
-                        not str(self.cfg.agent_reach_mcporter_cmd or "").strip()
-                        or not shutil.which(str(self.cfg.agent_reach_mcporter_cmd or "").strip())
-                    ):
-                        cmd = str(self.cfg.agent_reach_mcporter_cmd or "").strip()
-                        status = f"skip (missing command: {cmd or 'mcporter'})"
-                    else:
-                        active_provider, search_text = self._web_search(query)
-                        if search_text:
-                            status = "ok"
-                            obs = f"网页检索[{query}]({active_provider}): {search_text}"
-                        else:
-                            status = "ok (no-hit)"
-                            obs = f"网页检索[{query}]({active_provider})无命中"
-                        ok = True
-                elif tool == "web_search_volc":
-                    query = re.sub(r"\s+", " ", str(args.get("query", "")).strip())[:80]
-                    if not query:
-                        status = "skip (empty query)"
-                    elif not bool(self.cfg.volc_ark_enabled):
-                        status = "skip (volc_ark disabled)"
-                    elif not str(self.cfg.volc_ark_model or "").strip():
-                        status = "skip (missing volc_ark_model)"
-                    elif not self._resolve_volc_ark_api_key():
-                        status = "skip (missing volc_ark api key)"
-                    else:
-                        search_text = self._volc_web_search(query)
-                        if search_text:
-                            status = "ok"
-                            obs = f"网页检索[{query}](volc_ark): {search_text}"
-                            summary_line = ""
-                            for line in str(search_text).splitlines():
-                                clean_line = self._compact_web_text(line, limit=120)
-                                if not clean_line:
-                                    continue
-                                if clean_line.startswith("摘要:"):
-                                    summary_line = self._compact_web_text(
-                                        clean_line.replace("摘要:", "", 1),
-                                        limit=90,
-                                    )
-                                    break
-                                if not summary_line:
-                                    summary_line = clean_line
-                            fact = self._compact_web_text(
-                                f"{query}：{summary_line}",
-                                limit=120,
-                            )
-                            if fact:
-                                self._workspace.remember_structured(
-                                    session_key=key,
-                                    title=row.title,
-                                    facts=[fact],
-                                )
-                        else:
-                            status = "ok (no-hit)"
-                            obs = f"网页检索[{query}](volc_ark)无命中"
-                        ok = True
-                elif tool == "generate_image":
-                    prompt = self._clean_image_prompt(args.get("prompt", ""), limit=280)
-                    if not prompt:
-                        status = "skip (empty prompt)"
-                    elif not self._has_image_generation_tool():
-                        status = f"skip ({self._image_generation_status_text()})"
-                    else:
-                        requested_size = self._normalize_image_size(args.get("size", ""))
-                        image_path = self._generate_image_file(
-                            prompt=prompt,
-                            size=requested_size,
-                        )
-                        sent_ok = self._send_generated_file(row, image_path)
-                        compact_prompt = self._compact_web_text(prompt, limit=52)
-                        if sent_ok:
-                            status = "ok"
-                            obs = (
-                                f"已生成并发送图片文件[{requested_size}]: "
-                                f"{image_path.name} (prompt={compact_prompt})"
-                            )
-                        else:
-                            status = "ok (generated, send-failed)"
-                            obs = (
-                                f"图片已生成但发送失败: {image_path.name} "
-                                f"(prompt={compact_prompt})"
-                            )
-                        ok = True
-                elif tool == "mute_session":
-                    if not is_admin:
-                        status = "deny (admin only)"
-                    else:
-                        sess = self._get_or_create_session(key)
-                        sess.muted = True
-                        self._memory_dirty = True
-                        status = "ok"
-                        obs = "当前会话已静音"
-                        ok = True
-                elif tool == "unmute_session":
-                    if not is_admin:
-                        status = "deny (admin only)"
-                    else:
-                        sess = self._get_or_create_session(key)
-                        sess.muted = False
-                        self._memory_dirty = True
-                        status = "ok"
-                        obs = "当前会话已取消静音"
-                        ok = True
-                else:
-                    status = "skip (unknown tool)"
-            except Exception as exc:
-                err = self._compact_web_text(exc, limit=240)
-                status = f"error ({err})"
-                if tool in ("web_search", "web_search_volc"):
-                    query = re.sub(r"\s+", " ", str(args.get("query", "")).strip())[:80]
-                    obs = f"网页检索[{query}]失败: {err}"
-                elif tool == "search_memory":
-                    query = re.sub(r"\s+", " ", str(args.get("query", "")).strip())[:80]
-                    obs = f"记忆检索[{query}]失败: {err}"
-                elif tool == "search_person_impression":
-                    query = re.sub(r"\s+", " ", str(args.get("query", "")).strip())[:80]
-                    obs = f"人物印象检索[{query}]失败: {err}"
-                elif tool == "maintain_person_impressions":
-                    obs = f"人物印象维护失败: {err}"
-                elif tool == "workspace_list_files":
-                    rel_path = re.sub(r"\s+", " ", str(args.get("path", "")).strip())[:120]
-                    obs = f"工作区目录[{rel_path or '.'}]失败: {err}"
-                elif tool == "workspace_read_file":
-                    rel_path = re.sub(r"\s+", " ", str(args.get("path", "")).strip())[:120]
-                    obs = f"工作区读取[{rel_path}]失败: {err}"
-                elif tool == "workspace_write_file":
-                    rel_path = re.sub(r"\s+", " ", str(args.get("path", "")).strip())[:120]
-                    obs = f"工作区写入[{rel_path}]失败: {err}"
-                elif tool == "generate_image":
-                    prompt = self._clean_image_prompt(args.get("prompt", ""), limit=60)
-                    obs = f"图片生成[{prompt}]失败: {err}"
-            action_elapsed = time.monotonic() - action_started
-            if self.cfg.log_verbose:
-                print(
-                    f"[agent] action-done  row={row.row_idx:>2} "
-                    f"step={idx:>2}/{max_actions:<2} "
-                    f"tool={tool or '-':<20} "
-                    f"elapsed={action_elapsed:>5.2f}s status={status}"
-                )
-
-            trace = f"{idx}. {tool or '-'} -> {status}"
-            if reason:
-                trace += f" | {reason}"
-            traces.append(trace)
-            if obs:
-                observations.append(obs)
-            if ok:
-                self._append_session_record(
-                    row,
-                    role="assistant",
-                    text=f"[tool:{tool}] {obs or status}",
-                    content_type="text",
-                    sender="",
-                    source="tool",
-                    count_turn=False,
-                )
-
-        return "\n".join(traces)[:1500], "\n".join(observations)[:2200]
+        return self.action_processor.execute_agent_actions(
+            row,
+            actions,
+            is_admin=is_admin,
+            max_actions_override=max_actions_override,
+        )
 
     def _load_heartbeat_tasks(self) -> str:
         if not self.cfg.workspace_enabled:
@@ -4562,23 +3953,102 @@ class WeChatGuiRpaBot:
         return action_count > 0 or status_after != status_before
 
     def _available_heartbeat_tools(self) -> list[str]:
-        tools = [
-            "remember_session_fact",
-            "remember_session_event",
-            "set_session_summary",
-            "search_memory",
-            "maintain_memory",
-            "refine_persona_files",
-        ]
-        if self.cfg.person_impression_enabled:
-            tools.extend(["search_person_impression", "maintain_person_impressions"])
-        if self.cfg.admin_commands_enabled:
-            tools.append("remember_long_term")
-        if self._has_volc_web_search_tool():
-            tools.append("web_search_volc")
-        if self._has_web_search_tool():
-            tools.append("web_search")
-        return tools
+        return ["read_impression", "write_impression", "write_memory"]
+
+    def _heartbeat_identity_text(self) -> str:
+        paths = [Path("data/identity.md"), Path(self.cfg.workspace_dir) / "IDENTITY.md"]
+        parts: list[str] = []
+        for path in paths:
+            try:
+                if path.is_file():
+                    text = path.read_text(encoding="utf-8", errors="replace").strip()
+                    if text and text not in parts:
+                        parts.append(text)
+            except OSError:
+                continue
+        return "\n\n".join(parts)[:3000]
+
+    def _heartbeat_recent_chat_activity(self, *, max_chats: int = 10, max_lines: int = 60) -> str:
+        items: list[tuple[int, str, list[dict]]] = []
+        for key, sess in self._sessions.items():
+            history = [x for x in sess.history if isinstance(x, dict)]
+            if not history:
+                continue
+            last_ts = max(int(x.get("observed_at", 0) or 0) for x in history[-20:])
+            titles = sorted(str(x).strip() for x in sess.titles if str(x).strip())
+            title = titles[0] if titles else key
+            items.append((last_ts, title, history[-10:]))
+        items.sort(key=lambda x: x[0], reverse=True)
+
+        lines: list[str] = []
+        for _, title, history in items[:max_chats]:
+            if len(lines) >= max_lines:
+                break
+            lines.append(f"[{title}]")
+            for record in history:
+                if len(lines) >= max_lines:
+                    break
+                ts = int(record.get("observed_at", 0) or 0)
+                ts_text = datetime.fromtimestamp(ts).strftime("%m-%d %H:%M") if ts > 0 else "--"
+                role = str(record.get("role", "unknown")).strip()
+                sender = str(record.get("sender", "")).strip()
+                text = re.sub(r"\s+", " ", str(record.get("text", ""))).strip()
+                if not text:
+                    continue
+                who = sender if sender else ("萨比" if role == "assistant" else role)
+                lines.append(f"{ts_text} {who}: {text[:180]}")
+        return "\n".join(lines)[:6000]
+
+    def _heartbeat_current_state(self, now: float) -> str:
+        parts: list[str] = []
+        core = self.agent_memory.read("core").strip()
+        if core:
+            parts.append(f"[memories]\n{core}")
+        timeline = self.agent_memory.read("timeline").strip()
+        if timeline:
+            parts.append(f"[timeline]\n{timeline}")
+        people_names = self.agent_people.list()
+        if people_names:
+            parts.append(
+                "[people impressions]\n"
+                "Person impressions are available on demand, not preloaded. "
+                "These are records about people, not the agent's core/timeline memory. "
+                "Use read_impression with a canonical Chinese name before updating an existing record.\n"
+                f"Available names: {', '.join(people_names[:120])}"
+            )
+        recent = self._heartbeat_recent_chat_activity()
+        if recent:
+            parts.append(f"[recent chat activity]\n{recent}")
+        now_text = datetime.fromtimestamp(now).strftime("%Y-%m-%d %H:%M:%S")
+        parts.append(f"[current_time]\n{now_text}")
+        return "\n\n".join(parts)
+
+    def _heartbeat_prompt_text(self, now: float) -> str:
+        return (
+            f"[system]\n{self.cfg.llm_reply.system_prompt}\n\n"
+            f"[identity]\n{self._heartbeat_identity_text()}\n\n"
+            f"[current state]\n{self._heartbeat_current_state(now)}\n\n"
+            f"[heartbeat instruction]\n{self.cfg.heartbeat_prompt}\n\n"
+            "This is a scheduled self-reflection heartbeat. "
+            "Scan the [recent chat activity] section below. For EVERY person who appears there, "
+            "update or create their impression with new observations from today's conversations. "
+            "People impressions are not preloaded; use read_impression for relevant people before updating "
+            "an existing impression. Maintain memory only through write_memory name=core or name=timeline.\n\n"
+            "IMPORTANT write_memory rules:\n"
+            "- write_memory FULLY REPLACES either data/memory/core.md or data/memory/timeline.md\n"
+            "- name=core stores stable facts, preferences, self-improvement rules, and durable knowledge\n"
+            "- name=timeline stores dated events and recent activity, newest first when practical\n\n"
+            "IMPORTANT write_impression rules:\n"
+            "- write_impression FULLY REPLACES the entire impression for that person\n"
+            "- Use read_impression first when preserving an existing person record matters\n"
+            "- Use canonical Chinese name (NOT a file path)\n"
+            "- Recommended markdown structure:\n"
+            "  ## 基本特征\n  Personality, background, habits.\n"
+            "  ## 事件纪要\n  Key past interactions with approximate dates.\n"
+            "  ## 人物关系\n  Relationships to other known people.\n\n"
+            "Supported internal tools: read_impression, write_impression, write_memory. "
+            "If nothing needs maintenance, return no actions."
+        )
 
     def _run_heartbeat(self, now: float, rows: list[ChatRowState]) -> bool:
         if not self.cfg.heartbeat_enabled:
@@ -4586,15 +4056,6 @@ class WeChatGuiRpaBot:
         if not self._heartbeat_llm_backends():
             return False
         if not self.cfg.agent_actions_enabled:
-            return False
-
-        if self._run_heartbeat_pending_agent_task(now, rows):
-            return True
-
-        tasks_text = self._load_heartbeat_tasks()
-        if not tasks_text:
-            if self.cfg.log_verbose:
-                print("[heartbeat] skipped (HEARTBEAT.md has no actionable lines)")
             return False
 
         row = self._heartbeat_virtual_row()
@@ -4609,80 +4070,30 @@ class WeChatGuiRpaBot:
             return False
 
         is_admin = bool(self.cfg.admin_commands_enabled)
-        session_context = self._build_session_context(row)
-        chat_context = self._build_session_history_text(row)
-        workspace_context = self._workspace_context_for_row(
-            row,
-            is_admin=is_admin,
-            skill_query=tasks_text,
-        )
-        memory_recall = self._workspace_memory_recall_for_row(
-            row,
-            tasks_text,
-            is_admin=is_admin,
-        )
-        now_text = datetime.fromtimestamp(now).strftime("%Y-%m-%d %H:%M:%S")
-        environment_context = (
-            f"[heartbeat_prompt]\n{self.cfg.heartbeat_prompt}\n\n"
-            f"[heartbeat_tasks]\n{tasks_text}\n\n"
-            f"[current_time]\n{now_text}"
-        )[:2200]
-
-        planned_actions = self._parse_heartbeat_direct_actions(tasks_text)
-        if planned_actions:
-            heartbeat_limit = int(self.cfg.heartbeat_max_actions)
-            if heartbeat_limit <= 0:
-                heartbeat_limit = len(planned_actions)
-            trace, observations = self._execute_agent_actions(
-                row,
-                planned_actions,
-                is_admin=is_admin,
-                max_actions_override=heartbeat_limit,
-            )
-            print(
-                f"[heartbeat] ran actions={len(planned_actions):>2} "
-                f"title={self._fit_col(row.title, 14)}"
-            )
-            if trace:
-                for line in trace.split("\n"):
-                    if line.strip():
-                        print(f"            {line}")
-            if observations:
-                self._append_session_record(
-                    row,
-                    role="assistant",
-                    text=f"[heartbeat] {observations}",
-                    content_type="text",
-                    sender="",
-                    source="heartbeat",
-                    count_turn=False,
-                )
-            self._memory_dirty = True
-            return True
-
-        lookup_seed = tasks_text.split("\n", 1)[0][:80]
-        lookup_intent = self._is_web_lookup_intent(tasks_text)
+        action_limit = int(self.cfg.heartbeat_max_actions)
+        if action_limit <= 0:
+            action_limit = 4
+        action_limit = max(1, min(6, action_limit))
+        environment_context = self._heartbeat_prompt_text(now)[:12000]
         memory_recall, _, action_count, _, task_state = self._run_agent_planner_loop(
             planner=self.llm_heartbeat,
             row=row,
             reason="heartbeat",
             is_group=False,
             is_admin=is_admin,
-            latest_message=lookup_seed,
-            chat_context=chat_context,
+            latest_message="Heartbeat tick. Reflect and maintain durable memory.",
+            chat_context=self._heartbeat_recent_chat_activity(max_chats=10, max_lines=80),
             environment_context=environment_context,
-            session_context=session_context,
-            workspace_context=workspace_context,
-            memory_recall=memory_recall,
+            session_context="",
+            workspace_context="",
+            memory_recall="",
             tools=tools,
-            per_round_max_actions=(
-                self.cfg.heartbeat_max_actions
-                if int(self.cfg.heartbeat_max_actions) > 0
-                else 999
-            ),
-            lookup_intent=lookup_intent,
-            lookup_query=lookup_seed,
+            per_round_max_actions=action_limit,
+            lookup_intent=False,
+            lookup_query="",
             enforce_lookup_round1=False,
+            max_rounds_override=2,
+            max_total_actions_override=action_limit,
         )
         if action_count <= 0 and not task_state:
             if self.cfg.log_verbose:
@@ -4693,41 +4104,17 @@ class WeChatGuiRpaBot:
             f"[heartbeat] ran actions={action_count:>2} "
             f"title={self._fit_col(row.title, 14)}"
         )
-        observations = ""
-        marker = "[工具执行结果]"
-        if marker in memory_recall:
-            observations = memory_recall.split(marker, 1)[1].strip()[:1800]
-        if observations:
-            self._append_session_record(
-                row,
-                role="assistant",
-                text=f"[heartbeat] {observations}",
-                content_type="text",
-                sender="",
-                source="heartbeat",
-                count_turn=False,
-            )
         self._memory_dirty = True
         return True
 
     def _maybe_run_heartbeat(self, now: float, rows: list[ChatRowState]) -> bool:
-        if not self.cfg.heartbeat_enabled:
-            return False
-        if (now - self._last_heartbeat_at) < float(self.cfg.heartbeat_interval_sec):
-            return False
-        if (now - self._last_activity_at) < float(self.cfg.heartbeat_min_idle_sec):
-            return False
-        self._last_heartbeat_at = now
-        try:
-            return self._run_heartbeat(now, rows)
-        except Exception as exc:
-            if self.cfg.heartbeat_fail_open:
-                print(f"[warn] heartbeat failed, fail-open: {exc}")
-                return False
-            raise
+        return self.heartbeat.maybe_run(now, rows)
 
     def _is_ignored_title(self, row: ChatRowState) -> bool:
-        title = (row.title or "").strip()
+        return self._is_ignored_title_text(row.title)
+
+    def _is_ignored_title_text(self, title: str) -> bool:
+        title = (title or "").strip()
         if not title:
             return False
         return any(keyword and keyword in title for keyword in self.cfg.ignore_title_keywords)
@@ -5734,28 +5121,10 @@ class WeChatGuiRpaBot:
         return merged
 
     def _activate_wechat(self) -> None:
-        aliases = [x.strip() for x in self.cfg.app_name.split("|") if x.strip()]
-        if "WeChat" in aliases and "微信" not in aliases:
-            aliases.append("微信")
-        if not aliases:
-            aliases = ["WeChat", "微信"]
-
-        for app in aliases:
-            proc = subprocess.run(
-                ["osascript", "-e", f'tell application "{app}" to activate'],
-                capture_output=True,
-                text=True,
-            )
-            if proc.returncode == 0:
-                return
-
-        print(f"[warn] failed to activate app, tried aliases={aliases}")
+        self.sender.activate()
 
     def _safe_click(self, x: int, y: int) -> None:
-        pyautogui.moveTo(x, y, duration=max(0.0, self.cfg.click_move_duration_sec))
-        pyautogui.mouseDown()
-        time.sleep(max(0.01, self.cfg.mouse_down_hold_sec))
-        pyautogui.mouseUp()
+        self.sender.safe_click(x, y)
 
     def _perform_scroll(self, amount: int) -> None:
         total = int(amount)
@@ -5770,86 +5139,17 @@ class WeChatGuiRpaBot:
             time.sleep(0.015)
 
     def _send_delay_sec(self) -> float:
-        return max(0.0, float(self.cfg.send_after_paste_delay_sec))
+        return self.sender.send_delay_sec()
 
     @staticmethod
     def _apple_quote(raw: str) -> str:
-        return str(raw or "").replace("\\", "\\\\").replace('"', '\\"')
+        return WeChatGuiSender.apple_quote(raw)
 
     def _paste_and_send(self, message: str) -> None:
-        pyperclip.copy(message)
-        time.sleep(0.05)
-        delay_sec = self._send_delay_sec()
-
-        # Prefer AppleScript paste on macOS to reduce occasional literal "v" input.
-        paste_script = 'tell application "System Events" to keystroke "v" using command down'
-        enter_script = 'tell application "System Events" to key code 36'
-        proc = subprocess.run(
-            [
-                "osascript",
-                "-e",
-                paste_script,
-                "-e",
-                f"delay {delay_sec:.3f}",
-                "-e",
-                enter_script,
-            ],
-            capture_output=True,
-            text=True,
-        )
-        if proc.returncode == 0:
-            return
-
-        print(f"[warn] osascript paste failed, fallback to pyautogui: {proc.stderr.strip()}")
-        pyautogui.keyDown("command")
-        pyautogui.press("v")
-        pyautogui.keyUp("command")
-        time.sleep(delay_sec)
-        pyautogui.press("enter")
+        self.sender.paste_and_send(message)
 
     def _paste_file_and_send(self, file_path: Path) -> bool:
-        target = Path(file_path).expanduser().resolve()
-        if not target.exists():
-            print(f"[warn] file-send skipped, file not found: {target}")
-            return False
-
-        delay_sec = self._send_delay_sec()
-        set_clip_script = f'set the clipboard to (POSIX file "{self._apple_quote(str(target))}")'
-        paste_script = 'tell application "System Events" to keystroke "v" using command down'
-        enter_script = 'tell application "System Events" to key code 36'
-        proc = subprocess.run(
-            [
-                "osascript",
-                "-e",
-                set_clip_script,
-                "-e",
-                paste_script,
-                "-e",
-                f"delay {delay_sec:.3f}",
-                "-e",
-                enter_script,
-            ],
-            capture_output=True,
-            text=True,
-        )
-        if proc.returncode == 0:
-            return True
-
-        print(f"[warn] osascript file paste failed, fallback to pyautogui: {proc.stderr.strip()}")
-        clip_proc = subprocess.run(
-            ["osascript", "-e", set_clip_script],
-            capture_output=True,
-            text=True,
-        )
-        if clip_proc.returncode != 0:
-            print(f"[warn] osascript set file clipboard failed: {clip_proc.stderr.strip()}")
-            return False
-        pyautogui.keyDown("command")
-        pyautogui.press("v")
-        pyautogui.keyUp("command")
-        time.sleep(delay_sec)
-        pyautogui.press("enter")
-        return True
+        return self.sender.paste_file_and_send(file_path)
 
     def _send_generated_file(
         self,
@@ -5860,6 +5160,15 @@ class WeChatGuiRpaBot:
     ) -> bool:
         if self.cfg.dry_run:
             print(f"[dry-run] file={str(file_path)}")
+            return True
+
+        if self.cfg.receiver_mode == "detached_windows":
+            ok = self.sender.paste_file_and_send_to_window(row.title, file_path)
+            if not ok:
+                print(f"[warn] detached file send not confirmed: {row.title!r}")
+                return False
+            file_w = max(24, self._term_width() - 13)
+            print(f"[sent] to={self._fit_col(row.title, 14)} file={self._fit_col(str(file_path), file_w)}")
             return True
 
         if focused_bounds is not None:
@@ -5905,6 +5214,57 @@ class WeChatGuiRpaBot:
         print(f"[sent] file={self._fit_col(str(file_path), file_w)}")
         return True
 
+    def _remember_latest_image_for_row(self, row: ChatRowState, image_path: str) -> None:
+        clean = str(image_path or "").strip()
+        if clean:
+            self._latest_image_by_session[self._session_key_for_row(row)] = clean
+
+    def _latest_image_for_row(self, row: ChatRowState) -> str:
+        return self._latest_image_by_session.get(self._session_key_for_row(row), "")
+
+    def _image_followup_context_for_text(self, row: ChatRowState, text: str) -> str:
+        clean = re.sub(r"\s+", " ", str(text or "")).strip()
+        if not clean:
+            return ""
+        image_path = self._latest_image_for_row(row)
+        if not image_path:
+            return ""
+        triggers = (
+            "图",
+            "图片",
+            "照片",
+            "这张",
+            "这个图",
+            "这图",
+            "看图",
+            "识别",
+            "是什么",
+            "改图",
+            "修图",
+            "编辑",
+            "换成",
+            "去掉",
+            "加上",
+        )
+        if not any(token in clean for token in triggers):
+            return ""
+        cached = self._image_vision_by_path.get(image_path, "")
+        if not cached:
+            try:
+                cached = self._describe_image_file(
+                    image_path,
+                    prompt=(
+                        "这是当前微信会话最近收到的图片。请用中文描述图片内容；"
+                        "如果有文字，请转写；如果适合识别物体/植物/截图内容，也请直接说明。"
+                    ),
+                )
+            except Exception as exc:
+                cached = f"[图片识别失败: {exc}]"
+            cached = re.sub(r"\s+", " ", cached).strip()[:800]
+            if cached:
+                self._image_vision_by_path[image_path] = cached
+        return f"[最近收到的图片]\npath={image_path}\nvision={cached[:800]}" if cached else ""
+
     def _reply(
         self,
         row: ChatRowState,
@@ -5944,6 +5304,14 @@ class WeChatGuiRpaBot:
         if self.cfg.dry_run:
             msg_w = max(24, self._term_width() - 16)
             print(f"[dry-run] msg={self._fit_col(message, msg_w)}")
+            return message
+
+        if self.cfg.receiver_mode == "detached_windows":
+            raised = self.sender.paste_and_send_to_window(row.title, message)
+            if not raised:
+                print(f"[warn] detached send window raise not confirmed: {row.title!r}")
+            msg_w = max(24, self._term_width() - 12)
+            print(f"[sent] to={self._fit_col(row.title, 14)} msg={self._fit_col(message, msg_w)}")
             return message
 
         if focused_bounds is not None:
@@ -5993,6 +5361,458 @@ class WeChatGuiRpaBot:
         for remain in range(total, 0, -1):
             print(f"[recover] start in {remain}")
             time.sleep(1.0)
+
+    def _detached_windows(self):
+        windows = list_detached_wechat_windows(self.cfg.app_name)
+        filters = [str(x).strip() for x in self.cfg.detached_window_title_filter if str(x).strip()]
+        if filters:
+            windows = [w for w in windows if any(token in w.title for token in filters)]
+        return [w for w in windows if w.title and not self._is_ignored_title_text(w.title)]
+
+    def _canonicalize_visible_message(self, message: dict) -> dict:
+        if not isinstance(message, dict):
+            return message
+        if str(message.get("side", "")).strip() != "other":
+            return message
+        sender_raw = str(message.get("sender", "") or "").strip()
+        if not sender_raw:
+            return message
+        sender, raw = self._canonicalize_sender_pair(sender_raw)
+        if not sender:
+            message["sender_raw"] = raw or sender_raw[:40]
+            message["sender"] = ""
+            return message
+        if raw:
+            message["sender_raw"] = raw
+        message["sender"] = sender
+        return message
+
+    def _canonicalize_visible_messages(self, messages: list[dict]) -> list[dict]:
+        return [self._canonicalize_visible_message(message) for message in messages]
+
+    def _detached_message_record(self, message: dict) -> dict:
+        side = str(message.get("side", "")).strip()
+        content_type = str(message.get("content_type", "text")).strip().lower() or "text"
+        text = re.sub(r"\s+", " ", str(message.get("text", "") or "")).strip()
+        if content_type == "image":
+            image_hash = str(message.get("image_hash", "")).strip()
+            text = f"[图片:{image_hash}]" if image_hash else "[图片]"
+        return {
+            "role": "assistant" if side == "self" else "user",
+            "content_type": content_type,
+            "text": text,
+            "sender": str(message.get("sender", "") or "").strip()[:40],
+            "sender_raw": str(message.get("sender_raw", "") or "").strip()[:40],
+        }
+
+    def _detached_preview_text(self, message: dict) -> str:
+        sender = str(message.get("sender", "") or "").strip()
+        content_type = str(message.get("content_type", "text")).strip().lower()
+        text = re.sub(r"\s+", " ", str(message.get("text", "") or "")).strip()
+        if content_type == "image":
+            text = "[图片]"
+        if sender:
+            return f"{sender}：{text}"
+        return text
+
+    def _detached_row_for_message(self, *, window_id: int, title: str, message: dict) -> ChatRowState:
+        preview = self._detached_preview_text(message)
+        has_mention = self.visible_message_state.is_mention(
+            message,
+            list(self.cfg.group_reply_keywords) + list(self.cfg.mention_keywords),
+        )
+        if self.cfg.mention_any_at and "@" in preview:
+            has_mention = True
+        fingerprint = str(message.get("fingerprint", "") or "")
+        return ChatRowState(
+            row_idx=int(window_id),
+            text=preview,
+            title=title,
+            preview=preview,
+            has_mention=has_mention,
+            has_unread_badge=False,
+            fingerprint=fingerprint,
+            click_x_ratio=-1.0,
+            click_y_ratio=-1.0,
+        )
+
+    def _detached_context_text(self, messages: list[dict], *, limit: int = 18) -> str:
+        lines: list[str] = []
+        for msg in messages[-limit:]:
+            side = str(msg.get("side", ""))
+            role = "我" if side == "self" else (str(msg.get("sender", "") or "对方"))
+            content_type = str(msg.get("content_type", "text"))
+            text = re.sub(r"\s+", " ", str(msg.get("text", "") or "")).strip()
+            if content_type == "image":
+                vision_text = re.sub(r"\s+", " ", str(msg.get("vision_text", "") or "")).strip()
+                if not vision_text:
+                    image_path = str(msg.get("image_path", "") or "").strip()
+                    vision_text = self._image_vision_by_path.get(image_path, "")
+                image_hash = str(msg.get("image_hash", "") or "").strip()
+                text = f"[图片:{image_hash}]"
+                if vision_text:
+                    text += f" {vision_text[:260]}"
+            if text:
+                lines.append(f"{role}: {text}")
+        return "\n".join(lines)[-1800:]
+
+    def _analyze_detached_image_message(self, message: dict) -> str:
+        if str(message.get("content_type", "")).strip().lower() != "image":
+            return ""
+        cached = str(message.get("vision_text", "") or "").strip()
+        if cached:
+            return cached
+        image_path = str(message.get("image_path", "") or "").strip()
+        if not image_path:
+            return ""
+        if image_path in self._image_vision_by_path:
+            cached = self._image_vision_by_path[image_path]
+            if cached:
+                message["vision_text"] = cached
+                return cached
+        try:
+            desc = self._describe_image_file(
+                image_path,
+                prompt=(
+                    "这是微信聊天里用户发送的一张图片。请用中文描述图片内容；"
+                    "如果有文字，请转写；如果适合识别物体/植物/截图内容，也请直接说明。"
+                ),
+            )
+        except Exception as exc:
+            desc = f"[图片识别失败: {exc}]"
+        desc = re.sub(r"\s+", " ", desc).strip()[:800]
+        if desc:
+            message["vision_text"] = desc
+            self._image_vision_by_path[image_path] = desc
+        return desc
+
+    def _select_detached_messages_to_handle(
+        self,
+        *,
+        window_id: int,
+        title: str,
+        new_messages: list[dict],
+        now: float,
+    ) -> list[dict]:
+        immediate: list[tuple[int, dict]] = []
+        normal_group: list[tuple[int, dict]] = []
+        for idx, message in enumerate(new_messages):
+            if not self.visible_message_state.is_incoming(message):
+                continue
+            row = self._detached_row_for_message(window_id=window_id, title=title, message=message)
+            if self._is_ignored_title(row):
+                continue
+            is_admin = self._is_admin_session(row)
+            if (not is_admin) and self._is_row_muted(row):
+                continue
+
+            content_type = str(message.get("content_type", "text")).strip().lower()
+            if content_type == "image" and not self.cfg.detached_reply_on_image:
+                continue
+
+            reason = "mention" if row.has_mention else "new_message"
+            is_group = self._is_group_chat(row)
+            if is_group and not self._should_reply_group(row, reason):
+                continue
+
+            if self._is_normal_reply_event(row, reason):
+                normal_group.append((idx, message))
+            else:
+                immediate.append((idx, message))
+
+        selected = list(immediate)
+        if normal_group:
+            normal_cooldown_active = (
+                self._normal_reply_interval_active()
+                and (now - self._last_normal_reply_at) < self.cfg.normal_reply_interval_sec
+            )
+            if not normal_cooldown_active:
+                # For ordinary group chatter, answer only the newest message in
+                # the batch. Mentions/private/admin messages above are all kept.
+                selected.append(max(normal_group, key=lambda item: item[0]))
+
+        return [message for _, message in sorted(selected, key=lambda item: item[0])]
+
+    def _handle_detached_new_message(
+        self,
+        *,
+        window_id: int,
+        title: str,
+        messages: list[dict],
+        message: dict,
+        now: float,
+    ) -> None:
+        row = self._detached_row_for_message(window_id=window_id, title=title, message=message)
+        if not self.visible_message_state.is_incoming(message):
+            return
+        if self._is_ignored_title(row):
+            return
+        is_admin = self._is_admin_session(row)
+        if (not is_admin) and self._is_row_muted(row):
+            if self.cfg.log_verbose:
+                print(f"[skip-muted] detached title={title!r}")
+            return
+
+        latest_text = re.sub(r"\s+", " ", str(message.get("text", "") or "")).strip()
+        content_type = str(message.get("content_type", "text")).strip().lower()
+        if content_type == "image":
+            image_path = str(message.get("image_path", "") or "").strip()
+            if image_path:
+                self._remember_latest_image_for_row(row, image_path)
+        if content_type == "image" and not self.cfg.detached_reply_on_image:
+            if self.cfg.log_verbose:
+                print(f"[skip-image] detached title={title!r} hash={message.get('image_hash', '')}")
+            return
+        if content_type == "image":
+            image_desc = self._analyze_detached_image_message(message)
+            if image_desc:
+                latest_text = f"[图片] {image_desc}"
+
+        reason = "mention" if row.has_mention else "new_message"
+        is_group = self._is_group_chat(row)
+        if is_group and not self._should_reply_group(row, reason):
+            if self.cfg.log_verbose:
+                print(f"[skip-rule] detached group title={title!r} preview={row.preview!r}")
+            return
+        if (
+            self._is_normal_reply_event(row, reason)
+            and self._normal_reply_interval_active()
+            and (now - self._last_normal_reply_at) < self.cfg.normal_reply_interval_sec
+        ):
+            if self.cfg.log_verbose:
+                remain = self.cfg.normal_reply_interval_sec - (now - self._last_normal_reply_at)
+                print(f"[skip-normal-interval] detached title={title!r} remain={max(0.0, remain):.1f}s")
+            return
+
+        image_followup_context = self._image_followup_context_for_text(row, latest_text)
+        chat_context = self._detached_context_text(messages)
+        if image_followup_context:
+            chat_context = f"{chat_context}\n{image_followup_context}".strip()
+        session_context = self._build_session_context(row)
+        workspace_context = self._workspace_context_for_row(
+            row,
+            is_admin=is_admin,
+            skill_query=latest_text or row.preview or row.title,
+        )
+        memory_recall = self._workspace_memory_recall_for_row(
+            row,
+            latest_text or row.preview or row.title,
+            is_admin=is_admin,
+        )
+
+        if is_admin:
+            cmd_line = self._extract_admin_command_text(row, self._detached_context_snapshot(row.preview))
+            if cmd_line:
+                self._append_session_item(row, "U", cmd_line)
+                ack = self._handle_admin_command(cmd_line)
+                reply_text = self._reply(
+                    row,
+                    "admin_command",
+                    chat_context=chat_context,
+                    session_context=session_context,
+                    workspace_context=workspace_context,
+                    memory_recall=memory_recall,
+                    force_message=ack or "命令已执行。",
+                )
+                sent_norm = self._normalize_preview(reply_text)
+                self._remember_sent_for_row(row, sent_norm, now)
+                self._append_session_item(row, "A", reply_text)
+                self._save_persistent_memory()
+                return
+
+        should_reply = True if self._is_immediate_reply_event(row, reason) else self._llm_should_reply_with_context(
+            row,
+            reason,
+            is_group,
+            chat_context,
+            "",
+            session_context,
+            workspace_context,
+            memory_recall,
+        )
+        if not should_reply:
+            self._save_persistent_memory()
+            return
+
+        planner_send_reply = True
+        if self.cfg.agent_actions_enabled:
+            tools = self._available_agent_tools(is_admin=is_admin)
+            if tools:
+                memory_recall, _, _, planner_send_reply, _ = self._run_agent_planner_loop(
+                    planner=self.llm_planner,
+                    row=row,
+                    reason=reason,
+                    is_group=is_group,
+                    is_admin=is_admin,
+                    latest_message=latest_text or row.preview,
+                    chat_context=chat_context,
+                    environment_context="",
+                    session_context=session_context,
+                    workspace_context=workspace_context,
+                    memory_recall=memory_recall,
+                    tools=tools,
+                    per_round_max_actions=self.cfg.agent_actions_max_per_turn,
+                    lookup_intent=self._is_web_lookup_intent(latest_text or row.preview),
+                    lookup_query=(latest_text or row.preview)[:80],
+                    enforce_lookup_round1=True,
+                )
+        if not planner_send_reply:
+            if self.cfg.log_verbose:
+                print(f"[agent] detached planner requested hold-send title={title!r}")
+            self._save_persistent_memory()
+            return
+
+        reply_text = self._reply(
+            row,
+            reason,
+            chat_context=chat_context,
+            session_context=session_context,
+            workspace_context=workspace_context,
+            memory_recall=memory_recall,
+            latest_message=latest_text or row.preview,
+        )
+        if reply_text:
+            sent_norm = self._normalize_preview(reply_text)
+            self._remember_sent_for_row(row, sent_norm, now)
+            self._append_session_item(row, "A", reply_text)
+            if self._is_normal_reply_event(row, reason):
+                self._last_normal_reply_at = now
+        self._save_persistent_memory()
+
+    @staticmethod
+    def _detached_context_snapshot(text: str):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            text=text,
+            last_side="other",
+            last_line=text,
+            last_user_message=text,
+            recent_messages=[text] if text else [],
+            recent_structured=None,
+            chat_records=None,
+            memory_summary="",
+            memory_time_hints=None,
+            memory_people=None,
+            memory_facts=None,
+            memory_events=None,
+            memory_relations=None,
+            environment_text="",
+            schema="detached",
+            source="detached",
+        )
+
+    def run_detached_window_forever(self) -> None:
+        self._last_activity_at = time.time()
+        self._last_heartbeat_at = 0.0
+        image_root = Path(self.cfg.detached_window_output_dir).expanduser()
+        print("[start] WeChat detached-window receiver started")
+        print(f"[start] receiver=detached_windows poll={self.cfg.poll_interval_sec:.1f}s dry_run={self.cfg.dry_run}")
+        print(f"[start] image-dir={image_root}")
+        print(f"[start] image-gen: {self._image_generation_status_text()}")
+        print(f"[start] image-edit: {self._image_editing_status_text()}")
+        print(f"[start] memory-sqlite: {self._workspace.sqlite_status_text()}")
+        while True:
+            self._cycle += 1
+            now = time.time()
+            windows = self._detached_windows()
+            if self.cfg.log_verbose:
+                names = ", ".join([w.title for w in windows]) or "-"
+                print(f"[cycle] id={self._cycle:>4} detached_windows={len(windows)} {self._fit_col(names, max(24, self._term_width() - 34))}")
+            any_new = False
+            for window in windows:
+                try:
+                    image = capture_window_by_id(window.window_id)
+                    title_slug = safe_window_name(window.title)
+                    snapshot = self.visible_message_parser.parse(
+                        image,
+                        window_id=window.window_id,
+                        title=window.title,
+                        image_output_dir=image_root / title_slug / "images",
+                        include_debug=self.cfg.detached_debug_save,
+                    )
+                    snapshot.messages = self._canonicalize_visible_messages(snapshot.messages)
+                    snapshot.latest_message = snapshot.messages[-1] if snapshot.messages else None
+                except Exception as exc:
+                    print(f"[warn] detached capture/parse failed title={window.title!r}: {exc}")
+                    continue
+
+                if self.cfg.detached_debug_save:
+                    debug_dir = image_root / title_slug / "debug"
+                    debug_dir.mkdir(parents=True, exist_ok=True)
+                    image.save(debug_dir / "latest_window.png")
+                    (debug_dir / "latest_messages.json").write_text(
+                        json.dumps(snapshot.messages, ensure_ascii=False, indent=2),
+                        encoding="utf-8",
+                    )
+
+                row_for_merge = ChatRowState(
+                    row_idx=int(window.window_id),
+                    text=window.title,
+                    title=window.title,
+                    preview="",
+                    has_mention=False,
+                    has_unread_badge=False,
+                    fingerprint=f"window-{window.window_id}",
+                    click_x_ratio=-1.0,
+                    click_y_ratio=-1.0,
+                )
+                for image_message in snapshot.messages:
+                    if str(image_message.get("content_type", "")).strip().lower() == "image":
+                        self._remember_latest_image_for_row(
+                            row_for_merge,
+                            str(image_message.get("image_path", "") or ""),
+                        )
+                records = [self._detached_message_record(message) for message in snapshot.messages]
+                self._merge_session_records(row_for_merge, records, source="detached")
+                new_messages = self.visible_message_state.update(
+                    window_id=window.window_id,
+                    messages=snapshot.messages,
+                )
+                if not self._detached_bootstrapped and not self.cfg.detached_process_existing_on_start:
+                    continue
+                for message in new_messages:
+                    if self.visible_message_state.is_incoming(message):
+                        any_new = True
+                        print(
+                            f"[event] detached title={self._fit_col(window.title, 14)} "
+                            f"sender={self._fit_col(str(message.get('sender', '') or '-'), 12)} "
+                            f"raw={self._fit_col(str(message.get('sender_raw', '') or '-'), 12)} "
+                            f"type={message.get('content_type')} "
+                            f"text={self._fit_col(str(message.get('text') or message.get('image_hash', '')), max(24, self._term_width() - 69))}"
+                        )
+                messages_to_handle = self._select_detached_messages_to_handle(
+                    window_id=window.window_id,
+                    title=window.title,
+                    new_messages=new_messages,
+                    now=now,
+                )
+                if self.cfg.log_verbose and len(messages_to_handle) < len(
+                    [m for m in new_messages if self.visible_message_state.is_incoming(m)]
+                ):
+                    picked = messages_to_handle[0] if messages_to_handle else {}
+                    picked_text = str(picked.get("text") or picked.get("image_hash") or "-")
+                    print(
+                        f"[batch] detached title={self._fit_col(window.title, 14)} "
+                        f"handle={self._fit_col(picked_text, max(24, self._term_width() - 40))}"
+                    )
+                for message in messages_to_handle:
+                    self._handle_detached_new_message(
+                        window_id=window.window_id,
+                        title=window.title,
+                        messages=snapshot.messages,
+                        message=message,
+                        now=now,
+                    )
+            if not self._detached_bootstrapped:
+                self._detached_bootstrapped = True
+                print(f"[init] detached baseline windows={len(windows)}")
+            if any_new:
+                self._last_activity_at = now
+            else:
+                self._maybe_run_heartbeat(now, [])
+            self._save_persistent_memory()
+            time.sleep(max(0.2, float(self.cfg.poll_interval_sec)))
 
     def _detect_active_chat_title(
         self,
@@ -6518,6 +6338,10 @@ class WeChatGuiRpaBot:
             print(f"[recover-auto] stopped | pages={page}")
 
     def run_forever(self) -> None:
+        if self.cfg.receiver_mode == "detached_windows":
+            self.run_detached_window_forever()
+            return
+
         self._last_activity_at = time.time()
         self._last_heartbeat_at = 0.0
         print("[start] WeChat GUI RPA started")
@@ -6572,6 +6396,7 @@ class WeChatGuiRpaBot:
         )
         print(f"[start] web-search: {self._web_search_status_text()}")
         print(f"[start] image-gen: {self._image_generation_status_text()}")
+        print(f"[start] image-edit: {self._image_editing_status_text()}")
         print(f"[start] memory-sqlite: {self._workspace.sqlite_status_text()}")
         print(f"[start] rerank: {self._workspace.rerank_status_text()}")
         print(f"        admin={self._fit_col(admin_titles, admin_w)}")
@@ -6608,399 +6433,12 @@ class WeChatGuiRpaBot:
                 self._idle_streak = 0
                 self._last_activity_at = now
                 row, reason = event
-                if self._skip_first_action_pending:
-                    self._skip_first_action_pending = False
-                    mem = self._baseline.get(row.row_idx)
-                    if mem is not None:
-                        if reason == "mention":
-                            mem.pending_mention = True
-                        else:
-                            mem.last_replied_at = now
-                            mem.pending_unread = False
-                            mem.pending_normal = False
-                            mem.pending_mention = False
-                    print(
-                        f"[skip-startup] row={row.row_idx:>2} | "
-                        f"reason={reason:<14} | title={self._fit_col(row.title, 14)}"
-                    )
-                    time.sleep(self.cfg.poll_interval_sec)
-                    continue
-                if self._is_ignored_title(row):
-                    if self.cfg.log_verbose or self.cfg.debug_scan:
-                        print(f"[skip-title-hard] row={row.row_idx} title={row.title!r}")
-                    mem = self._baseline.get(row.row_idx)
-                    if mem is not None:
-                        mem.last_replied_at = now
-                        mem.pending_unread = False
-                        mem.pending_normal = False
-                        mem.pending_mention = False
-                    time.sleep(self.cfg.poll_interval_sec)
-                    continue
-                if self.cfg.log_verbose:
-                    print(
-                        f"[event] id={self._cycle:>4} | row={row.row_idx:>2} | "
-                        f"reason={reason:<14} | title={self._fit_col(row.title, 14)}"
-                    )
-                event_is_group = self._is_group_chat(row)
-                event_is_admin = self._is_admin_session(row)
-                event_skip_self_latest = (
-                    self.cfg.skip_if_latest_chat_from_self
-                    and (event_is_group or self.cfg.skip_if_latest_chat_from_self_private)
+                self.message_handler.handle_event(
+                    rows=detected.rows,
+                    row=row,
+                    reason=reason,
+                    now=now,
                 )
-                focused_bounds = None
-                chat_context = ""
-                environment_context = ""
-                context_snapshot = ChatContextSnapshot(
-                    text="",
-                    last_side="unknown",
-                    last_line="",
-                    source="none",
-                )
-                need_context = (
-                    self.llm.is_vision_enabled()
-                    or (reason == "new_message" and event_skip_self_latest)
-                    or event_is_admin
-                    or (
-                        self._should_use_llm_decision(event_is_group)
-                        and self.cfg.llm_decision.decision_read_chat_context
-                    )
-                )
-                focus_candidates = self._collect_focus_candidates(detected.rows, row, reason)
-                if need_context:
-                    focus_result = self._focus_chat(
-                        row,
-                        focus_candidates=focus_candidates,
-                        ensure_unread_clear=(reason == "new_message"),
-                    )
-                    if (not focus_result.matched) or (focus_result.resolved_row is None):
-                        seen_w = max(24, self._term_width() - 17)
-                        print(
-                            f"[skip-focus] row={row.row_idx:>2} | "
-                            f"expect={self._fit_col(row.title, 14)}"
-                        )
-                        if focus_result.seen_header:
-                            print(
-                                f"            seen={self._fit_col(focus_result.seen_header, seen_w)}"
-                            )
-                        time.sleep(self.cfg.poll_interval_sec)
-                        continue
-                    resolved = focus_result.resolved_row
-                    changed_target = (
-                        resolved.row_idx != row.row_idx
-                        or self._title_key(resolved.title) != self._title_key(row.title)
-                    )
-                    if changed_target and self.cfg.log_verbose:
-                        print(
-                            f"[focus-retarget] from={self._fit_col(row.title, 14)} "
-                            f"-> to={self._fit_col(resolved.title, 14)}"
-                        )
-                    row = resolved
-                    focused_bounds = focus_result.bounds
-
-                is_group = self._is_group_chat(row)
-                is_admin = self._is_admin_session(row)
-                skip_self_latest = (
-                    self.cfg.skip_if_latest_chat_from_self
-                    and (is_group or self.cfg.skip_if_latest_chat_from_self_private)
-                )
-                session_context = self._build_session_context(row)
-                session_history = self._build_session_history_text(row)
-                workspace_context = self._workspace_context_for_row(
-                    row,
-                    is_admin=is_admin,
-                    skill_query=row.preview or row.text or row.title,
-                )
-                memory_recall = self._workspace_memory_recall_for_row(
-                    row,
-                    row.preview or row.text,
-                    is_admin=is_admin,
-                )
-                if need_context:
-                    context_snapshot = self._extract_chat_context(
-                        focused_bounds,
-                        title=row.title,
-                        reason=reason,
-                        is_group=is_group,
-                        session_context=session_context,
-                        session_history=session_history,
-                        workspace_context=workspace_context,
-                        memory_recall=memory_recall,
-                        latest_hint=row.preview or row.text,
-                        preview=row.preview,
-                    )
-                    if context_snapshot.chat_records:
-                        self._merge_session_records(
-                            row, context_snapshot.chat_records, source=context_snapshot.source
-                        )
-                    if context_snapshot.memory_summary:
-                        self._apply_session_summary(row, context_snapshot.memory_summary)
-                    self._apply_workspace_memory_update(row, context_snapshot)
-                    chat_context = context_snapshot.text
-                    environment_context = context_snapshot.environment_text
-                    if self.cfg.debug_scan:
-                        print(f"[context] row={row.row_idx} text={chat_context!r}")
-                    if self.cfg.log_verbose:
-                        line_w = max(24, self._term_width() - 12)
-                        print(
-                            f"[ctx] row={row.row_idx:>2} | "
-                            f"src={self._fit_col(context_snapshot.source, 6)} | "
-                            f"schema={self._fit_col(context_snapshot.schema or '-', 14)} | "
-                            f"side={self._fit_col(context_snapshot.last_side, 7)}"
-                        )
-                        print(
-                            f"      last={self._fit_col(context_snapshot.last_line, line_w)}"
-                        )
-
-                if (
-                    reason == "new_message"
-                    and skip_self_latest
-                    and context_snapshot.last_side == "self"
-                ):
-                    if self.cfg.log_verbose or self.cfg.debug_scan:
-                        print(
-                            f"[skip-self-latest] row={row.row_idx} title={row.title!r} "
-                            f"preview={row.preview!r} last_line={context_snapshot.last_line!r}"
-                        )
-                    mem = self._baseline.get(row.row_idx)
-                    if mem is not None:
-                        mem.last_replied_at = now
-                        mem.pending_unread = False
-                        mem.pending_normal = False
-                        mem.pending_mention = False
-                        self._save_persistent_memory()
-                        time.sleep(self.cfg.poll_interval_sec)
-                        continue
-
-                cmd_line = ""
-                if is_admin:
-                    cmd_line = self._extract_admin_command_text(row, context_snapshot)
-                    if cmd_line:
-                        self._append_session_item(row, "U", cmd_line)
-                        ack = self._handle_admin_command(cmd_line)
-                        if self.cfg.log_verbose:
-                            print(f"[admin-cmd] cmd={cmd_line!r} ack={ack!r}")
-                        reply_text = self._reply(
-                            row,
-                            "admin_command",
-                            focused_bounds=focused_bounds,
-                            environment_context=environment_context,
-                            workspace_context=workspace_context,
-                            memory_recall=memory_recall,
-                            force_message=ack or "命令已执行。",
-                        )
-                        mem = self._baseline.get(row.row_idx)
-                        if mem is not None:
-                            mem.last_replied_at = now
-                            mem.last_sent_norm = self._normalize_preview(reply_text)
-                            mem.pending_unread = False
-                            mem.pending_normal = False
-                            mem.pending_mention = False
-                        self._remember_sent_for_row(
-                            row, self._normalize_preview(reply_text), now
-                        )
-                        self._append_session_item(row, "A", reply_text)
-                        self._save_persistent_memory()
-                        time.sleep(self.cfg.poll_interval_sec)
-                        continue
-
-                latest_user_message = ""
-                if context_snapshot.last_user_message:
-                    latest_user_message = context_snapshot.last_user_message
-                elif context_snapshot.last_line and context_snapshot.last_side == "other":
-                    latest_user_message = context_snapshot.last_line
-                else:
-                    latest_user_message = row.preview or row.text
-
-                memory_recall = self._workspace_memory_recall_for_row(
-                    row,
-                    latest_user_message or row.preview or row.text,
-                    is_admin=is_admin,
-                )
-
-                session_context = self._build_session_context(row)
-                if (not context_snapshot.chat_records) and latest_user_message:
-                    self._append_session_record(
-                        row,
-                        role="user",
-                        text=latest_user_message,
-                        content_type="text",
-                        sender="",
-                        source="list",
-                        count_turn=True,
-                    )
-                    session_context = self._build_session_context(row)
-                if not context_snapshot.memory_summary:
-                    self._update_long_summary(row)
-                    session_context = self._build_session_context(row)
-
-                if self._is_immediate_reply_event(row, reason):
-                    should_reply = True
-                else:
-                    should_reply = self._llm_should_reply_with_context(
-                        row,
-                        reason,
-                        is_group,
-                        chat_context,
-                        environment_context,
-                        session_context,
-                        workspace_context,
-                        memory_recall,
-                    )
-
-                if not should_reply:
-                    mem = self._baseline.get(row.row_idx)
-                    if mem is not None:
-                        mem.last_replied_at = now
-                        mem.pending_unread = False
-                        mem.pending_normal = False
-                        mem.pending_mention = False
-                    self._save_persistent_memory()
-                    time.sleep(self.cfg.poll_interval_sec)
-                    continue
-
-                lookup_query = re.sub(
-                    r"\s+",
-                    " ",
-                    (latest_user_message or row.preview or row.text or "").strip(),
-                )[:80]
-                lookup_intent = self._is_web_lookup_intent(lookup_query)
-                if not lookup_intent and self._is_opinion_prompt(latest_user_message or row.preview or ""):
-                    topic_query = self._extract_lookup_topic_from_context(chat_context)
-                    if topic_query:
-                        lookup_query = topic_query[:80]
-                        lookup_intent = True
-                if self.cfg.log_verbose:
-                    print(
-                        f"[agent] lookup-intent={lookup_intent} "
-                        f"query={self._fit_col(lookup_query, max(24, self._term_width() - 28))}"
-                    )
-                reply_budget = max(1, int(self.cfg.agent_reply_max_messages_per_turn))
-                sent_in_event = 0
-                skip_event_reply = False
-                sent_norm_in_event: set[str] = set()
-                follow_reason = reason
-                follow_lookup_intent = lookup_intent
-                follow_lookup_query = lookup_query
-
-                while sent_in_event < reply_budget:
-                    planner_hint = ""
-                    planner_send_reply = True
-                    if self.cfg.agent_actions_enabled:
-                        tools = self._available_agent_tools(is_admin=is_admin)
-                        if tools:
-                            memory_recall, planner_hint, _, planner_send_reply, _ = self._run_agent_planner_loop(
-                                planner=self.llm_planner,
-                                row=row,
-                                reason=follow_reason,
-                                is_group=is_group,
-                                is_admin=is_admin,
-                                latest_message=latest_user_message,
-                                chat_context=chat_context,
-                                environment_context=environment_context,
-                                session_context=session_context,
-                                workspace_context=workspace_context,
-                                memory_recall=memory_recall,
-                                tools=tools,
-                                per_round_max_actions=self.cfg.agent_actions_max_per_turn,
-                                lookup_intent=follow_lookup_intent,
-                                lookup_query=follow_lookup_query,
-                                enforce_lookup_round1=(sent_in_event == 0),
-                            )
-                        if planner_hint and self.cfg.log_verbose:
-                            print(
-                                f"[agent] planner hint ignored (reply by llm) row={row.row_idx:>2} "
-                                f"hint={self._fit_col(planner_hint, max(24, self._term_width() - 45))}"
-                            )
-                        if not planner_send_reply:
-                            if sent_in_event == 0:
-                                if self.cfg.log_verbose:
-                                    print(
-                                        f"[agent] planner requested hold-send row={row.row_idx:>2} "
-                                        f"title={self._fit_col(row.title, 14)}"
-                                    )
-                                mem = self._baseline.get(row.row_idx)
-                                if mem is not None:
-                                    mem.last_replied_at = now
-                                    mem.pending_unread = False
-                                    mem.pending_normal = False
-                                    mem.pending_mention = False
-                                self._save_persistent_memory()
-                                time.sleep(self.cfg.poll_interval_sec)
-                                skip_event_reply = True
-                            elif self.cfg.log_verbose:
-                                print(
-                                    f"[agent] planner stop after sent={sent_in_event} "
-                                    f"row={row.row_idx:>2}"
-                                )
-                            break
-                        if sent_in_event > 0:
-                            if self.cfg.log_verbose:
-                                print(
-                                    f"[agent] stop follow-up (planner direct reply disabled) row={row.row_idx:>2} "
-                                    f"sent={sent_in_event}"
-                                )
-                            break
-
-                    message = self._reply(
-                        row,
-                        reason,
-                        focused_bounds=focused_bounds,
-                        chat_context=chat_context,
-                        environment_context=environment_context,
-                        session_context=session_context,
-                        workspace_context=workspace_context,
-                        memory_recall=memory_recall,
-                        latest_message=latest_user_message,
-                        force_message="",
-                    )
-                    if not (message or "").strip():
-                        if self.cfg.log_verbose:
-                            print(
-                                f"[agent] stop empty reply row={row.row_idx:>2} "
-                                f"sent={sent_in_event}"
-                            )
-                        break
-                    mem = self._baseline.get(row.row_idx)
-                    sent_norm = self._normalize_preview(message)
-                    if mem is not None:
-                        mem.last_replied_at = now
-                        mem.last_sent_norm = sent_norm
-                        mem.pending_unread = False
-                        mem.pending_normal = False
-                        mem.pending_mention = False
-                        self._remember_sent_for_row(row, sent_norm, now)
-                        if message and self._is_normal_reply_event(row, reason):
-                            self._last_normal_reply_at = now
-                    self._append_session_item(row, "A", message)
-                    self._save_persistent_memory()
-                    if sent_norm:
-                        sent_norm_in_event.add(sent_norm)
-                    sent_in_event += 1
-                    if not self.cfg.agent_actions_enabled:
-                        break
-                    if sent_in_event >= reply_budget:
-                        if self.cfg.log_verbose:
-                            print(
-                                f"[agent] reply budget reached row={row.row_idx:>2} "
-                                f"budget={reply_budget}"
-                            )
-                        break
-
-                    # Give planner a fresh view after each sent message and let it decide
-                    # whether to continue with another message.
-                    chat_context = self._build_session_history_text(row)
-                    session_context = self._build_session_context(row)
-                    follow_reason = "planner_follow_up"
-                    follow_lookup_intent = False
-                    follow_lookup_query = ""
-                    if self.cfg.log_verbose:
-                        print(
-                            f"[agent] multi-send continue row={row.row_idx:>2} "
-                            f"next={sent_in_event + 1}/{reply_budget}"
-                        )
-
-                if skip_event_reply:
-                    continue
             else:
                 self._idle_streak += 1
                 if self.cfg.log_verbose:

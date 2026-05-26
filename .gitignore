@@ -22,6 +22,13 @@ data/
 !data/
 data/*
 !data/.gitkeep
+!data/identity.md
+!data/memory/
+data/memory/*
+!data/memory/*.md
+!data/people/
+data/people/*
+!data/people/*.md
 
 # Local provider config
 config/*.json

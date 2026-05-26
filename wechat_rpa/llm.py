@@ -641,6 +641,12 @@ class LlmReplyGenerator:
         t6 = re.sub(r'}\s*"\s*,\s*"', '},"', t5)
         attempts.append(t6)
 
+        # 7) Escape unescaped double quotes between CJK characters inside string values.
+        # LLMs often output literal "..." around quoted terms in Chinese content fields.
+        t7 = re.sub(r'(?<=[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef])"(?=[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef，。、；：])', r'\u201c', t6)
+        t7 = re.sub(r'(?<=[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef，。、；：])"(?=[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef])', r'\u201d', t7)
+        attempts.append(t7)
+
         # De-duplicate while preserving order.
         out: list[str] = []
         seen: set[str] = set()
@@ -1248,6 +1254,33 @@ class LlmReplyGenerator:
         image.save(buf, format="PNG")
         b64 = base64.b64encode(buf.getvalue()).decode("ascii")
         return f"data:image/png;base64,{b64}"
+
+    def describe_image(self, image: Image.Image, *, prompt: str = "") -> str:
+        if not self.is_vision_enabled():
+            raise RuntimeError("vision disabled")
+        data_url = self._image_to_data_url(image)
+        vision_prompt = (
+            prompt.strip()
+            or "Describe this image in detail. If it contains text, transcribe the visible text. Answer in Chinese."
+        )
+        payload: dict = {
+            "model": self.vision_cfg.model,
+            "temperature": 0.0,
+            "messages": [
+                {"role": "system", "content": self.vision_cfg.system_prompt},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": vision_prompt},
+                        {"type": "image_url", "image_url": {"url": data_url}},
+                    ],
+                },
+            ],
+        }
+        vision_max_tokens = self._effective_text_max_tokens(self.vision_cfg.max_tokens)
+        if vision_max_tokens is not None:
+            payload["max_tokens"] = max(256, min(vision_max_tokens, 1200))
+        return self._post_chat_vision(payload).strip()
 
     @staticmethod
     def _norm_role(v: str) -> str:
@@ -2224,6 +2257,23 @@ class LlmReplyGenerator:
             "set_session_summary": "args={\"summary\":\"<=200字\"} 更新当前会话画像摘要",
             "search_memory": "args={\"query\":\"<=80字\"} 在记忆库检索相关片段",
             "search_person_impression": "args={\"query\":\"<=80字\"} 检索特定人物的印象记忆",
+            "write_memory": (
+                "args={\"name\":\"core|timeline\",\"content\":\"完整 markdown\"} "
+                "完整替换 data/memory/core.md 或 timeline.md"
+            ),
+            "read_impression": "args={\"name\":\"规范中文名\"} 读取 data/people/<name>.md 人物印象",
+            "read_chat_history": (
+                "args={\"chat_title\":\"可选，不填为当前会话\",\"limit\":1-100} "
+                "读取最近聊天记录"
+            ),
+            "run_python": (
+                "args={\"code\":\"短代码，需 print 输出\"} "
+                "仅用于数学、统计、日期计算；无文件/网络/系统访问"
+            ),
+            "write_impression": (
+                "args={\"name\":\"规范中文名\",\"content\":\"完整 markdown\"} "
+                "完整替换 data/people/<name>.md"
+            ),
             "workspace_list_files": (
                 "args={\"path\":\"<=120字,可空\",\"recursive\":false,\"max_entries\":1-200} "
                 "列出 agent_workspace 目录内容"
@@ -2242,6 +2292,10 @@ class LlmReplyGenerator:
                 "args={\"prompt\":\"<=280字\",\"size\":\"可选，如1024x1024\"} "
                 "生成图片并发送本地文件"
             ),
+            "edit_image": (
+                "args={\"prompt\":\"<=800字\",\"image_path\":\"可选，不填用最近收到的图片\",\"size\":\"可选\"} "
+                "编辑/改图并发送"
+            ),
             "remember_long_term": "args={\"note\":\"<=200字\"} 写入长期记忆（仅管理员）",
             "maintain_memory": "args={\"days\":1-14} 整理近期记忆到 MEMORY.md",
             "maintain_person_impressions": (
@@ -2258,6 +2312,7 @@ class LlmReplyGenerator:
             "你是微信机器人动作规划器。"
             "你只能从给定工具白名单中选择动作，不允许发明新工具。"
             "你必须严格输出一个 JSON 对象，不要输出 markdown、解释或前缀。"
+            "JSON 中所有字符串值内的双引号必须转义为 \\\"，例如 content 字段中有中文引号时用 \\\"魔法少女\\\"。"
             "输出格式必须是："
             '{"actions":[{"tool":"...","args":{},"reason":"<=40字"}],"reply_hint":"<=120字","send_reply":true|false,"task":{"status":"idle|running|blocked|waiting_user|done","goal":"<=120字","plan":"<=200字","next_step":"<=120字","blocked_reason":"<=120字","continue_on_heartbeat":true|false}}。'
             "如果不需要动作，actions 返回空数组。reply_hint 可空串。"
@@ -2297,6 +2352,8 @@ class LlmReplyGenerator:
             + "10) send_reply=false 表示当前不要对用户发送最终回复；send_reply=true 表示本轮可发送最终回复。\n"
             + "11) 当用户明确要求作图/海报/配图时可用 generate_image，prompt 要具体且可执行；"
             + "若需求是纯文本答复，不要调用 generate_image。"
+            + "\n11b) 当用户要求改图、修图、换风格、增删画面内容时优先用 edit_image；"
+            + "如果当前消息或近期上下文已有图片，可省略 image_path。"
             + "\n12) task.status=running 表示任务未完成，后续还要继续；若希望空闲时后台续跑，设 continue_on_heartbeat=true。"
             + "\n13) task.status=waiting_user 表示缺用户信息，continue_on_heartbeat 必须为 false。"
             + "\n14) task.status=done 表示当前任务已完成；task.status=blocked 表示被外部条件卡住，需写 blocked_reason。"
@@ -2312,7 +2369,10 @@ class LlmReplyGenerator:
         }
         planner_max_tokens = self._effective_text_max_tokens(self.cfg.max_tokens)
         if planner_max_tokens is not None:
-            payload["max_tokens"] = max(120, min(520, planner_max_tokens))
+            if {"write_memory", "write_impression"} & tool_set:
+                payload["max_tokens"] = planner_max_tokens
+            else:
+                payload["max_tokens"] = max(120, min(520, planner_max_tokens))
         content = self._post_chat(payload)
         parsed_any = self._extract_json_payload(content)
         if isinstance(parsed_any, dict):
@@ -2451,6 +2511,49 @@ class LlmReplyGenerator:
                     if not query:
                         continue
                     args = {"query": query}
+                elif tool == "write_memory":
+                    raw_name = str(args_obj.get("name", "core")).strip().lower()
+                    name = "timeline" if raw_name in {"timeline", "time", "history", "events"} else "core"
+                    content = str(args_obj.get("content", "") or args_obj.get("text", "")).strip()[:12000]
+                    if not content:
+                        continue
+                    args = {"name": name, "content": content}
+                elif tool == "read_impression":
+                    name = re.sub(
+                        r"\s+",
+                        " ",
+                        str(args_obj.get("name", "") or args_obj.get("person", "")).strip(),
+                    )[:40]
+                    if not name:
+                        continue
+                    args = {"name": name}
+                elif tool == "read_chat_history":
+                    chat_title = re.sub(
+                        r"\s+",
+                        " ",
+                        str(args_obj.get("chat_title", "") or args_obj.get("title", "")).strip(),
+                    )[:80]
+                    limit_raw = args_obj.get("limit", 50)
+                    try:
+                        limit = int(limit_raw)
+                    except Exception:
+                        limit = 50
+                    args = {"chat_title": chat_title, "limit": max(1, min(100, limit))}
+                elif tool == "run_python":
+                    code = str(args_obj.get("code", "") or args_obj.get("expression", "")).strip()[:4000]
+                    if not code:
+                        continue
+                    args = {"code": code}
+                elif tool == "write_impression":
+                    name = re.sub(
+                        r"\s+",
+                        " ",
+                        str(args_obj.get("name", "") or args_obj.get("person", "")).strip(),
+                    )[:40]
+                    content = str(args_obj.get("content", "") or args_obj.get("text", "")).strip()[:12000]
+                    if (not name) or (not content):
+                        continue
+                    args = {"name": name, "content": content}
                 elif tool == "workspace_list_files":
                     rel_path = re.sub(
                         r"\s+",
@@ -2522,6 +2625,28 @@ class LlmReplyGenerator:
                         continue
                     args = {"prompt": prompt}
                     size_raw = re.sub(r"\s+", "", str(args_obj.get("size", "")).strip().lower())
+                    if re.fullmatch(r"\d{2,4}x\d{2,4}", size_raw):
+                        args["size"] = size_raw
+                elif tool == "edit_image":
+                    prompt = re.sub(
+                        r"\s+",
+                        " ",
+                        str(args_obj.get("prompt", "") or args_obj.get("text", "")).strip(),
+                    )[:800]
+                    if not prompt:
+                        continue
+                    args = {"prompt": prompt}
+                    image_path = str(
+                        args_obj.get("image_path", "")
+                        or args_obj.get("path", "")
+                        or args_obj.get("file_path", "")
+                    ).strip()[:500]
+                    image_url = str(args_obj.get("image_url", "") or args_obj.get("url", "")).strip()[:1000]
+                    size_raw = re.sub(r"\s+", "", str(args_obj.get("size", "")).strip().lower())
+                    if image_path:
+                        args["image_path"] = image_path
+                    if image_url:
+                        args["image_url"] = image_url
                     if re.fullmatch(r"\d{2,4}x\d{2,4}", size_raw):
                         args["size"] = size_raw
                 elif tool == "maintain_memory":

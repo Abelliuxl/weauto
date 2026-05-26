@@ -169,12 +169,12 @@ class RerankConfig:
 @dataclass
 class ImageGenerationConfig:
     enabled: bool = False
-    provider: str = "openai_compat"
-    base_url: str = "https://api.siliconflow.cn/v1"
-    base_url_env: str = "SILICONFLOW_BASE_URL"
+    provider: str = "dashscope_z_image"
+    base_url: str = "https://dashscope.aliyuncs.com/api/v1/services/aigc"
+    base_url_env: str = "DASHSCOPE_BASE_URL"
     api_key: str = ""
-    api_key_env: str = "SILICONFLOW_API_KEY"
-    model: str = "black-forest-labs/FLUX.1-dev"
+    api_key_env: str = "DASHSCOPE_API_KEY"
+    model: str = "z-image-turbo"
     timeout_sec: float = 90.0
     download_timeout_sec: float = 45.0
     default_size: str = "1024x1024"
@@ -182,8 +182,34 @@ class ImageGenerationConfig:
 
 
 @dataclass
+class ImageEditingConfig:
+    enabled: bool = False
+    provider: str = "dashscope_qwen_image_edit"
+    base_url: str = "https://dashscope.aliyuncs.com/api/v1/services/aigc"
+    base_url_env: str = "DASHSCOPE_BASE_URL"
+    api_key: str = ""
+    api_key_env: str = "DASHSCOPE_API_KEY"
+    model: str = "qwen-image-2.0-pro"
+    timeout_sec: float = 120.0
+    download_timeout_sec: float = 45.0
+    default_size: str = ""
+    output_dir: str = "data/edited_images"
+    watermark: bool = False
+    prompt_extend: bool = True
+    max_input_bytes: int = 10 * 1024 * 1024
+
+
+@dataclass
 class AppConfig:
     app_name: str = "WeChat"
+    # detached_windows: capture each detached chat window by macOS window id.
+    # legacy_list: old whole-app left-list detector.
+    receiver_mode: str = "detached_windows"
+    detached_window_title_filter: list[str] = field(default_factory=list)
+    detached_window_output_dir: str = "data/detached_window_images"
+    detached_debug_save: bool = False
+    detached_reply_on_image: bool = False
+    detached_process_existing_on_start: bool = False
     poll_interval_sec: float = 2.0
     action_cooldown_sec: float = 8.0
     normal_reply_interval_sec: float = 60.0
@@ -227,6 +253,8 @@ class AppConfig:
     workspace_memory_sqlite_chunk_chars: int = 320
     # In-process embedding cache cap to prevent unbounded RAM growth.
     workspace_embedding_cache_max_items: int = 1024
+    people_aliases_enabled: bool = True
+    people_aliases_path: str = "agent_workspace/PEOPLE_ALIASES.md"
     admin_commands_enabled: bool = True
     admin_session_titles: list[str] = field(default_factory=lambda: ["example_admin"])
     admin_command_prefix: str = "/"
@@ -268,14 +296,14 @@ class AppConfig:
     agent_reach_max_results: int = 5
     agent_reach_timeout_sec: float = 12.0
     heartbeat_enabled: bool = False
-    heartbeat_interval_sec: float = 1800.0
+    heartbeat_interval_sec: float = 300.0
     heartbeat_min_idle_sec: float = 20.0
-    heartbeat_max_actions: int = 2
+    heartbeat_max_actions: int = 4
     heartbeat_fail_open: bool = True
     heartbeat_prompt: str = (
-        "Read HEARTBEAT.md if it exists (workspace context). Follow it strictly. "
-        "Do not infer or repeat old tasks from prior chats. "
-        "If nothing needs attention, return no actions."
+        "Scheduled self-reflection heartbeat. Maintain data/memory/core.md, "
+        "data/memory/timeline.md, and data/people/*.md only when recent chat "
+        "activity justifies it."
     )
     person_impression_enabled: bool = False
     person_impression_days: int = 90
@@ -357,6 +385,7 @@ class AppConfig:
     embedding: EmbeddingConfig = field(default_factory=EmbeddingConfig)
     rerank: RerankConfig = field(default_factory=RerankConfig)
     image_generation: ImageGenerationConfig = field(default_factory=ImageGenerationConfig)
+    image_editing: ImageEditingConfig = field(default_factory=ImageEditingConfig)
 
 
 def _load_region(data: dict, key: str, default: RegionRatio) -> RegionRatio:
@@ -519,6 +548,21 @@ def load_config(path: str | Path | None) -> AppConfig:
     data = tomllib.loads(config_path.read_text(encoding="utf-8"))
 
     cfg.app_name = str(data.get("app_name", cfg.app_name))
+    receiver_mode = str(data.get("receiver_mode", cfg.receiver_mode)).strip().lower()
+    cfg.receiver_mode = receiver_mode if receiver_mode in {"detached_windows", "legacy_list"} else "detached_windows"
+    title_filter = data.get("detached_window_title_filter", cfg.detached_window_title_filter)
+    if isinstance(title_filter, list):
+        cfg.detached_window_title_filter = [str(x).strip() for x in title_filter if str(x).strip()]
+    cfg.detached_window_output_dir = str(
+        data.get("detached_window_output_dir", cfg.detached_window_output_dir)
+    ).strip() or cfg.detached_window_output_dir
+    cfg.detached_debug_save = bool(data.get("detached_debug_save", cfg.detached_debug_save))
+    cfg.detached_reply_on_image = bool(
+        data.get("detached_reply_on_image", cfg.detached_reply_on_image)
+    )
+    cfg.detached_process_existing_on_start = bool(
+        data.get("detached_process_existing_on_start", cfg.detached_process_existing_on_start)
+    )
     cfg.poll_interval_sec = float(data.get("poll_interval_sec", cfg.poll_interval_sec))
     cfg.action_cooldown_sec = float(data.get("action_cooldown_sec", cfg.action_cooldown_sec))
     cfg.normal_reply_interval_sec = float(
@@ -623,6 +667,10 @@ def load_config(path: str | Path | None) -> AppConfig:
     cfg.workspace_embedding_cache_max_items = int(
         data.get("workspace_embedding_cache_max_items", cfg.workspace_embedding_cache_max_items)
     )
+    cfg.people_aliases_enabled = bool(
+        data.get("people_aliases_enabled", cfg.people_aliases_enabled)
+    )
+    cfg.people_aliases_path = str(data.get("people_aliases_path", cfg.people_aliases_path))
     if cfg.workspace_memory_rerank_shortlist < 1:
         cfg.workspace_memory_rerank_shortlist = 1
     if cfg.workspace_memory_rerank_weight < 0.0:
@@ -1011,17 +1059,23 @@ def load_config(path: str | Path | None) -> AppConfig:
     ).strip()
     if (not image_gen_base_url) and image_gen_base_url_env:
         image_gen_base_url = str(os.getenv(image_gen_base_url_env, "")).strip().rstrip("/")
+    image_gen_model = str(image_gen_raw.get("model", cfg.image_generation.model)).strip()
+    image_gen_provider_default = cfg.image_generation.provider
+    if "provider" not in image_gen_raw:
+        legacy_hint = " ".join([image_gen_base_url, image_gen_model]).lower()
+        if "siliconflow" in legacy_hint or "flux" in legacy_hint:
+            image_gen_provider_default = "openai_compat"
     cfg.image_generation = ImageGenerationConfig(
         enabled=bool(image_gen_raw.get("enabled", cfg.image_generation.enabled)),
         provider=_load_image_generation_provider(
-            image_gen_raw.get("provider", cfg.image_generation.provider),
-            cfg.image_generation.provider,
+            image_gen_raw.get("provider", image_gen_provider_default),
+            image_gen_provider_default,
         ),
         base_url=image_gen_base_url,
         base_url_env=image_gen_base_url_env,
         api_key=str(image_gen_raw.get("api_key", cfg.image_generation.api_key)),
         api_key_env=str(image_gen_raw.get("api_key_env", cfg.image_generation.api_key_env)),
-        model=str(image_gen_raw.get("model", cfg.image_generation.model)).strip(),
+        model=image_gen_model,
         timeout_sec=float(image_gen_raw.get("timeout_sec", cfg.image_generation.timeout_sec)),
         download_timeout_sec=float(
             image_gen_raw.get(
@@ -1035,9 +1089,9 @@ def load_config(path: str | Path | None) -> AppConfig:
         output_dir=str(image_gen_raw.get("output_dir", cfg.image_generation.output_dir)).strip(),
     )
     if not cfg.image_generation.base_url:
-        cfg.image_generation.base_url = "https://api.siliconflow.cn/v1"
+        cfg.image_generation.base_url = "https://dashscope.aliyuncs.com/api/v1/services/aigc"
     if not cfg.image_generation.model:
-        cfg.image_generation.model = "black-forest-labs/FLUX.1-dev"
+        cfg.image_generation.model = "z-image-turbo"
     if not cfg.image_generation.default_size:
         cfg.image_generation.default_size = "1024x1024"
     if not cfg.image_generation.output_dir:
@@ -1046,6 +1100,76 @@ def load_config(path: str | Path | None) -> AppConfig:
         cfg.image_generation.timeout_sec = 5.0
     if cfg.image_generation.download_timeout_sec < 5.0:
         cfg.image_generation.download_timeout_sec = 5.0
+
+    image_edit_raw = data.get("image_editing", {})
+    if isinstance(image_edit_raw, dict):
+        image_edit_base_url = str(
+            image_edit_raw.get(
+                "base_url",
+                cfg.image_generation.base_url or cfg.image_editing.base_url,
+            )
+        ).strip().rstrip("/")
+        image_edit_base_url_env = str(
+            image_edit_raw.get(
+                "base_url_env",
+                cfg.image_generation.base_url_env or cfg.image_editing.base_url_env,
+            )
+        ).strip()
+        if (not image_edit_base_url) and image_edit_base_url_env:
+            image_edit_base_url = str(os.getenv(image_edit_base_url_env, "")).strip().rstrip("/")
+        cfg.image_editing = ImageEditingConfig(
+            enabled=bool(image_edit_raw.get("enabled", cfg.image_editing.enabled)),
+            provider=str(
+                image_edit_raw.get("provider", cfg.image_editing.provider)
+            ).strip().lower() or "dashscope_qwen_image_edit",
+            base_url=image_edit_base_url,
+            base_url_env=image_edit_base_url_env,
+            api_key=str(
+                image_edit_raw.get(
+                    "api_key",
+                    cfg.image_generation.api_key or cfg.image_editing.api_key,
+                )
+            ),
+            api_key_env=str(
+                image_edit_raw.get(
+                    "api_key_env",
+                    cfg.image_generation.api_key_env or cfg.image_editing.api_key_env,
+                )
+            ),
+            model=str(image_edit_raw.get("model", cfg.image_editing.model)).strip(),
+            timeout_sec=float(image_edit_raw.get("timeout_sec", cfg.image_editing.timeout_sec)),
+            download_timeout_sec=float(
+                image_edit_raw.get(
+                    "download_timeout_sec",
+                    cfg.image_editing.download_timeout_sec,
+                )
+            ),
+            default_size=str(
+                image_edit_raw.get("default_size", cfg.image_editing.default_size)
+            ).strip(),
+            output_dir=str(
+                image_edit_raw.get("output_dir", cfg.image_editing.output_dir)
+            ).strip(),
+            watermark=bool(image_edit_raw.get("watermark", cfg.image_editing.watermark)),
+            prompt_extend=bool(
+                image_edit_raw.get("prompt_extend", cfg.image_editing.prompt_extend)
+            ),
+            max_input_bytes=int(
+                image_edit_raw.get("max_input_bytes", cfg.image_editing.max_input_bytes)
+            ),
+        )
+    if not cfg.image_editing.base_url:
+        cfg.image_editing.base_url = "https://dashscope.aliyuncs.com/api/v1/services/aigc"
+    if not cfg.image_editing.model:
+        cfg.image_editing.model = "qwen-image-2.0-pro"
+    if not cfg.image_editing.output_dir:
+        cfg.image_editing.output_dir = "data/edited_images"
+    if cfg.image_editing.timeout_sec < 5.0:
+        cfg.image_editing.timeout_sec = 5.0
+    if cfg.image_editing.download_timeout_sec < 5.0:
+        cfg.image_editing.download_timeout_sec = 5.0
+    if cfg.image_editing.max_input_bytes <= 0:
+        cfg.image_editing.max_input_bytes = 10 * 1024 * 1024
     if cfg.send_after_paste_delay_sec < 0.0:
         cfg.send_after_paste_delay_sec = 0.0
 

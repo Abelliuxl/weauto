@@ -5,6 +5,17 @@
 # WeChat app name shown by macOS window server
 app_name = "WeChat"
 
+# Receiver mode:
+# - detached_windows: recommended; each chat is a detached WeChat window,
+#   captured by macOS window id and parsed with local OCR.
+# - legacy_list: old whole-app left-list detector, kept for rollback.
+receiver_mode = "detached_windows"
+detached_window_title_filter = []
+detached_window_output_dir = "data/detached_window_images"
+detached_debug_save = false
+detached_reply_on_image = false
+detached_process_existing_on_start = false
+
 # --------------------
 # Loop Cadence
 # --------------------
@@ -84,6 +95,11 @@ workspace_memory_sqlite_vector_limit = 24
 workspace_memory_sqlite_chunk_chars = 320
 workspace_embedding_cache_max_items = 1024
 
+# Canonicalize OCR sender nicknames through PEOPLE_ALIASES.md before they
+# enter chat history, reply context, heartbeat, and person impressions.
+people_aliases_enabled = true
+people_aliases_path = "agent_workspace/PEOPLE_ALIASES.md"
+
 # --------------------
 # Admin Session
 # --------------------
@@ -154,11 +170,11 @@ agent_reach_timeout_sec = 12.0
 # --------------------
 
 heartbeat_enabled = false
-heartbeat_interval_sec = 1800.0
+heartbeat_interval_sec = 300.0
 heartbeat_min_idle_sec = 20.0
-heartbeat_max_actions = 2
+heartbeat_max_actions = 4
 heartbeat_fail_open = true
-heartbeat_prompt = "Read HEARTBEAT.md if it exists (workspace context). Follow it strictly. Do not infer or repeat old tasks from prior chats. If nothing needs attention, return no actions."
+heartbeat_prompt = "Scheduled self-reflection heartbeat. Maintain data/memory/core.md, data/memory/timeline.md, and data/people/*.md only when recent chat activity justifies it."
 
 # ============================================================
 # Reply Policy & Detection
@@ -427,15 +443,33 @@ system_prompt = "你是微信聊天截图解析器。请严格输出 JSON，sche
 # planner 工具名：generate_image。启用后可按需生成图片并发送本地文件。
 # 每次生成会保留图片文件，并在 output_dir/history.jsonl 追加历史记录。
 enabled = false
-base_url = "https://api.siliconflow.cn/v1"
-base_url_env = "SILICONFLOW_BASE_URL"
+provider = "dashscope_z_image"  # openai_compat | dashscope_z_image
+base_url = "https://dashscope.aliyuncs.com/api/v1/services/aigc"
+base_url_env = "DASHSCOPE_BASE_URL"
 api_key = "YOUR_API_KEY_HERE"
-api_key_env = "SILICONFLOW_API_KEY"
-model = "black-forest-labs/FLUX.1-dev"
+api_key_env = "DASHSCOPE_API_KEY"
+model = "z-image-turbo"
 timeout_sec = 90.0
 download_timeout_sec = 45.0
 default_size = "1024x1024"
 output_dir = "data/generated_images"
+
+[image_editing]
+# planner 工具名：edit_image。启用后可对最近收到的图片或指定本地图片进行编辑并发送。
+enabled = false
+provider = "dashscope_qwen_image_edit"
+base_url = "https://dashscope.aliyuncs.com/api/v1/services/aigc"
+base_url_env = "DASHSCOPE_BASE_URL"
+api_key = "YOUR_API_KEY_HERE"
+api_key_env = "DASHSCOPE_API_KEY"
+model = "qwen-image-2.0-pro"
+timeout_sec = 120.0
+download_timeout_sec = 45.0
+default_size = "1024x1024"
+output_dir = "data/edited_images"
+watermark = false
+prompt_extend = true
+max_input_bytes = 10485760
 
 # --------------------
 # Embedding (Memory Recall)
