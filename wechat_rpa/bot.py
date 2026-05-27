@@ -5032,10 +5032,10 @@ class WeChatGuiRpaBot:
                         image_output_dir=image_root / title_slug / "images",
                         include_debug=self.cfg.detached_debug_save,
                     )
-                    snapshot.messages = self._canonicalize_visible_messages(snapshot.messages)
                     for msg in snapshot.messages:
                         if (not msg.get("sender")) and msg.get("side") == "other" and window.title:
                             msg["sender"] = window.title[:40]
+                    snapshot.messages = self._canonicalize_visible_messages(snapshot.messages)
                     snapshot.latest_message = snapshot.messages[-1] if snapshot.messages else None
                 except Exception as exc:
                     print(f"[warn] detached capture/parse failed title={window.title!r}: {exc}")
