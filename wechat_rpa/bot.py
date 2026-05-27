@@ -4769,9 +4769,13 @@ class WeChatGuiRpaBot:
                 continue
             row = self._detached_row_for_message(window_id=window_id, title=title, message=message)
             if self._is_ignored_title(row):
+                if self.cfg.log_verbose:
+                    print(f"[batch-skip] ignored title={title!r}")
                 continue
             is_admin = self._is_admin_session(row)
             if (not is_admin) and self._is_row_muted(row):
+                if self.cfg.log_verbose:
+                    print(f"[batch-skip] muted title={title!r}")
                 continue
 
             content_type = str(message.get("content_type", "text")).strip().lower()
@@ -4781,6 +4785,8 @@ class WeChatGuiRpaBot:
             reason = "mention" if row.has_mention else "new_message"
             is_group = self._is_group_chat(row)
             if is_group and not self._should_reply_group(row, reason):
+                if self.cfg.log_verbose:
+                    print(f"[batch-skip] group rule title={title!r} reason={reason}")
                 continue
 
             if self._is_normal_reply_event(row, reason):
