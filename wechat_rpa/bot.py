@@ -2509,6 +2509,16 @@ class WeChatGuiRpaBot:
 
     def _open_url(self, req: urllib.request.Request, *, timeout: float, use_proxy: bool):
         if use_proxy:
+            proxy_url = (
+                os.getenv("HTTPS_PROXY")
+                or os.getenv("https_proxy")
+                or os.getenv("HTTP_PROXY")
+                or os.getenv("http_proxy")
+            )
+            if proxy_url:
+                handler = urllib.request.ProxyHandler({"https": proxy_url, "http": proxy_url})
+                opener = urllib.request.build_opener(handler)
+                return opener.open(req, timeout=timeout)
             return urllib.request.urlopen(req, timeout=timeout, context=ssl.create_default_context())
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         return opener.open(req, timeout=timeout)
