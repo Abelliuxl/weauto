@@ -87,6 +87,7 @@ if [[ "$LOG_KEEP_MAX_FILES" =~ ^[0-9]+$ && "$LOG_KEEP_MAX_TOTAL_MB" =~ ^[0-9]+$ 
   _prune_old_logs "$LOG_KEEP_MAX_FILES" "$((LOG_KEEP_MAX_TOTAL_MB * 1024 * 1024))"
 fi
 LOG_FILE="$LOG_DIR/rpa_$(date +%Y%m%d_%H%M%S).log"
+ISSUES_FILE="$LOG_DIR/issues.log"
 export WEAUTO_LOG_FILE="$LOG_FILE"
 # High-res Quartz capture leaks native memory in long-running loops on some
 # macOS builds. Keep it off by default; users can still override with
@@ -109,15 +110,28 @@ echo "[run] python run.py --config $CONFIG_PATH$EXTRA_DISPLAY"
 echo "[log] $LOG_FILE"
 echo "[log] retention: max_files=$LOG_KEEP_MAX_FILES max_total_mb=$LOG_KEEP_MAX_TOTAL_MB"
 
+# Issues filter: extract warn/error/skip lines to a separate log for easy daily review.
+_issues_pipe() {
+  local issues_file="$1"
+  while IFS= read -r line; do
+    if [[ "$line" =~ \[(warn|error|skip-)\] ]]; then
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] $line" >> "$issues_file"
+    fi
+  done
+}
+
 # Keep terminal colors when running through tee, and store plain logs without ANSI codes.
 if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
   export FORCE_COLOR="${FORCE_COLOR:-1}"
   if command -v perl >/dev/null 2>&1; then
     python -u run.py --config "$CONFIG_PATH" ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} 2>&1 \
-      | tee >(perl -pe 's/\e\[[0-9;]*[A-Za-z]//g' >> "$LOG_FILE")
+      | tee >(perl -pe 's/\e\[[0-9;]*[A-Za-z]//g' >> "$LOG_FILE") \
+            >(_issues_pipe "$ISSUES_FILE")
   else
-    python -u run.py --config "$CONFIG_PATH" ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} 2>&1 | tee -a "$LOG_FILE"
+    python -u run.py --config "$CONFIG_PATH" ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} 2>&1 \
+      | tee -a "$LOG_FILE" >(_issues_pipe "$ISSUES_FILE")
   fi
 else
-  python -u run.py --config "$CONFIG_PATH" ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} 2>&1 | tee -a "$LOG_FILE"
+  python -u run.py --config "$CONFIG_PATH" ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} 2>&1 \
+    | tee -a "$LOG_FILE" >(_issues_pipe "$ISSUES_FILE")
 fi
