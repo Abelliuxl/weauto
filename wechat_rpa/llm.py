@@ -2232,6 +2232,12 @@ class LlmReplyGenerator:
             "做不到时要明确说明卡点和下一步。"
             "严禁索要红包/稿费/转账或把回答设为先付款再说。"
         )
+        mention_style = (
+            "这是@消息，对方在直接向你提问。回复要求：内容详实完整、结构清晰、直接给结论和细节，"
+            "不要过于口语化或过于简短，像认真回答问题而不是闲聊。全句最多 1 个 emoji。\n"
+            if reason == "mention"
+            else ""
+        )
         user_prompt = (
             f"触发原因: {reason}\n"
             f"会话标题: {title or '未知'}\n"
@@ -2242,6 +2248,7 @@ class LlmReplyGenerator:
             f"该会话历史上下文: {session_context or '无'}\n"
             f"工作区规则与人格: {workspace_context or '无'}\n"
             f"相关记忆检索: {memory_recall or '无'}\n"
+            f"{mention_style}"
             "回复风格硬约束：自然口语优先，禁止在句首或整句写括号动作描写（如“（...）”）；"
             "全句最多使用 1 个 emoji，能不用就不用；避免夸张拟人舞台腔。"
             f"{sarcasm_guard}"
