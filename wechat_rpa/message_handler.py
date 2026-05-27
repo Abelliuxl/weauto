@@ -171,7 +171,6 @@ class MessageHandler:
                 )
             if context_snapshot.memory_summary:
                 bot._apply_session_summary(row, context_snapshot.memory_summary)
-            bot._apply_workspace_memory_update(row, context_snapshot)
             chat_context = context_snapshot.text
             environment_context = context_snapshot.environment_text
             if bot.cfg.debug_scan:

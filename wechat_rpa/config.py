@@ -145,27 +145,6 @@ class VisionConfig:
 
 
 @dataclass
-class EmbeddingConfig:
-    enabled: bool = False
-    base_url: str = "https://api.siliconflow.cn/v1"
-    base_url_env: str = "SILICONFLOW_BASE_URL"
-    api_key: str = ""
-    api_key_env: str = "SILICONFLOW_API_KEY"
-    model: str = "Qwen/Qwen3-Embedding-8B"
-    timeout_sec: float = 8.0
-
-
-@dataclass
-class RerankConfig:
-    enabled: bool = False
-    base_url: str = "https://api.siliconflow.cn/v1"
-    base_url_env: str = "SILICONFLOW_BASE_URL"
-    api_key: str = ""
-    api_key_env: str = "SILICONFLOW_API_KEY"
-    model: str = "Qwen/Qwen3-Reranker-8B"
-    timeout_sec: float = 12.0
-
-
 @dataclass
 class ImageGenerationConfig:
     enabled: bool = False
@@ -238,20 +217,6 @@ class AppConfig:
     memory_history_context_items: int = 24
     # 0 means unlimited.
     memory_history_max_items: int = 0
-    workspace_enabled: bool = False
-    workspace_dir: str = ""
-    workspace_memory_main_only: bool = True
-    workspace_memory_search_limit: int = 3
-    workspace_memory_rerank_enabled: bool = False
-    workspace_memory_rerank_shortlist: int = 24
-    workspace_memory_rerank_weight: float = 2.5
-    workspace_memory_sqlite_enabled: bool = False
-    workspace_memory_sqlite_path: str = ""
-    workspace_memory_sqlite_sync_interval_sec: float = 20.0
-    workspace_memory_sqlite_fts_limit: int = 64
-    workspace_memory_sqlite_vector_limit: int = 24
-    workspace_memory_sqlite_chunk_chars: int = 320
-    workspace_embedding_cache_max_items: int = 1024
     people_aliases_enabled: bool = True
     people_aliases_path: str = "data/config/PEOPLE_ALIASES.md"
     admin_commands_enabled: bool = True
@@ -302,17 +267,11 @@ class AppConfig:
     heartbeat_interval_sec: float = 300.0
     heartbeat_min_idle_sec: float = 20.0
     heartbeat_max_actions: int = 4
-    heartbeat_fail_open: bool = True
     heartbeat_prompt: str = (
         "Scheduled self-reflection heartbeat. Maintain data/memory/core.md, "
         "data/memory/timeline.md, and data/people/*.md only when recent chat "
         "activity justifies it."
     )
-    person_impression_enabled: bool = False
-    person_impression_days: int = 90
-    person_impression_max_people_per_run: int = 6
-    person_impression_search_limit: int = 3
-
     reply_on_new_message: str = "已收到消息，我稍后回复你。"
     reply_on_mention: str = "收到@，我看到了，稍后处理。"
     mention_keywords: list[str] = field(
@@ -361,8 +320,6 @@ class AppConfig:
     chat_title_region_private: RegionRatio = field(
         default_factory=lambda: RegionRatio(x=0.40, y=0.01, w=0.57, h=0.10)
     )
-    chat_context_max_lines: int = 14
-    chat_self_x_ratio: float = 0.62
     skip_if_latest_chat_from_self: bool = True
     # If false, self-latest skip applies to groups only.
     skip_if_latest_chat_from_self_private: bool = False
@@ -385,8 +342,6 @@ class AppConfig:
     llm_summary: LlmConfig = field(default_factory=LlmConfig)
     llm_heartbeat: LlmConfig = field(default_factory=LlmConfig)
     vision: VisionConfig = field(default_factory=VisionConfig)
-    embedding: EmbeddingConfig = field(default_factory=EmbeddingConfig)
-    rerank: RerankConfig = field(default_factory=RerankConfig)
     image_generation: ImageGenerationConfig = field(default_factory=ImageGenerationConfig)
     image_editing: ImageEditingConfig = field(default_factory=ImageEditingConfig)
 
@@ -623,71 +578,10 @@ def load_config(path: str | Path | None) -> AppConfig:
     cfg.memory_history_max_items = int(
         data.get("memory_history_max_items", cfg.memory_history_max_items)
     )
-    cfg.workspace_enabled = bool(data.get("workspace_enabled", cfg.workspace_enabled))
-    cfg.workspace_dir = str(data.get("workspace_dir", cfg.workspace_dir))
-    cfg.workspace_memory_main_only = bool(
-        data.get("workspace_memory_main_only", cfg.workspace_memory_main_only)
-    )
-    cfg.workspace_memory_search_limit = int(
-        data.get("workspace_memory_search_limit", cfg.workspace_memory_search_limit)
-    )
-    cfg.workspace_memory_rerank_enabled = bool(
-        data.get("workspace_memory_rerank_enabled", cfg.workspace_memory_rerank_enabled)
-    )
-    cfg.workspace_memory_rerank_shortlist = int(
-        data.get("workspace_memory_rerank_shortlist", cfg.workspace_memory_rerank_shortlist)
-    )
-    cfg.workspace_memory_rerank_weight = float(
-        data.get("workspace_memory_rerank_weight", cfg.workspace_memory_rerank_weight)
-    )
-    cfg.workspace_memory_sqlite_enabled = bool(
-        data.get("workspace_memory_sqlite_enabled", cfg.workspace_memory_sqlite_enabled)
-    )
-    cfg.workspace_memory_sqlite_path = str(
-        data.get("workspace_memory_sqlite_path", cfg.workspace_memory_sqlite_path)
-    )
-    cfg.workspace_memory_sqlite_sync_interval_sec = float(
-        data.get(
-            "workspace_memory_sqlite_sync_interval_sec",
-            cfg.workspace_memory_sqlite_sync_interval_sec,
-        )
-    )
-    cfg.workspace_memory_sqlite_fts_limit = int(
-        data.get("workspace_memory_sqlite_fts_limit", cfg.workspace_memory_sqlite_fts_limit)
-    )
-    cfg.workspace_memory_sqlite_vector_limit = int(
-        data.get(
-            "workspace_memory_sqlite_vector_limit",
-            cfg.workspace_memory_sqlite_vector_limit,
-        )
-    )
-    cfg.workspace_memory_sqlite_chunk_chars = int(
-        data.get(
-            "workspace_memory_sqlite_chunk_chars",
-            cfg.workspace_memory_sqlite_chunk_chars,
-        )
-    )
-    cfg.workspace_embedding_cache_max_items = int(
-        data.get("workspace_embedding_cache_max_items", cfg.workspace_embedding_cache_max_items)
-    )
     cfg.people_aliases_enabled = bool(
         data.get("people_aliases_enabled", cfg.people_aliases_enabled)
     )
     cfg.people_aliases_path = str(data.get("people_aliases_path", cfg.people_aliases_path))
-    if cfg.workspace_memory_rerank_shortlist < 1:
-        cfg.workspace_memory_rerank_shortlist = 1
-    if cfg.workspace_memory_rerank_weight < 0.0:
-        cfg.workspace_memory_rerank_weight = 0.0
-    if cfg.workspace_memory_sqlite_sync_interval_sec < 2.0:
-        cfg.workspace_memory_sqlite_sync_interval_sec = 2.0
-    if cfg.workspace_memory_sqlite_fts_limit < 4:
-        cfg.workspace_memory_sqlite_fts_limit = 4
-    if cfg.workspace_memory_sqlite_vector_limit < 1:
-        cfg.workspace_memory_sqlite_vector_limit = 1
-    if cfg.workspace_memory_sqlite_chunk_chars < 120:
-        cfg.workspace_memory_sqlite_chunk_chars = 120
-    if cfg.workspace_embedding_cache_max_items < 64:
-        cfg.workspace_embedding_cache_max_items = 64
     cfg.admin_commands_enabled = bool(
         data.get("admin_commands_enabled", cfg.admin_commands_enabled)
     )
@@ -803,22 +697,6 @@ def load_config(path: str | Path | None) -> AppConfig:
         data.get("heartbeat_fail_open", cfg.heartbeat_fail_open)
     )
     cfg.heartbeat_prompt = str(data.get("heartbeat_prompt", cfg.heartbeat_prompt))
-    cfg.person_impression_enabled = bool(
-        data.get("person_impression_enabled", cfg.person_impression_enabled)
-    )
-    cfg.person_impression_days = int(
-        data.get("person_impression_days", cfg.person_impression_days)
-    )
-    cfg.person_impression_max_people_per_run = int(
-        data.get(
-            "person_impression_max_people_per_run",
-            cfg.person_impression_max_people_per_run,
-        )
-    )
-    cfg.person_impression_search_limit = int(
-        data.get("person_impression_search_limit", cfg.person_impression_search_limit)
-    )
-
     cfg.reply_on_new_message = str(
         data.get("reply_on_new_message", cfg.reply_on_new_message)
     )
@@ -894,8 +772,6 @@ def load_config(path: str | Path | None) -> AppConfig:
         )
     else:
         cfg.chat_title_region_private = cfg.chat_title_region
-    cfg.chat_context_max_lines = int(data.get("chat_context_max_lines", cfg.chat_context_max_lines))
-    cfg.chat_self_x_ratio = float(data.get("chat_self_x_ratio", cfg.chat_self_x_ratio))
     cfg.skip_if_latest_chat_from_self = bool(
         data.get("skip_if_latest_chat_from_self", cfg.skip_if_latest_chat_from_self)
     )
@@ -1015,44 +891,6 @@ def load_config(path: str | Path | None) -> AppConfig:
         cfg.vision.api_key = cfg.llm.api_key
     if not cfg.vision.model:
         cfg.vision.model = cfg.llm.model
-
-    embedding_raw = data.get("embedding", {})
-    embedding_base_url = str(embedding_raw.get("base_url", cfg.embedding.base_url)).strip().rstrip("/")
-    embedding_base_url_env = str(
-        embedding_raw.get("base_url_env", cfg.embedding.base_url_env)
-    ).strip()
-    if (not embedding_base_url) and embedding_base_url_env:
-        embedding_base_url = str(os.getenv(embedding_base_url_env, "")).strip().rstrip("/")
-    cfg.embedding = EmbeddingConfig(
-        enabled=bool(embedding_raw.get("enabled", cfg.embedding.enabled)),
-        base_url=embedding_base_url,
-        base_url_env=embedding_base_url_env,
-        api_key=str(embedding_raw.get("api_key", cfg.embedding.api_key)),
-        api_key_env=str(embedding_raw.get("api_key_env", cfg.embedding.api_key_env)),
-        model=str(embedding_raw.get("model", cfg.embedding.model)),
-        timeout_sec=float(embedding_raw.get("timeout_sec", cfg.embedding.timeout_sec)),
-    )
-    if not cfg.embedding.base_url:
-        cfg.embedding.base_url = "https://api.siliconflow.cn/v1"
-
-    rerank_raw = data.get("rerank", {})
-    rerank_base_url = str(rerank_raw.get("base_url", cfg.rerank.base_url)).strip().rstrip("/")
-    rerank_base_url_env = str(
-        rerank_raw.get("base_url_env", cfg.rerank.base_url_env)
-    ).strip()
-    if (not rerank_base_url) and rerank_base_url_env:
-        rerank_base_url = str(os.getenv(rerank_base_url_env, "")).strip().rstrip("/")
-    cfg.rerank = RerankConfig(
-        enabled=bool(rerank_raw.get("enabled", cfg.rerank.enabled)),
-        base_url=rerank_base_url,
-        base_url_env=rerank_base_url_env,
-        api_key=str(rerank_raw.get("api_key", cfg.rerank.api_key)),
-        api_key_env=str(rerank_raw.get("api_key_env", cfg.rerank.api_key_env)),
-        model=str(rerank_raw.get("model", cfg.rerank.model)),
-        timeout_sec=float(rerank_raw.get("timeout_sec", cfg.rerank.timeout_sec)),
-    )
-    if not cfg.rerank.base_url:
-        cfg.rerank.base_url = "https://api.siliconflow.cn/v1"
 
     image_gen_raw = data.get("image_generation", {})
     image_gen_base_url = str(
@@ -1183,17 +1021,5 @@ def load_config(path: str | Path | None) -> AppConfig:
         cfg.heartbeat_min_idle_sec = 0.0
     if cfg.heartbeat_max_actions < 0:
         cfg.heartbeat_max_actions = 0
-    if cfg.person_impression_days < 1:
-        cfg.person_impression_days = 1
-    if cfg.person_impression_days > 3650:
-        cfg.person_impression_days = 3650
-    if cfg.person_impression_max_people_per_run < 1:
-        cfg.person_impression_max_people_per_run = 1
-    if cfg.person_impression_max_people_per_run > 200:
-        cfg.person_impression_max_people_per_run = 200
-    if cfg.person_impression_search_limit < 1:
-        cfg.person_impression_search_limit = 1
-    if cfg.person_impression_search_limit > 12:
-        cfg.person_impression_search_limit = 12
 
     return cfg

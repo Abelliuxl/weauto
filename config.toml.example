@@ -1,14 +1,8 @@
 # ============================================================
-# Core Runtime
+# Receiver Mode
 # ============================================================
-
-# WeChat app name shown by macOS window server
-app_name = "WeChat"
-
-# Receiver mode:
-# - detached_windows: recommended; each chat is a detached WeChat window,
-#   captured by macOS window id and parsed with local OCR.
-# - legacy_list: old whole-app left-list detector, kept for rollback.
+# detached_windows: each chat is a detached WeChat window (recommended)
+# legacy_list: old whole-app list detector (requires calibration)
 receiver_mode = "detached_windows"
 detached_window_title_filter = []
 detached_window_output_dir = "data/detached_window_images"
@@ -16,56 +10,29 @@ detached_debug_save = false
 detached_reply_on_image = false
 detached_process_existing_on_start = false
 
-# --------------------
-# Loop Cadence
-# --------------------
-
-# Poll interval for detecting new messages
+# ============================================================
+# Loop & Interaction Timing
+# ============================================================
 poll_interval_sec = 1.0
-
-# Avoid repeated triggering on the same row in short time
 action_cooldown_sec = 8.0
-
-# Private chats and @ mentions reply immediately; normal group messages are throttled globally.
 normal_reply_interval_sec = 60.0
-
-# If true: detect only and print logs, no click/type/send
-# Change to false when you finish coordinate tuning
-# and granted Accessibility + Screen Recording permissions.
-dry_run = false
-
-# --------------------
-# UI Interaction Timing
-# --------------------
-
+dry_run = true
 activate_wait_sec = 0.6
 click_move_duration_sec = 0.18
 mouse_down_hold_sec = 0.03
 post_select_wait_sec = 0.35
 send_after_paste_delay_sec = 0.5
-focus_verify_enabled = true
-focus_verify_max_clicks = 3
-focus_verify_wait_sec = 0.20
 
-# --------------------
+# ============================================================
 # Logging & Startup
-# --------------------
-
-trigger_on_preview_change = true
-debug_scan = false
+# ============================================================
 log_verbose = true
-log_snapshot_rows = 6
-process_existing_unread_on_start = true
+debug_scan = false
 skip_first_action_on_start = true
 
 # ============================================================
-# Memory & Workspace
-# ============================================================
-
-# --------------------
 # Session Memory
-# --------------------
-
+# ============================================================
 memory_enabled = true
 memory_store_path = "data/session_memory.json"
 memory_short_max_items = 12
@@ -76,45 +43,24 @@ memory_summary_max_chars = 500
 memory_history_context_items = 24
 memory_history_max_items = 1000
 
-# --------------------
-# Workspace Memory
-# --------------------
-
-workspace_enabled = true
-workspace_dir = "agent_workspace"
-workspace_memory_main_only = true
-workspace_memory_search_limit = 3
-workspace_memory_rerank_enabled = true
-workspace_memory_rerank_shortlist = 24
-workspace_memory_rerank_weight = 2.5
-workspace_memory_sqlite_enabled = true
-workspace_memory_sqlite_path = "data/workspace_memory.sqlite3"
-workspace_memory_sqlite_sync_interval_sec = 20.0
-workspace_memory_sqlite_fts_limit = 64
-workspace_memory_sqlite_vector_limit = 24
-workspace_memory_sqlite_chunk_chars = 320
-workspace_embedding_cache_max_items = 1024
-
-# Canonicalize OCR sender nicknames through PEOPLE_ALIASES.md before they
-# enter chat history, reply context, heartbeat, and person impressions.
+# ============================================================
+# Person Aliases
+# ============================================================
 people_aliases_enabled = true
-people_aliases_path = "agent_workspace/PEOPLE_ALIASES.md"
+people_aliases_path = "data/config/PEOPLE_ALIASES.md"
 
-# --------------------
+# ============================================================
 # Admin Session
-# --------------------
-
+# ============================================================
 admin_commands_enabled = true
 admin_session_titles = ["example_admin"]
 admin_command_prefix = "/"
 
-# --------------------
+# ============================================================
 # Agent Actions
-# --------------------
-
+# ============================================================
 agent_actions_enabled = true
 agent_actions_max_per_turn = 2
-# 单次触发最多可连续发送几条消息（由 planner 决定何时 send_reply=false 结束）
 agent_reply_max_messages_per_turn = 3
 agent_actions_fail_open = true
 agent_plan_loop_enabled = true
@@ -123,330 +69,187 @@ agent_plan_max_total_actions = 6
 agent_plan_repeat_limit = 2
 agent_plan_observation_max_chars = 5200
 
-# --------------------
-# Web Search Tool
-# --------------------
-
-# 当前检索 provider：tavily | brave | agent_reach | volc_ark
-# - volc_ark: 走 LLM 主导检索模式（tool=web_search_volc，单轮可信）
-# - 其他: 走机器检索模式（tool=web_search）
+# ============================================================
+# Web Search
+# ============================================================
 web_search_provider = "tavily"
 
-# Tavily provider
 tavily_enabled = false
-tavily_base_url = "https://api.tavily.com"
 tavily_api_key = ""
 tavily_api_key_env = "TAVILY_API_KEY"
 tavily_max_results = 3
 tavily_timeout_sec = 8.0
 
-# Brave provider
 brave_enabled = false
-brave_base_url = "https://api.search.brave.com/res/v1/web"
 brave_api_key = ""
 brave_api_key_env = "BRAVE_SEARCH_API_KEY"
 brave_max_results = 3
 brave_timeout_sec = 8.0
 
-# Volcengine Ark built-in web search（独立工具：web_search_volc）
 volc_ark_enabled = false
-volc_ark_base_url = "https://ark.cn-beijing.volces.com/api/v3"
 volc_ark_api_key = ""
 volc_ark_api_key_env = "ARK_API_KEY"
 volc_ark_model = "doubao-seed-1-8-251228"
-# Web Search tool args
 volc_ark_limit = 8
 volc_ark_max_keyword = 3
 volc_ark_timeout_sec = 20.0
 
-# Agent Reach provider（通过 mcporter 调 exa）
 agent_reach_enabled = false
 agent_reach_mcporter_cmd = "mcporter"
 agent_reach_max_results = 5
 agent_reach_timeout_sec = 12.0
 
-# --------------------
-# Heartbeat
-# --------------------
+# ============================================================
+# Python Sandbox
+# ============================================================
+python_sandbox_restricted = true
 
+# ============================================================
+# Heartbeat
+# ============================================================
 heartbeat_enabled = false
 heartbeat_interval_sec = 300.0
 heartbeat_min_idle_sec = 20.0
 heartbeat_max_actions = 4
-heartbeat_fail_open = true
-heartbeat_prompt = "Scheduled self-reflection heartbeat. Maintain data/memory/core.md, data/memory/timeline.md, and data/people/*.md only when recent chat activity justifies it."
 
 # ============================================================
-# Reply Policy & Detection
+# Reply Policy & Group Rules
 # ============================================================
-
-# --------------------
-# Reply Fallbacks
-# --------------------
-
-# Reply templates
 reply_on_new_message = "已收到消息，我稍后回复你。"
 reply_on_mention = "收到@，我看到了，稍后处理。"
 
-# --------------------
-# Mention / Group Rules
-# --------------------
-
-# Words that identify mention events in conversation preview text
 mention_keywords = ["@我", "有人@我", "[有人@我]", "［有人@我］"]
 mention_any_at = false
 group_title_prefixes = ["群"]
 group_detect_sender_prefix = true
 group_require_sender_prefix_for_new_message = false
 group_only_reply_when_mentioned = false
-# Allow reply LLM to skip a group reply by emitting [NO_REPLY]/no-reply markers.
-# false: always force a sendable fallback if this signal appears.
-# true: permit silent skip in groups.
 group_allow_llm_no_reply = false
 group_reply_keywords = ["@助手", "@机器人", "机器人", "bot", "小助手"]
 ignore_title_keywords = ["折叠的聊天"]
 
-# --------------------
-# Manual Row Calibration
-# --------------------
-
-use_manual_row_boxes = true
-manual_row_boxes_path = "data/manual_row_boxes.json"
-
-# --------------------
-# Row/Chat Heuristics
-# --------------------
-
-# Conversation row heuristics for grouping OCR lines.
-# OCR 只负责左侧会话列表的新消息识别；右侧聊天区会截图交给 vision 模型。
-rows_max = 9
-row_height_ratio = 0.118
-chat_context_max_lines = 14
-chat_self_x_ratio = 0.62
-skip_if_latest_chat_from_self = true
-skip_if_latest_chat_from_self_private = false
-recover_auto_scroll_amount = 900
-recover_auto_scroll_pause_sec = 0.7
-
-# --------------------
-# Region Feature Switches
-# --------------------
-
-# Region ratios are relative to WeChat window bounds.
-# Tuned from your screenshot layout (left nav + conversation list + chat panel).
-preview_region_enabled = true
-row_title_region_enabled = true
-chat_title_region_group_enabled = false
-chat_title_region_private_enabled = false
-
 # ============================================================
-# Geometry Calibration
+# Legacy List Mode Geometry
+# (only used when receiver_mode = "legacy_list")
 # ============================================================
-
 [list_region]
-x = 0.065
-# starts below search bar
-y = 0.12
-w = 0.325
-h = 0.82
+x = 0.065; y = 0.12; w = 0.325; h = 0.82
 
 [chat_context_region]
-x = 0.40
-y = 0.16
-w = 0.57
-h = 0.63
+x = 0.40; y = 0.16; w = 0.57; h = 0.63
 
 [chat_title_region]
-x = 0.424679
-y = 0.006198
-w = 0.342949
-h = 0.028926
+x = 0.424679; y = 0.006198; w = 0.342949; h = 0.028926
 
 [chat_title_region_group]
-x = 0.424679
-y = 0.006198
-w = 0.342949
-h = 0.028926
+x = 0.424679; y = 0.006198; w = 0.342949; h = 0.028926
 
 [chat_title_region_private]
-x = 0.424679
-y = 0.006198
-w = 0.342949
-h = 0.028926
-
-[preview_text_region]
-x = 0.211111
-y = 0.000000
-w = 0.788889
-h = 0.347826
-
-[row_title_region]
-x = 0.227778
-y = 0.369565
-w = 0.583333
-h = 0.413043
-
-[unread_badge_circle]
-enabled = true
-x = 0.200000
-y = 0.760870
-r = 0.195652
+x = 0.424679; y = 0.006198; w = 0.342949; h = 0.028926
 
 [input_point]
-x = 0.73
-y = 0.92
-
-[recover_auto_click_point]
-x = -1.0
-y = -1.0
-
-# --------------------
-# Detection Thresholds
-# --------------------
-
-# Red badge detection heuristics (HSV)
-[unread_badge]
-min_blob_pixels = 70
+x = 0.73; y = 0.92
 
 # ============================================================
-# OCR / LLM / Vision / Embedding
+# OCR
 # ============================================================
-
 [ocr]
-# Left list OCR backend: rapidocr | paddleocr | cnocr
 backend = "rapidocr"
-
-# Enable image enhancement before OCR (upscale + sharpen).
 enhance = false
 target_short_side = 900
 max_upscale = 3.2
-
-# Paddle/CnOCR language option.
 paddle_lang = "ch"
 paddle_use_angle_cls = false
-
-# Optional A/B backend comparison.
 ab_compare_backend = ""
 ab_compare_sample_rate = 0.0
 ab_compare_max_text_len = 120
 
-# --------------------
-# LLM (Text)
-# --------------------
-
+# ============================================================
+# LLM
+# ============================================================
 [llm]
 enabled = true
-base_url = "https://api.deepseek.com"
-base_url_env = "DEEPSEEK_BASE_URL"
-api_key = "YOUR_API_KEY_HERE"
-api_key_env = "DEEPSEEK_API_KEY"
+base_url = ""
+base_url_env = "OPENAI_BASE_URL"
+api_key = ""
+api_key_env = "OPENAI_API_KEY"
 model = "deepseek-v4-flash"
+api_format = "openai"
 ollama_native = false
-ollama_think = "default"
-openai_compat_think_mode = "default"
 temperature = 0.8
-presence_penalty = 0.2
-frequency_penalty = 0.2
 max_tokens = 4096
 timeout_sec = 8.0
-interest_hint = "纯闲聊、表情刷屏、别人互相聊天可以跳过，我比较关心：1.直接问我、让我做决定、涉及工作安排、明确提问的消息；2.游戏相关，尤其是魔兽世界"
-# 阴阳强度开关：off | low | medium | high
 sarcasm_level = "medium"
-system_prompt = '查看workspace里的文档，了解你自己。你是年轻玩家风格，像真人聊天：简洁自然、少废话，可带一点阴阳味和轻度调侃。遇到严肃求助或情绪敏感场景时自动收敛一点，但别切客服腔。优先根据聊天上下文、记忆和工具结果作答；涉及事实/时效信息先检索再答，没查到就明确说不确定。用户明确要求做的事先做完再回，不要只口头答应。禁止使用括号动作描写（如“（...）”），emoji每条最多1个且可不用。'
+reasoning_effort = "low"
+debug_log_payload = false
+debug_log_response = false
+
 decision_enabled = true
 decision_on_group = false
 decision_on_private = false
 decision_fail_open = false
 decision_max_tokens = 32
 decision_read_chat_context = true
-decision_system_prompt = "你是消息分流器。给定会话标题、预览和触发原因，判断是否值得自动回复。仅输出JSON，格式为: {\"decision\":\"reply|skip\",\"reason\":\"<=20字\"}。"
 summary_enabled = true
 summary_max_tokens = 160
-summary_system_prompt = "你是会话摘要器。给定历史摘要和最近对话，输出新的简短中文摘要，覆盖关键信息、事实、偏好和待办。只输出摘要正文。"
 anti_repeat_enabled = true
 anti_repeat_window = 4
 anti_repeat_similarity = 0.82
 anti_repeat_retry = 1
-reasoning_exclude = true
-reasoning_effort = "low"
-debug_log_payload = false
-debug_log_response = false
-
-# --------------------
-# LLM Profiles
-# --------------------
-
-# 每个 profile 都会在缺省字段上继承 [llm]。
 
 [llm_reply]
 enabled = true
-openai_compat_think_mode = "default"
 reasoning_effort = "minimal"
 timeout_sec = 20.0
 
 [llm_decision]
 enabled = true
-openai_compat_think_mode = "default"
 reasoning_effort = "minimal"
 timeout_sec = 20.0
 
 [llm_planner]
 enabled = true
-openai_compat_think_mode = "default"
 reasoning_effort = "minimal"
 timeout_sec = 120.0
 
 [llm_summary]
 enabled = true
-openai_compat_think_mode = "default"
 reasoning_effort = "minimal"
 timeout_sec = 20.0
 
 [llm_heartbeat]
 enabled = true
-openai_compat_think_mode = "default"
 reasoning_effort = "minimal"
 timeout_sec = 60.0
 
-# --------------------
-# Vision (Image Parsing)
-# --------------------
-
+# ============================================================
+# Vision
+# ============================================================
 [vision]
-# 聊天截图解析模型（仅输出 context + environment，可与 llm 不同）
 enabled = true
-base_url = "https://openrouter.ai/api/v1"
+base_url = ""
 base_url_env = "OPENAI_BASE_URL"
-api_key = "YOUR_API_KEY_HERE"
+api_key = ""
 api_key_env = "OPENAI_API_KEY"
-model = "google/gemini-3.1-flash-lite-preview"
+model = ""
 ollama_native = false
-ollama_think = "false"
-openai_compat_think_mode = "off"
 timeout_sec = 12.0
 max_tokens = 512
-# 是否携带 response_format={"type":"json_object"}。
-# 若模型不支持该字段，可设为 false，避免先失败再自动重试。
 response_format_json_object = true
 fail_open = true
-reasoning_exclude = true
 reasoning_effort = "low"
 debug_log_payload = false
 debug_log_response = false
-system_prompt = "你是微信聊天截图解析器。请严格输出 JSON，schema=wechat_context_v2；不要输出 markdown，不要输出额外解释。"
 
-# --------------------
-# Image Generation (Planner Tool)
-# --------------------
-
+# ============================================================
+# Image Generation / Editing
+# ============================================================
 [image_generation]
-# planner 工具名：generate_image。启用后可按需生成图片并发送本地文件。
-# 每次生成会保留图片文件，并在 output_dir/history.jsonl 追加历史记录。
 enabled = false
-provider = "dashscope_z_image"  # openai_compat | dashscope_z_image
-base_url = "https://dashscope.aliyuncs.com/api/v1/services/aigc"
+provider = "dashscope_z_image"
+base_url = ""
 base_url_env = "DASHSCOPE_BASE_URL"
-api_key = "YOUR_API_KEY_HERE"
+api_key = ""
 api_key_env = "DASHSCOPE_API_KEY"
 model = "z-image-turbo"
 timeout_sec = 90.0
@@ -455,12 +258,11 @@ default_size = "1024x1024"
 output_dir = "data/generated_images"
 
 [image_editing]
-# planner 工具名：edit_image。启用后可对最近收到的图片或指定本地图片进行编辑并发送。
 enabled = false
 provider = "dashscope_qwen_image_edit"
-base_url = "https://dashscope.aliyuncs.com/api/v1/services/aigc"
+base_url = ""
 base_url_env = "DASHSCOPE_BASE_URL"
-api_key = "YOUR_API_KEY_HERE"
+api_key = ""
 api_key_env = "DASHSCOPE_API_KEY"
 model = "qwen-image-2.0-pro"
 timeout_sec = 120.0
@@ -470,31 +272,3 @@ output_dir = "data/edited_images"
 watermark = false
 prompt_extend = true
 max_input_bytes = 10485760
-
-# --------------------
-# Embedding (Memory Recall)
-# --------------------
-
-[embedding]
-# 只用于会话记忆召回重排，不参与主回复生成。
-enabled = false
-base_url = "https://api.siliconflow.cn/v1"
-base_url_env = "SILICONFLOW_BASE_URL"
-api_key = "YOUR_API_KEY_HERE"
-api_key_env = "SILICONFLOW_API_KEY"
-model = "Qwen/Qwen3-Embedding-8B"
-timeout_sec = 20.0
-
-# --------------------
-# Rerank (Memory Recall)
-# --------------------
-
-[rerank]
-# 专用重排模型：对记忆召回候选进行精排。
-enabled = false
-base_url = "https://api.siliconflow.cn/v1"
-base_url_env = "SILICONFLOW_BASE_URL"
-api_key = "YOUR_API_KEY_HERE"
-api_key_env = "SILICONFLOW_API_KEY"
-model = "Qwen/Qwen3-Reranker-8B"
-timeout_sec = 20.0
