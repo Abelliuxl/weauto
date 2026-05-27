@@ -5,7 +5,7 @@ from wechat_rpa.agent_store import SkillStore
 from wechat_rpa.bot import WeChatGuiRpaBot
 from wechat_rpa.config import LlmConfig
 from wechat_rpa.llm import LlmReplyGenerator
-from wechat_rpa.workspace_context import WorkspaceContextManager
+from wechat_rpa.prompt_context import build_prompt_context
 
 
 def test_skill_store_writes_to_data_skills_shape():
@@ -24,10 +24,8 @@ def test_skill_store_writes_to_data_skills_shape():
         assert store.list() == []
 
 
-def test_workspace_context_loads_data_skills():
-    manager = WorkspaceContextManager("agent_workspace", enabled=True)
-
-    context = manager.build_prompt_context(include_long_term=False)
+def test_prompt_context_loads_skills():
+    context = build_prompt_context(include_long_term=False)
 
     assert "[skills (" in context
     assert "wow-character-link" in context

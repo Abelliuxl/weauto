@@ -11,11 +11,8 @@ logs/
 
 .venv312/
 
-# Runtime workspace/memory artifacts
-agent_workspace/memory/
-!agent_workspace/memory/
-agent_workspace/memory/*
-!agent_workspace/memory/.gitkeep
+# Runtime workspace/memory artifacts (legacy — archived)
+agent_workspace/
 
 # Runtime data snapshots / indexes
 data/
@@ -23,6 +20,9 @@ data/
 data/*
 !data/.gitkeep
 !data/identity.md
+!data/config/
+data/config/*
+!data/config/*.md
 !data/memory/
 data/memory/*
 !data/memory/*.md
@@ -37,12 +37,3 @@ data/skills/**
 !data/skills/**/*.tsv
 !data/skills/**/*.json
 
-# Local provider config
-config/*.json
-!config/.gitkeep
-
-# Local persona / personal notes (use *.example.md as templates)
-agent_workspace/IDENTITY.md
-agent_workspace/MEMORY.md
-agent_workspace/TOOLS.md
-!agent_workspace/*.example.md

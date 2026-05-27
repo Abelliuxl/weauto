@@ -2273,31 +2273,6 @@ class LlmReplyGenerator:
     @staticmethod
     def _agent_tool_specs_for_names(tool_names: list[str]) -> list[dict]:
         specs: dict[str, dict] = {
-            "remember_session_fact": {
-                "description": "Record a stable fact about the current chat session.",
-                "properties": {"fact": {"type": "string", "description": "Fact, <=120 Chinese chars."}},
-                "required": ["fact"],
-            },
-            "remember_session_event": {
-                "description": "Record a recent event in the current chat session.",
-                "properties": {"event": {"type": "string", "description": "Event, <=120 Chinese chars."}},
-                "required": ["event"],
-            },
-            "set_session_summary": {
-                "description": "Update the compact profile/summary of the current chat session.",
-                "properties": {"summary": {"type": "string", "description": "Summary, <=200 Chinese chars."}},
-                "required": ["summary"],
-            },
-            "search_memory": {
-                "description": "Search the local memory database for related past context.",
-                "properties": {"query": {"type": "string", "description": "Search query, <=80 chars."}},
-                "required": ["query"],
-            },
-            "search_person_impression": {
-                "description": "Search stored person impressions.",
-                "properties": {"query": {"type": "string", "description": "Person name or clue, <=80 chars."}},
-                "required": ["query"],
-            },
             "write_memory": {
                 "description": "Replace core or timeline memory markdown.",
                 "properties": {
@@ -2346,28 +2321,6 @@ class LlmReplyGenerator:
                     "content": {"type": "string", "description": "Complete markdown content."},
                 },
                 "required": ["name", "content"],
-            },
-            "workspace_list_files": {
-                "description": "List files in the agent workspace.",
-                "properties": {
-                    "path": {"type": "string", "description": "Relative path; optional."},
-                    "recursive": {"type": "boolean"},
-                    "max_entries": {"type": "integer", "minimum": 1, "maximum": 200},
-                },
-            },
-            "workspace_read_file": {
-                "description": "Read a UTF-8 file from the agent workspace.",
-                "properties": {"path": {"type": "string", "description": "Relative file path."}},
-                "required": ["path"],
-            },
-            "workspace_write_file": {
-                "description": "Write a UTF-8 file in the agent workspace.",
-                "properties": {
-                    "path": {"type": "string", "description": "Relative file path."},
-                    "content": {"type": "string", "description": "Content, <=4000 chars."},
-                    "mode": {"type": "string", "enum": ["overwrite", "append"]},
-                },
-                "required": ["path", "content"],
             },
             "web_search": {
                 "description": "Search public web pages with the configured provider.",
@@ -2447,10 +2400,7 @@ class LlmReplyGenerator:
                 },
                 "required": ["prompt"],
             },
-            "remember_long_term": {
-                "description": "Admin only: write a long-term memory note.",
-                "properties": {"note": {"type": "string", "description": "Note, <=200 chars."}},
-                "required": ["note"],
+            "mute_session": {                "required": ["note"],
             },
             "maintain_memory": {
                 "description": "Admin only: consolidate recent memory into MEMORY.md.",
@@ -2563,11 +2513,6 @@ class LlmReplyGenerator:
         total_remaining = max(0, min(total_limit, int(planner_total_actions_remaining)))
 
         tool_specs = {
-            "remember_session_fact": "args={\"fact\":\"<=120字\"} 记录当前会话稳定事实",
-            "remember_session_event": "args={\"event\":\"<=120字\"} 记录当前会话近期事件",
-            "set_session_summary": "args={\"summary\":\"<=200字\"} 更新当前会话画像摘要",
-            "search_memory": "args={\"query\":\"<=80字\"} 在记忆库检索相关片段",
-            "search_person_impression": "args={\"query\":\"<=80字\"} 检索特定人物的印象记忆",
             "write_memory": (
                 "args={\"name\":\"core|timeline\",\"content\":\"完整 markdown\"} "
                 "完整替换 data/memory/core.md 或 timeline.md"
@@ -2590,18 +2535,6 @@ class LlmReplyGenerator:
                 "args={\"name\":\"规范中文名\",\"content\":\"完整 markdown\"} "
                 "完整替换 data/people/<name>.md"
             ),
-            "workspace_list_files": (
-                "args={\"path\":\"<=120字,可空\",\"recursive\":false,\"max_entries\":1-200} "
-                "列出 agent_workspace 目录内容"
-            ),
-            "workspace_read_file": (
-                "args={\"path\":\"相对 agent_workspace 的文件路径\"} "
-                "读取 agent_workspace 非技能文件；技能内容已从 data/skills 自动注入上下文"
-            ),
-            "workspace_write_file": (
-                "args={\"path\":\"相对路径\",\"content\":\"<=4000字\",\"mode\":\"overwrite|append\"} "
-                "写入 agent_workspace 非技能文件；创建或更新技能必须使用 write_skill"
-            ),
             "web_search": "args={\"query\":\"<=80字\"} 联网检索公开网页信息（provider 可配置）",
             "search_web": "args={\"query\":\"<=80字\"} Tavily 联网检索",
             "search_web_brave": "args={\"query\":\"<=80字\"} Brave 联网检索",
@@ -2621,13 +2554,6 @@ class LlmReplyGenerator:
                 "args={\"prompt\":\"<=800字\",\"image_path\":\"可选，不填用最近收到的图片\",\"size\":\"可选\"} "
                 "编辑/改图并发送"
             ),
-            "remember_long_term": "args={\"note\":\"<=200字\"} 写入长期记忆（仅管理员）",
-            "maintain_memory": "args={\"days\":1-14} 整理近期记忆到 MEMORY.md",
-            "maintain_person_impressions": (
-                "args={\"days\":1-3650,\"max_people\":1-200} "
-                "按近期会话维护人物印象记忆"
-            ),
-            "refine_persona_files": "args={} 整理 SOUL/IDENTITY/USER/TOOLS 设定文件",
             "mute_session": "args={} 静音当前会话（仅管理员）",
             "unmute_session": "args={} 取消静音当前会话（仅管理员）",
         }
@@ -2648,7 +2574,7 @@ class LlmReplyGenerator:
             "task 字段必须始终给出；若没有持续任务，status=idle。"
             "若输入中已包含工具观察结果，可继续规划下一步动作；"
             "但禁止重复输出同一个 tool+args。"
-            "检索证据优先级默认是：web_search_volc > web_search > search_memory。"
+            "检索证据优先级默认是：web_search_volc > web_search。"
             "若不同来源冲突，优先采用更高优先级来源，不要回退到低优先级覆盖高优先级结论。"
         )
         user_prompt = (
@@ -2674,9 +2600,9 @@ class LlmReplyGenerator:
             + "不能写类似“顺着这个话题调侃”“用轻松语气回一句”“符合群聊氛围”这样的元提示。\n"
             + "5) reply_hint 不能索要红包/稿费/转账，不能以先给条件为前提拒绝回答。\n"
             + "6) 如果已有检索结果仍不足，请换关键词继续检索，不要机械重复同一参数。\n"
-            + "7) 若选择 web_search_volc/search_web_volc，本轮只保留它一个检索动作，不要再同时规划 search_memory/web_search/search_web。\n"
+            + "7) 若选择 web_search_volc/search_web_volc，本轮只保留它一个检索动作，不要再同时规划 web_search/search_web。\n"
             + "8) 若工具观察中已有网页检索结果（web_search/search_web/search_web_brave/web_search_volc/search_web_volc），默认直接信任该结果；"
-            + "除非明确失败/无结果，否则不要再追加 search_memory 或记忆写入动作。\n"
+            + "除非明确失败/无结果，否则不要再追加记忆写入动作。\n"
             + "9) 当 web_search_volc 与其他来源冲突时，以 web_search_volc 为准，并优先结束动作规划（actions 为空）。\n"
             + "10) send_reply=false 表示当前不要对用户发送最终回复；send_reply=true 表示本轮可发送最终回复。\n"
             + "11) 当用户明确要求作图/海报/配图时可用 generate_image，prompt 要具体且可执行；"
@@ -2828,61 +2754,7 @@ class LlmReplyGenerator:
                 args_raw = item.get("args")
                 args_obj = args_raw if isinstance(args_raw, dict) else {}
                 args: dict[str, str] = {}
-                if tool == "remember_long_term":
-                    note = re.sub(
-                        r"\s+",
-                        " ",
-                        str(args_obj.get("note", "") or args_obj.get("text", "")).strip(),
-                    )[:200]
-                    if not note:
-                        continue
-                    args = {"note": note}
-                elif tool == "remember_session_fact":
-                    fact = re.sub(
-                        r"\s+",
-                        " ",
-                        str(args_obj.get("fact", "") or args_obj.get("text", "")).strip(),
-                    )[:120]
-                    if not fact:
-                        continue
-                    args = {"fact": fact}
-                elif tool == "remember_session_event":
-                    event = re.sub(
-                        r"\s+",
-                        " ",
-                        str(args_obj.get("event", "") or args_obj.get("text", "")).strip(),
-                    )[:120]
-                    if not event:
-                        continue
-                    args = {"event": event}
-                elif tool == "set_session_summary":
-                    summary = re.sub(
-                        r"\s+",
-                        " ",
-                        str(args_obj.get("summary", "") or args_obj.get("text", "")).strip(),
-                    )[:200]
-                    if not summary:
-                        continue
-                    args = {"summary": summary}
-                elif tool == "search_memory":
-                    query = re.sub(
-                        r"\s+",
-                        " ",
-                        str(args_obj.get("query", "") or args_obj.get("text", "")).strip(),
-                    )[:80]
-                    if not query:
-                        continue
-                    args = {"query": query}
-                elif tool == "search_person_impression":
-                    query = re.sub(
-                        r"\s+",
-                        " ",
-                        str(args_obj.get("query", "") or args_obj.get("text", "")).strip(),
-                    )[:80]
-                    if not query:
-                        continue
-                    args = {"query": query}
-                elif tool == "write_memory":
+                if tool == "write_memory":
                     raw_name = str(args_obj.get("name", "core")).strip().lower()
                     name = "timeline" if raw_name in {"timeline", "time", "history", "events"} else "core"
                     content = str(args_obj.get("content", "") or args_obj.get("text", "")).strip()[:12000]
@@ -2944,49 +2816,6 @@ class LlmReplyGenerator:
                     if (not name) or (not content):
                         continue
                     args = {"name": name, "content": content}
-                elif tool == "workspace_list_files":
-                    rel_path = re.sub(
-                        r"\s+",
-                        " ",
-                        str(args_obj.get("path", "") or args_obj.get("dir", "")).strip(),
-                    )[:120]
-                    recursive_raw = args_obj.get("recursive", False)
-                    if isinstance(recursive_raw, str):
-                        recursive = recursive_raw.strip().lower() in {"1", "true", "yes", "on"}
-                    else:
-                        recursive = bool(recursive_raw)
-                    max_entries_raw = args_obj.get("max_entries", 80)
-                    try:
-                        max_entries = int(max_entries_raw)
-                    except Exception:
-                        max_entries = 80
-                    max_entries = max(1, min(200, max_entries))
-                    args = {
-                        "path": rel_path,
-                        "recursive": recursive,
-                        "max_entries": max_entries,
-                    }
-                elif tool == "workspace_read_file":
-                    rel_path = re.sub(
-                        r"\s+",
-                        " ",
-                        str(args_obj.get("path", "") or args_obj.get("file", "")).strip(),
-                    )[:200]
-                    if not rel_path:
-                        continue
-                    args = {"path": rel_path}
-                elif tool == "workspace_write_file":
-                    rel_path = re.sub(
-                        r"\s+",
-                        " ",
-                        str(args_obj.get("path", "") or args_obj.get("file", "")).strip(),
-                    )[:200]
-                    content = str(args_obj.get("content", "") or args_obj.get("text", "")).strip()[:4000]
-                    if (not rel_path) or (not content):
-                        continue
-                    mode_raw = str(args_obj.get("mode", "overwrite")).strip().lower()
-                    mode = "append" if mode_raw in {"append", "a", "追加"} else "overwrite"
-                    args = {"path": rel_path, "content": content, "mode": mode}
                 elif tool in {"web_search", "search_web", "search_web_brave", "web_search_volc", "search_web_volc"}:
                     query = re.sub(
                         r"\s+",

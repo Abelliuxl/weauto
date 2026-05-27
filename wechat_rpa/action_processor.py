@@ -61,29 +61,7 @@ class ActionProcessor:
                     f"args={bot._fit_col(arg_preview, max(20, bot._term_width() - 60))}"
                 )
             try:
-                if tool == "remember_long_term":
-                    if not is_admin:
-                        status = "deny (admin only)"
-                    else:
-                        note = re.sub(r"\s+", " ", str(args.get("note", "")).strip())[:200]
-                        if not note:
-                            status = "skip (empty note)"
-                        else:
-                            bot._workspace.append_long_term_memory(note)
-                            status = "ok"
-                            obs = f"长期记忆新增: {note}"
-                            ok = True
-                elif tool == "maintain_memory":
-                    days_raw = args.get("days", 3)
-                    try:
-                        days = int(days_raw)
-                    except Exception:
-                        days = 3
-                    done, detail = bot._heartbeat_maintain_memory(days=max(1, min(14, days)))
-                    status = "ok" if done else detail
-                    obs = detail if done else ""
-                    ok = done
-                elif tool == "write_memory":
+                if tool == "write_memory":
                     name = bot.agent_memory.normalize_name(str(args.get("name", "core")))
                     content = str(args.get("content", "") or args.get("text", "")).strip()
                     if not content:
@@ -182,167 +160,6 @@ class ActionProcessor:
                         status = "ok" if result.ok else "error"
                         obs = f"Python结果:\n{result.to_tool_text()}"[:1800]
                         ok = result.ok
-                elif tool == "refine_persona_files":
-                    done, detail = bot._heartbeat_refine_persona_files()
-                    status = "ok" if done else detail
-                    obs = detail if done else ""
-                    ok = done
-                elif tool == "remember_session_fact":
-                    fact = re.sub(r"\s+", " ", str(args.get("fact", "")).strip())[:120]
-                    if not fact:
-                        status = "skip (empty fact)"
-                    else:
-                        bot._workspace.remember_structured(
-                            session_key=key,
-                            title=row.title,
-                            facts=[fact],
-                        )
-                        status = "ok"
-                        obs = f"会话事实已记录: {fact}"
-                        ok = True
-                elif tool == "remember_session_event":
-                    event = re.sub(r"\s+", " ", str(args.get("event", "")).strip())[:120]
-                    if not event:
-                        status = "skip (empty event)"
-                    else:
-                        bot._workspace.remember_structured(
-                            session_key=key,
-                            title=row.title,
-                            events=[event],
-                        )
-                        status = "ok"
-                        obs = f"会话事件已记录: {event}"
-                        ok = True
-                elif tool == "set_session_summary":
-                    summary = re.sub(r"\s+", " ", str(args.get("summary", "")).strip())[:200]
-                    if not summary:
-                        status = "skip (empty summary)"
-                    else:
-                        bot._apply_session_summary(row, summary)
-                        status = "ok"
-                        obs = f"会话摘要已更新: {summary}"
-                        ok = True
-                elif tool == "search_memory":
-                    query = re.sub(r"\s+", " ", str(args.get("query", "")).strip())[:80]
-                    if not query:
-                        status = "skip (empty query)"
-                    else:
-                        include_global = is_admin or (not bot.cfg.workspace_memory_main_only)
-                        hits = bot._workspace.search_memory(
-                            query=query,
-                            session_key=key,
-                            include_global=include_global,
-                            limit=max(1, int(bot.cfg.workspace_memory_search_limit)),
-                        )
-                        compact = re.sub(r"\s+", " ", hits or "").strip()
-                        if compact:
-                            compact = compact[:260]
-                            status = "ok"
-                            obs = f"记忆检索[{query}]: {compact}"
-                        else:
-                            status = "ok (no-hit)"
-                            obs = f"记忆检索[{query}]无命中"
-                        ok = True
-                elif tool == "search_person_impression":
-                    query = re.sub(r"\s+", " ", str(args.get("query", "")).strip())[:80]
-                    if not query:
-                        status = "skip (empty query)"
-                    elif not bot.cfg.person_impression_enabled:
-                        status = "skip (person impression disabled)"
-                    else:
-                        hits = bot._workspace.search_person_impressions(
-                            query=query,
-                            limit=max(1, int(bot.cfg.person_impression_search_limit)),
-                        )
-                        compact = re.sub(r"\s+", " ", hits or "").strip()
-                        if compact:
-                            compact = compact[:260]
-                            status = "ok"
-                            obs = f"人物印象检索[{query}]: {compact}"
-                        else:
-                            status = "ok (no-hit)"
-                            obs = f"人物印象检索[{query}]无命中"
-                        ok = True
-                elif tool == "maintain_person_impressions":
-                    days_raw = args.get("days", bot.cfg.person_impression_days)
-                    max_people_raw = args.get(
-                        "max_people",
-                        bot.cfg.person_impression_max_people_per_run,
-                    )
-                    try:
-                        days = int(days_raw)
-                    except Exception:
-                        days = int(bot.cfg.person_impression_days)
-                    try:
-                        max_people = int(max_people_raw)
-                    except Exception:
-                        max_people = int(bot.cfg.person_impression_max_people_per_run)
-                    done, detail = bot._heartbeat_maintain_person_impressions(
-                        days=max(1, min(3650, days)),
-                        max_people=max(1, min(200, max_people)),
-                    )
-                    status = "ok" if done else detail
-                    obs = detail if done else ""
-                    ok = done
-                elif tool == "workspace_list_files":
-                    rel_path = re.sub(r"\s+", " ", str(args.get("path", "")).strip())[:200]
-                    recursive_raw = args.get("recursive", False)
-                    if isinstance(recursive_raw, str):
-                        recursive = recursive_raw.strip().lower() in {"1", "true", "yes", "on"}
-                    else:
-                        recursive = bool(recursive_raw)
-                    max_entries_raw = args.get("max_entries", 80)
-                    try:
-                        max_entries = int(max_entries_raw)
-                    except Exception:
-                        max_entries = 80
-                    max_entries = max(1, min(200, max_entries))
-                    listing = bot._workspace_list_files(
-                        rel_path=rel_path,
-                        recursive=recursive,
-                        max_entries=max_entries,
-                    )
-                    status = "ok"
-                    obs = (
-                        f"工作区目录[{rel_path or '.'}] "
-                        f"(recursive={recursive}, max={max_entries}):\n{listing}"
-                    )[:1800]
-                    ok = True
-                elif tool == "workspace_read_file":
-                    rel_path = re.sub(
-                        r"\s+",
-                        " ",
-                        str(args.get("path", "") or args.get("file", "")).strip(),
-                    )[:200]
-                    if not rel_path:
-                        status = "skip (empty path)"
-                    else:
-                        text = bot._workspace_read_file(rel_path=rel_path, max_chars=4000)
-                        status = "ok"
-                        obs = f"工作区文件读取[{rel_path}]:\n{text}"[:1800]
-                        ok = True
-                elif tool == "workspace_write_file":
-                    rel_path = re.sub(
-                        r"\s+",
-                        " ",
-                        str(args.get("path", "") or args.get("file", "")).strip(),
-                    )[:200]
-                    content = str(args.get("content", "") or args.get("text", "")).strip()[:4000]
-                    mode_raw = str(args.get("mode", "overwrite")).strip().lower()
-                    mode = "append" if mode_raw in {"append", "a", "追加"} else "overwrite"
-                    if not rel_path:
-                        status = "skip (empty path)"
-                    elif not content:
-                        status = "skip (empty content)"
-                    else:
-                        detail = bot._workspace_write_file(
-                            rel_path=rel_path,
-                            content=content,
-                            mode=mode,
-                        )
-                        status = "ok"
-                        obs = f"工作区写入成功: {detail}"
-                        ok = True
                 elif tool in {"web_search", "search_web", "search_web_brave"}:
                     query = re.sub(r"\s+", " ", str(args.get("query", "")).strip())[:80]
                     provider = (
@@ -388,29 +205,6 @@ class ActionProcessor:
                         if search_text:
                             status = "ok"
                             obs = f"网页检索[{query}](volc_ark): {search_text}"
-                            summary_line = ""
-                            for line in str(search_text).splitlines():
-                                clean_line = bot._compact_web_text(line, limit=120)
-                                if not clean_line:
-                                    continue
-                                if clean_line.startswith("摘要:"):
-                                    summary_line = bot._compact_web_text(
-                                        clean_line.replace("摘要:", "", 1),
-                                        limit=90,
-                                    )
-                                    break
-                                if not summary_line:
-                                    summary_line = clean_line
-                            fact = bot._compact_web_text(
-                                f"{query}：{summary_line}",
-                                limit=120,
-                            )
-                            if fact:
-                                bot._workspace.remember_structured(
-                                    session_key=key,
-                                    title=row.title,
-                                    facts=[fact],
-                                )
                         else:
                             status = "ok (no-hit)"
                             obs = f"网页检索[{query}](volc_ark)无命中"
@@ -543,14 +337,6 @@ class ActionProcessor:
                 elif tool in ("fetch_url", "browse_url"):
                     url = re.sub(r"\s+", "", str(args.get("url", "")).strip())[:120]
                     obs = f"网页读取[{url}]失败: {err}"
-                elif tool == "search_memory":
-                    query = re.sub(r"\s+", " ", str(args.get("query", "")).strip())[:80]
-                    obs = f"记忆检索[{query}]失败: {err}"
-                elif tool == "search_person_impression":
-                    query = re.sub(r"\s+", " ", str(args.get("query", "")).strip())[:80]
-                    obs = f"人物印象检索[{query}]失败: {err}"
-                elif tool == "maintain_person_impressions":
-                    obs = f"人物印象维护失败: {err}"
                 elif tool == "write_memory":
                     name = re.sub(r"\s+", " ", str(args.get("name", "")).strip())[:40]
                     obs = f"记忆写入[{name}]失败: {err}"
@@ -571,15 +357,6 @@ class ActionProcessor:
                     obs = f"聊天记录读取[{chat_title or row.title}]失败: {err}"
                 elif tool == "run_python":
                     obs = f"Python执行失败: {err}"
-                elif tool == "workspace_list_files":
-                    rel_path = re.sub(r"\s+", " ", str(args.get("path", "")).strip())[:120]
-                    obs = f"工作区目录[{rel_path or '.'}]失败: {err}"
-                elif tool == "workspace_read_file":
-                    rel_path = re.sub(r"\s+", " ", str(args.get("path", "")).strip())[:120]
-                    obs = f"工作区读取[{rel_path}]失败: {err}"
-                elif tool == "workspace_write_file":
-                    rel_path = re.sub(r"\s+", " ", str(args.get("path", "")).strip())[:120]
-                    obs = f"工作区写入[{rel_path}]失败: {err}"
                 elif tool == "build_wow_character_url":
                     obs = f"魔兽角色链接构建失败: {err}"
                 elif tool == "generate_image":

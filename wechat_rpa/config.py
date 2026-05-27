@@ -238,23 +238,22 @@ class AppConfig:
     memory_history_context_items: int = 24
     # 0 means unlimited.
     memory_history_max_items: int = 0
-    workspace_enabled: bool = True
-    workspace_dir: str = "agent_workspace"
+    workspace_enabled: bool = False
+    workspace_dir: str = ""
     workspace_memory_main_only: bool = True
     workspace_memory_search_limit: int = 3
     workspace_memory_rerank_enabled: bool = False
     workspace_memory_rerank_shortlist: int = 24
     workspace_memory_rerank_weight: float = 2.5
     workspace_memory_sqlite_enabled: bool = False
-    workspace_memory_sqlite_path: str = "data/workspace_memory.sqlite3"
+    workspace_memory_sqlite_path: str = ""
     workspace_memory_sqlite_sync_interval_sec: float = 20.0
     workspace_memory_sqlite_fts_limit: int = 64
     workspace_memory_sqlite_vector_limit: int = 24
     workspace_memory_sqlite_chunk_chars: int = 320
-    # In-process embedding cache cap to prevent unbounded RAM growth.
     workspace_embedding_cache_max_items: int = 1024
     people_aliases_enabled: bool = True
-    people_aliases_path: str = "agent_workspace/PEOPLE_ALIASES.md"
+    people_aliases_path: str = "data/config/PEOPLE_ALIASES.md"
     admin_commands_enabled: bool = True
     admin_session_titles: list[str] = field(default_factory=lambda: ["example_admin"])
     admin_command_prefix: str = "/"

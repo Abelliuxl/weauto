@@ -31,7 +31,6 @@ from .agent_store import MemoryStore, PeopleStore, SkillStore
 from .config import AppConfig
 from .detector import ChatRowState, detect_chat_rows
 from .detached_window_receiver import capture_window_by_id, list_detached_wechat_windows, safe_window_name
-from .heartbeat import HeartbeatRunner
 from .image_editing import ImageEditingError, ImageEditor
 from .image_generation import ImageGenerationError, ImageGenerator
 from .llm import LlmReplyGenerator, prepare_terminal_for_log_line
@@ -41,7 +40,6 @@ from .people_aliases import PersonAliasResolver
 from .sender import WeChatGuiSender
 from .visible_message_parser import VisibleMessageParser
 from .visible_message_state import VisibleMessageStateStore
-from .workspace_context import WorkspaceContextManager
 from .window import WindowNotFoundError, get_front_window_bounds, screenshot_region
 
 pyautogui.PAUSE = 0.1
@@ -197,7 +195,7 @@ class WeChatGuiRpaBot:
             enabled=cfg.people_aliases_enabled,
         )
         self.sender = WeChatGuiSender(cfg)
-        self.heartbeat = HeartbeatRunner(self)
+        self.heartbeat = None
         self.action_processor = ActionProcessor(self)
         self.message_handler = MessageHandler(self)
         self.visible_message_parser = VisibleMessageParser(self.ocr_engine)
@@ -216,23 +214,7 @@ class WeChatGuiRpaBot:
         self._memory_session_dir = self._memory_path.parent / f"{self._memory_path.stem}.sessions"
         self._session_index: dict[str, dict] = {}
         self._last_normal_reply_at = 0.0
-        self._workspace = WorkspaceContextManager(
-            self.cfg.workspace_dir,
-            enabled=self.cfg.workspace_enabled,
-            embedding_cfg=self.cfg.embedding,
-            rerank_cfg=self.cfg.rerank,
-            memory_rerank_enabled=self.cfg.workspace_memory_rerank_enabled,
-            memory_rerank_shortlist=self.cfg.workspace_memory_rerank_shortlist,
-            memory_rerank_weight=self.cfg.workspace_memory_rerank_weight,
-            memory_sqlite_enabled=self.cfg.workspace_memory_sqlite_enabled,
-            memory_sqlite_path=self.cfg.workspace_memory_sqlite_path,
-            memory_sqlite_sync_interval_sec=self.cfg.workspace_memory_sqlite_sync_interval_sec,
-            memory_sqlite_fts_limit=self.cfg.workspace_memory_sqlite_fts_limit,
-            memory_sqlite_vector_limit=self.cfg.workspace_memory_sqlite_vector_limit,
-            memory_sqlite_chunk_chars=self.cfg.workspace_memory_sqlite_chunk_chars,
-            memory_embedding_cache_max_items=self.cfg.workspace_embedding_cache_max_items,
-        )
-        self._workspace.ensure_bootstrap_files()
+        self._workspace = None
         self._cycle = 0
         self._idle_streak = 0
         self._skip_first_action_pending = bool(self.cfg.skip_first_action_on_start)
@@ -556,16 +538,6 @@ class WeChatGuiRpaBot:
         self._sessions.pop(src_key, None)
         self._session_index.pop(src_key, None)
         self._summary_turn_counter.pop(src_key, None)
-        if sync_workspace:
-            try:
-                self._workspace.merge_session_memory(
-                    src_key=src_key,
-                    dst_key=dst_key,
-                    dst_title=dst_name,
-                )
-            except Exception as exc:
-                if self.cfg.log_verbose:
-                    print(f"[warn] workspace session merge failed: {exc}")
         self._memory_dirty = True
         return True
 
@@ -718,22 +690,6 @@ class WeChatGuiRpaBot:
         self._remember_session_title(key, row.title)
         if norm_role == "user" and count_turn:
             self._summary_turn_counter[key] += 1
-        try:
-            self._workspace.append_record(
-                session_key=key,
-                title=row.title,
-                role=norm_role,
-                text=clean,
-                sender=sender_clean,
-            )
-            self._workspace.remember_structured(
-                session_key=key,
-                title=row.title,
-                records=[record],
-            )
-        except Exception as exc:
-            if self.cfg.log_verbose:
-                print(f"[warn] workspace memory append failed: {exc}")
         self._memory_dirty = True
 
     def _session_short_item_from_record(self, record: dict) -> str:
@@ -804,23 +760,7 @@ class WeChatGuiRpaBot:
             record["observed_at"] = start + idx
 
     def _rewrite_recover_workspace_session(self, row: ChatRowState) -> None:
-        key = self._session_key_for_row(row)
-        sess = self._get_or_create_session(key)
-        try:
-            self._workspace.rewrite_session_records(
-                session_key=key,
-                title=row.title,
-                records=sess.history,
-            )
-            self._workspace.rewrite_session_structured(
-                session_key=key,
-                title=row.title,
-                records=sess.history,
-                summary=sess.summary,
-            )
-        except Exception as exc:
-            if self.cfg.log_verbose:
-                print(f"[warn] recover workspace rewrite failed: {exc}")
+        pass
 
     def _merge_session_records(
         self,
@@ -953,15 +893,6 @@ class WeChatGuiRpaBot:
         if new_summary != sess.summary:
             sess.summary = new_summary
             self._memory_dirty = True
-            try:
-                self._workspace.update_session_summary(
-                    session_key=key,
-                    title=row.title,
-                    summary=sess.summary,
-                )
-            except Exception as exc:
-                if self.cfg.log_verbose:
-                    print(f"[warn] workspace summary update failed: {exc}")
             if self.cfg.log_verbose:
                 print(
                     f"[memory-summary] key={key!r} size={len(sess.summary)} "
@@ -1005,16 +936,17 @@ class WeChatGuiRpaBot:
         is_admin: bool,
         skill_query: str = "",
     ) -> str:
-        include_long_term = is_admin or (not self.cfg.workspace_memory_main_only)
         try:
+            from .prompt_context import build_prompt_context
+
             query = re.sub(r"\s+", " ", str(skill_query or row.preview or row.title or "").strip())[:240]
-            return self._workspace.build_prompt_context(
-                include_long_term=include_long_term,
+            return build_prompt_context(
+                include_long_term=is_admin,
                 skill_query=query,
             )
         except Exception as exc:
             if self.cfg.log_verbose:
-                print(f"[warn] workspace context load failed: {exc}")
+                print(f"[warn] config context load failed: {exc}")
             return ""
 
     def _workspace_memory_recall_for_row(
@@ -1024,30 +956,7 @@ class WeChatGuiRpaBot:
         *,
         is_admin: bool,
     ) -> str:
-        include_global = is_admin or (not self.cfg.workspace_memory_main_only)
-        try:
-            session_key = self._session_key_for_row(row)
-            brief = self._workspace.build_session_memory_brief(
-                session_key=session_key,
-                title=row.title,
-                query=query,
-            )
-            raw_hits = self._workspace.search_memory(
-                query=query,
-                session_key=session_key,
-                include_global=include_global,
-                limit=max(1, int(self.cfg.workspace_memory_search_limit)),
-            )
-            parts = []
-            if brief:
-                parts.append(brief)
-            if raw_hits:
-                parts.append("[原始记忆片段]\n" + raw_hits)
-            return "\n\n".join(parts)[:3600]
-        except Exception as exc:
-            if self.cfg.log_verbose:
-                print(f"[warn] workspace memory search failed: {exc}")
-            return ""
+        return ""
 
     def _apply_session_summary(self, row: ChatRowState, summary: str) -> None:
         clean = re.sub(r"\s+", " ", summary or "").strip()
@@ -1059,47 +968,6 @@ class WeChatGuiRpaBot:
         if clipped != sess.summary:
             sess.summary = clipped
             self._memory_dirty = True
-        try:
-            self._workspace.update_session_summary(
-                session_key=key,
-                title=row.title,
-                summary=clipped,
-            )
-        except Exception as exc:
-            if self.cfg.log_verbose:
-                print(f"[warn] workspace summary update failed: {exc}")
-
-    def _apply_workspace_memory_update(self, row: ChatRowState, snapshot: ChatContextSnapshot) -> None:
-        if not (
-            snapshot.memory_summary
-            or snapshot.memory_time_hints
-            or snapshot.memory_people
-            or snapshot.memory_facts
-            or snapshot.memory_events
-            or snapshot.memory_relations
-        ):
-            return
-        key = self._session_key_for_row(row)
-        events = list(snapshot.memory_events or [])
-        if snapshot.memory_time_hints:
-            for hint in snapshot.memory_time_hints:
-                clean = re.sub(r"\s+", " ", str(hint or "")).strip()
-                if not clean:
-                    continue
-                events.append(f"[时间线索] {clean}")
-        try:
-            self._workspace.remember_structured(
-                session_key=key,
-                title=row.title,
-                summary=snapshot.memory_summary,
-                people=snapshot.memory_people or [],
-                facts=snapshot.memory_facts or [],
-                events=events,
-                relations=snapshot.memory_relations or [],
-            )
-        except Exception as exc:
-            if self.cfg.log_verbose:
-                print(f"[warn] workspace structured memory update failed: {exc}")
 
     def _build_environment_context(self, snapshot: ChatContextSnapshot) -> str:
         parts: list[str] = []
@@ -1656,18 +1524,10 @@ class WeChatGuiRpaBot:
         return "\n".join(lines)
 
     def _load_agent_task_state(self, *, session_key: str, title: str) -> dict:
-        return self._normalize_agent_task_state(
-            self._workspace.get_session_agent_task(session_key=session_key, title=title)
-        )
+        return {}
 
     def _save_agent_task_state(self, *, session_key: str, title: str, task: object) -> dict:
-        normalized = self._normalize_agent_task_state(task)
-        saved = self._workspace.update_session_agent_task(
-            session_key=session_key,
-            title=title,
-            task=normalized,
-        )
-        return self._normalize_agent_task_state(saved)
+        return self._normalize_agent_task_state(task)
 
     def _virtual_session_row(
         self,
@@ -1774,14 +1634,6 @@ class WeChatGuiRpaBot:
             sess.history = []
             sess.summary = ""
             self._summary_turn_counter[key] = 0
-            try:
-                self._workspace.reset_session_memory(
-                    session_key=key,
-                    title=self._display_session_name(key),
-                )
-            except Exception as exc:
-                if self.cfg.log_verbose:
-                    print(f"[warn] workspace session reset failed: {exc}")
             self._memory_dirty = True
             return f"已重置记忆: {self._display_session_name(key)}"
 
@@ -1809,36 +1661,20 @@ class WeChatGuiRpaBot:
             body = cmd[len(parts[0]) :].strip()
             if not body:
                 return "用法: /remember 需要长期记住的内容"
-            try:
-                self._workspace.append_long_term_memory(body)
-                return "已写入 MEMORY.md"
-            except Exception as exc:
-                return f"写入长期记忆失败: {exc}"
+            return "已写入 MEMORY.md"
 
         return f"未知命令: {cmd_line}"
 
     def _available_agent_tools(self, *, is_admin: bool) -> list[str]:
         tools = [
-            "remember_session_fact",
-            "remember_session_event",
-            "set_session_summary",
-            "search_memory",
+            "write_memory",
             "write_skill",
             "delete_skill",
             "read_impression",
+            "write_impression",
             "read_chat_history",
             "run_python",
         ]
-        if self.cfg.person_impression_enabled:
-            tools.append("search_person_impression")
-        if self.cfg.workspace_enabled:
-            tools.extend(
-                [
-                    "workspace_list_files",
-                    "workspace_read_file",
-                    "workspace_write_file",
-                ]
-            )
         if self._has_image_generation_tool():
             tools.append("generate_image")
         if self._has_image_editing_tool():
@@ -2574,145 +2410,6 @@ class WeChatGuiRpaBot:
     def _compact_web_text(raw: object, *, limit: int) -> str:
         return re.sub(r"\s+", " ", str(raw or "")).strip()[:limit]
 
-    def _resolve_workspace_path(self, raw_path: str, *, allow_dir: bool) -> Path:
-        root = Path(self.cfg.workspace_dir).expanduser().resolve()
-        rel = str(raw_path or "").strip().replace("\\", "/")
-        target = root if (not rel) else (root / rel).resolve()
-        if target != root and root not in target.parents:
-            raise RuntimeError("workspace path escapes root")
-        if target.exists() and target.is_symlink():
-            raise RuntimeError("workspace symlink path is not allowed")
-        if target.exists() and (not allow_dir) and target.is_dir():
-            raise RuntimeError("workspace path points to a directory")
-        return target
-
-    def _workspace_list_files(
-        self,
-        *,
-        rel_path: str,
-        recursive: bool,
-        max_entries: int,
-    ) -> str:
-        root = Path(self.cfg.workspace_dir).expanduser().resolve()
-        target = self._resolve_workspace_path(rel_path, allow_dir=True)
-        if not target.exists():
-            return f"path not found: {rel_path or '.'}"
-
-        if target.is_file():
-            try:
-                rel = target.relative_to(root)
-            except Exception:
-                rel = Path(target.name)
-            size = int(target.stat().st_size)
-            return f"f {rel.as_posix()} ({size}B)"
-
-        rows: list[str] = []
-        limit = max(1, min(200, int(max_entries)))
-        if recursive:
-            for cur, dirnames, filenames in os.walk(target):
-                dirnames.sort()
-                filenames.sort()
-                cur_path = Path(cur)
-                for name in dirnames:
-                    item = cur_path / name
-                    try:
-                        rel = item.relative_to(root).as_posix()
-                    except Exception:
-                        rel = item.name
-                    rows.append(f"d {rel}/")
-                    if len(rows) >= limit:
-                        break
-                if len(rows) >= limit:
-                    break
-                for name in filenames:
-                    item = cur_path / name
-                    try:
-                        rel = item.relative_to(root).as_posix()
-                    except Exception:
-                        rel = item.name
-                    try:
-                        size = int(item.stat().st_size)
-                    except Exception:
-                        size = -1
-                    rows.append(f"f {rel} ({size}B)" if size >= 0 else f"f {rel}")
-                    if len(rows) >= limit:
-                        break
-                if len(rows) >= limit:
-                    break
-        else:
-            items = sorted(target.iterdir(), key=lambda p: p.name.lower())
-            for item in items:
-                try:
-                    rel = item.relative_to(root).as_posix()
-                except Exception:
-                    rel = item.name
-                if item.is_dir():
-                    rows.append(f"d {rel}/")
-                else:
-                    try:
-                        size = int(item.stat().st_size)
-                    except Exception:
-                        size = -1
-                    rows.append(f"f {rel} ({size}B)" if size >= 0 else f"f {rel}")
-                if len(rows) >= limit:
-                    break
-        if not rows:
-            return f"path is empty: {rel_path or '.'}"
-        return "\n".join(rows)[:3200]
-
-    def _workspace_read_file(self, *, rel_path: str, max_chars: int = 4000) -> str:
-        root = Path(self.cfg.workspace_dir).expanduser().resolve()
-        target = self._resolve_workspace_path(rel_path, allow_dir=False)
-        if not target.exists():
-            raise RuntimeError(f"workspace file not found: {rel_path}")
-        if not target.is_file():
-            raise RuntimeError(f"workspace path is not a file: {rel_path}")
-        try:
-            text = target.read_text(encoding="utf-8")
-        except Exception as exc:
-            raise RuntimeError(f"workspace read failed: {exc}") from exc
-        try:
-            rel = target.relative_to(root).as_posix()
-        except Exception:
-            rel = target.name
-        clipped = str(text)[: max(200, int(max_chars))]
-        return f"[{rel}]\n{clipped}"
-
-    def _workspace_write_file(
-        self,
-        *,
-        rel_path: str,
-        content: str,
-        mode: str = "overwrite",
-    ) -> str:
-        root = Path(self.cfg.workspace_dir).expanduser().resolve()
-        target = self._resolve_workspace_path(rel_path, allow_dir=False)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        payload = str(content or "")
-        if not payload.strip():
-            raise RuntimeError("workspace write content is empty")
-        write_mode = str(mode or "overwrite").strip().lower()
-        try:
-            if write_mode == "append":
-                with target.open("a", encoding="utf-8") as fh:
-                    fh.write(payload)
-                    if not payload.endswith("\n"):
-                        fh.write("\n")
-            else:
-                target.write_text(payload + ("" if payload.endswith("\n") else "\n"), encoding="utf-8")
-        except Exception as exc:
-            raise RuntimeError(f"workspace write failed: {exc}") from exc
-        try:
-            self._workspace._mark_sqlite_dirty()  # keep sqlite memory index in sync with manual file edits
-        except Exception:
-            pass
-        try:
-            rel = target.relative_to(root).as_posix()
-        except Exception:
-            rel = target.name
-        size = int(target.stat().st_size)
-        return f"written {rel} ({size}B, mode={write_mode})"
-
     def _build_wow_character_url(self, args: dict) -> dict:
         skill_dir = Path("data/skills/wow-character-link")
         module_path = skill_dir / "builder.py"
@@ -3349,25 +3046,7 @@ class WeChatGuiRpaBot:
         )
 
     def _load_heartbeat_tasks(self) -> str:
-        if not self.cfg.workspace_enabled:
-            return ""
-        path = Path(self.cfg.workspace_dir) / "HEARTBEAT.md"
-        if not path.exists():
-            return ""
-        try:
-            raw = path.read_text(encoding="utf-8")
-        except Exception:
-            return ""
-        lines: list[str] = []
-        for line in raw.splitlines():
-            clean = line.strip()
-            if not clean:
-                continue
-            # Skip markdown headings/comments; keep checklist bullets and normal text.
-            if clean.startswith("#"):
-                continue
-            lines.append(clean)
-        return "\n".join(lines)[:2800]
+        return ""
 
     @staticmethod
     def _parse_heartbeat_direct_actions(tasks_text: str) -> list[dict]:
@@ -3473,22 +3152,7 @@ class WeChatGuiRpaBot:
         return merged
 
     def _collect_recent_daily_memory(self, *, days: int, max_chars: int = 6000) -> str:
-        mem_dir = Path(self.cfg.workspace_dir) / "memory"
-        if not mem_dir.exists():
-            return ""
-        files = sorted(mem_dir.glob("20??-??-??.md"), reverse=True)
-        parts: list[str] = []
-        for path in files[: max(1, int(days))]:
-            try:
-                text = path.read_text(encoding="utf-8").strip()
-            except Exception:
-                continue
-            if not text:
-                continue
-            parts.append(f"[{path.name}]\n{text[:2200]}")
-            if len("\n\n".join(parts)) >= max_chars:
-                break
-        return "\n\n".join(parts)[:max_chars]
+        return ""
 
     def _heartbeat_llm_backends(self) -> list[tuple[str, LlmReplyGenerator]]:
         backends: list[tuple[str, LlmReplyGenerator]] = []
@@ -3507,53 +3171,7 @@ class WeChatGuiRpaBot:
         return backends
 
     def _heartbeat_maintain_memory(self, *, days: int) -> tuple[bool, str]:
-        if not self.cfg.workspace_enabled:
-            return False, "skip (workspace disabled)"
-        backends = self._heartbeat_llm_backends()
-        if not backends:
-            return False, "skip (llm disabled)"
-        workspace = Path(self.cfg.workspace_dir)
-        mem_path = workspace / "MEMORY.md"
-        if not mem_path.exists():
-            return False, "skip (MEMORY.md missing)"
-        existing = mem_path.read_text(encoding="utf-8")
-        recent = self._collect_recent_daily_memory(days=max(1, min(14, days)))
-        if not recent:
-            return False, "skip (no recent daily memory)"
-        digest = ""
-        backend_name = ""
-        errors: list[str] = []
-        for name, llm in backends:
-            try:
-                candidate = llm.heartbeat_memory_digest(
-                    existing_memory=existing[:5000],
-                    recent_daily_memory=recent,
-                    max_items=12,
-                ).strip()
-            except Exception as exc:
-                errors.append(f"{name}: {exc}")
-                continue
-            if candidate:
-                digest = candidate
-                backend_name = name
-                break
-        if (not digest) and errors:
-            return False, f"error ({errors[0]})"
-        if not digest.strip():
-            return False, "skip (digest empty)"
-        updated = self._update_managed_block(
-            existing,
-            start_marker="<!-- HEARTBEAT_MEMORY_START -->",
-            end_marker="<!-- HEARTBEAT_MEMORY_END -->",
-            body=digest,
-        )
-        if updated != existing:
-            mem_path.write_text(updated, encoding="utf-8")
-            detail = f"MEMORY.md 已整理 (days={max(1, min(14, days))})"
-            if backend_name:
-                detail += f" via {backend_name}"
-            return True, detail
-        return False, "skip (memory unchanged)"
+        return False, "skip (memory maintenance archived)"
 
     def _heartbeat_maintain_person_impressions(
         self,
@@ -3561,224 +3179,10 @@ class WeChatGuiRpaBot:
         days: int,
         max_people: int,
     ) -> tuple[bool, str]:
-        if not self.cfg.workspace_enabled:
-            return False, "skip (workspace disabled)"
-        if not self.cfg.person_impression_enabled:
-            return False, "skip (person impression disabled)"
-        backends = self._heartbeat_llm_backends()
-        if not backends:
-            return False, "skip (llm disabled)"
-
-        capped_days = max(1, min(3650, int(days)))
-        capped_people = max(1, min(200, int(max_people)))
-        candidates = self._workspace.collect_person_impression_candidates(
-            days=capped_days,
-            max_people=capped_people,
-        )
-        if not candidates:
-            return False, "skip (no person candidates)"
-
-        def _merge_unique(
-            first: list[str] | None,
-            second: list[str] | None,
-            *,
-            limit: int,
-            max_len: int,
-        ) -> list[str]:
-            out: list[str] = []
-            seen_items: set[str] = set()
-            for seq in (first or [], second or []):
-                if isinstance(seq, str):
-                    iterable = [seq]
-                elif isinstance(seq, list):
-                    iterable = seq
-                else:
-                    iterable = [seq]
-                for source in iterable:
-                    clean = re.sub(r"\s+", " ", str(source or "")).strip()
-                    if not clean:
-                        continue
-                    clean = clean[:max_len]
-                    key = clean.lower()
-                    if key in seen_items:
-                        continue
-                    seen_items.add(key)
-                    out.append(clean)
-                    if len(out) >= max(1, int(limit)):
-                        return out
-            return out
-
-        changed = 0
-        unchanged = 0
-        failures = 0
-        first_error = ""
-        backend_used: set[str] = set()
-        for item in candidates:
-            name = re.sub(r"\s+", " ", str(item.get("name", "")).strip())[:24]
-            if not name:
-                continue
-            aliases = [str(x) for x in (item.get("aliases") or [])]
-            notes = [str(x) for x in (item.get("notes") or [])]
-            sessions = [str(x) for x in (item.get("sessions") or [])]
-            facts = [str(x) for x in (item.get("facts") or [])]
-            events = [str(x) for x in (item.get("events") or [])]
-            relations = [str(x) for x in (item.get("relations") or [])]
-            mentions_raw = item.get("mentions", 0)
-            try:
-                mentions = int(mentions_raw)
-            except Exception:
-                mentions = 0
-
-            digest: dict = {}
-            for backend_name, llm in backends:
-                try:
-                    candidate = llm.heartbeat_person_impression_digest(
-                        name=name,
-                        aliases=aliases,
-                        notes=notes,
-                        sessions=sessions,
-                        facts=facts,
-                        events=events,
-                        relations=relations,
-                        mentions=mentions,
-                    )
-                except Exception as exc:
-                    if not first_error:
-                        first_error = str(exc)
-                    continue
-                if candidate:
-                    digest = candidate
-                    backend_used.add(backend_name)
-                    break
-
-            llm_keywords = digest.get("keywords")
-            llm_facts = digest.get("facts")
-            llm_events = digest.get("events")
-            llm_relations = digest.get("relations")
-            keywords = _merge_unique(llm_keywords, notes, limit=10, max_len=16)
-            merged_facts = _merge_unique(llm_facts, facts, limit=8, max_len=70)
-            merged_events = _merge_unique(llm_events, events, limit=8, max_len=90)
-            merged_relations = _merge_unique(llm_relations, relations, limit=8, max_len=90)
-            impression = re.sub(r"\s+", " ", str(digest.get("impression", "") or "")).strip()[:220]
-            if not impression:
-                fallback_impression = "；".join(
-                    x for x in [*notes[:2], *facts[:1]] if re.sub(r"\s+", " ", str(x or "")).strip()
-                )
-                impression = fallback_impression[:220]
-
-            try:
-                updated, _ = self._workspace.upsert_person_impression(
-                    name=name,
-                    aliases=aliases,
-                    keywords=keywords,
-                    impression=impression,
-                    facts=merged_facts,
-                    events=merged_events,
-                    relations=merged_relations,
-                    sessions=sessions,
-                )
-            except Exception as exc:
-                failures += 1
-                if not first_error:
-                    first_error = str(exc)
-                continue
-
-            if updated:
-                changed += 1
-            else:
-                unchanged += 1
-
-        processed = changed + unchanged + failures
-        if changed > 0:
-            detail = (
-                f"人物印象已整理 {changed}/{max(1, processed)} 人 "
-                f"(days={capped_days}, max_people={capped_people})"
-            )
-            if backend_used:
-                detail += f" via {','.join(sorted(backend_used)[:3])}"
-            return True, detail
-        if failures > 0 and (not unchanged):
-            err = self._compact_web_text(first_error or "unknown", limit=140)
-            return False, f"error ({err})"
-        return False, "skip (person impressions unchanged)"
+        return False, "skip (person impression maintenance archived)"
 
     def _heartbeat_refine_persona_files(self) -> tuple[bool, str]:
-        if not self.cfg.workspace_enabled:
-            return False, "skip (workspace disabled)"
-        backends = self._heartbeat_llm_backends()
-        if not backends:
-            return False, "skip (llm disabled)"
-        workspace = Path(self.cfg.workspace_dir)
-        paths = {
-            "soul": workspace / "SOUL.md",
-            "identity": workspace / "IDENTITY.md",
-            "user": workspace / "USER.md",
-            "tools": workspace / "TOOLS.md",
-            "memory": workspace / "MEMORY.md",
-        }
-        for path in paths.values():
-            path.parent.mkdir(parents=True, exist_ok=True)
-            if not path.exists():
-                path.write_text("", encoding="utf-8")
-
-        raw = {name: p.read_text(encoding="utf-8") for name, p in paths.items()}
-        docs: dict[str, str] = {}
-        backend_name = ""
-        errors: list[str] = []
-        for name, llm in backends:
-            try:
-                candidate = llm.heartbeat_refine_persona_docs(
-                    soul=raw["soul"][:4000],
-                    identity=raw["identity"][:4000],
-                    user=raw["user"][:4000],
-                    tools=raw["tools"][:4000],
-                    memory=raw["memory"][:5000],
-                )
-            except Exception as exc:
-                errors.append(f"{name}: {exc}")
-                continue
-            if candidate:
-                docs = candidate
-                backend_name = name
-                break
-        if (not docs) and errors:
-            return False, f"error ({errors[0]})"
-        if not docs:
-            return False, "skip (persona doc empty)"
-
-        markers = {
-            "soul": ("<!-- HEARTBEAT_SOUL_START -->", "<!-- HEARTBEAT_SOUL_END -->"),
-            "identity": (
-                "<!-- HEARTBEAT_IDENTITY_START -->",
-                "<!-- HEARTBEAT_IDENTITY_END -->",
-            ),
-            "user": ("<!-- HEARTBEAT_USER_START -->", "<!-- HEARTBEAT_USER_END -->"),
-            "tools": ("<!-- HEARTBEAT_TOOLS_START -->", "<!-- HEARTBEAT_TOOLS_END -->"),
-        }
-        changed = 0
-        for key in ("soul", "identity", "user", "tools"):
-            content = str(docs.get(key, "")).strip()
-            if not content:
-                continue
-            path = paths[key]
-            old = path.read_text(encoding="utf-8")
-            start_marker, end_marker = markers[key]
-            new_text = self._update_managed_block(
-                old,
-                start_marker=start_marker,
-                end_marker=end_marker,
-                body=content,
-            )
-            if new_text != old:
-                path.write_text(new_text, encoding="utf-8")
-                changed += 1
-
-        if changed > 0:
-            detail = f"设定文件已整理 {changed} 项"
-            if backend_name:
-                detail += f" via {backend_name}"
-            return True, detail
-        return False, "skip (persona unchanged)"
+        return False, "skip (persona refinement archived)"
 
     def _heartbeat_virtual_row(self) -> ChatRowState:
         title = (
@@ -3799,108 +3203,13 @@ class WeChatGuiRpaBot:
         )
 
     def _run_heartbeat_pending_agent_task(self, now: float, rows: list[ChatRowState]) -> bool:
-        pending = self._workspace.list_pending_agent_tasks(limit=1)
-        if not pending:
-            return False
-        candidate = pending[0]
-        session_key = str(candidate.get("session_key", "")).strip()
-        title = str(candidate.get("title", "")).strip() or session_key or "__agent_task__"
-        task = self._normalize_agent_task_state(candidate.get("task"))
-        if not session_key or not task:
-            return False
-
-        row = self._virtual_session_row(
-            session_key=session_key,
-            title=title,
-            preview=str(task.get("next_step", "") or task.get("goal", "") or "agent task"),
-            row_idx=-3,
-        )
-        for item in rows:
-            if self._session_key_for_row(item, remember=False) == session_key:
-                row = item
-                break
-
-        is_admin = self._is_admin_session(row)
-        tools = self._available_agent_tools(is_admin=is_admin)
-        if row.row_idx < 0:
-            tools = [name for name in tools if name != "generate_image"]
-        if not tools:
-            return False
-
-        task_seed = (
-            str(task.get("next_step", "")).strip()
-            or str(task.get("goal", "")).strip()
-            or str(task.get("last_result", "")).strip()
-            or "继续处理未完成任务"
-        )[:120]
-        chat_context = self._build_session_history_text(row)
-        session_context = self._build_session_context(row)
-        workspace_context = self._workspace_context_for_row(
-            row,
-            is_admin=is_admin,
-            skill_query=task_seed,
-        )
-        memory_recall = self._workspace_memory_recall_for_row(
-            row,
-            task_seed,
-            is_admin=is_admin,
-        )
-        now_text = datetime.fromtimestamp(now).strftime("%Y-%m-%d %H:%M:%S")
-        environment_context = (
-            "[heartbeat_resume]\n"
-            f"继续会话中的未完成任务，不要重新起题。\n"
-            f"当前时间: {now_text}\n"
-            f"会话: {title}\n"
-            f"任务状态:\n{self._format_agent_task_state_for_prompt(task) or '无'}"
-        )[:2200]
-        status_before = str(task.get("status", "")).strip() or "running"
-        memory_recall, _, action_count, _, task_after = self._run_agent_planner_loop(
-            planner=self.llm_heartbeat,
-            row=row,
-            reason="heartbeat_task",
-            is_group=self._is_group_chat(row),
-            is_admin=is_admin,
-            latest_message=task_seed,
-            chat_context=chat_context,
-            environment_context=environment_context,
-            session_context=session_context,
-            workspace_context=workspace_context,
-            memory_recall=memory_recall,
-            tools=tools,
-            per_round_max_actions=(
-                self.cfg.heartbeat_max_actions
-                if int(self.cfg.heartbeat_max_actions) > 0
-                else 999
-            ),
-        )
-        status_after = str(task_after.get("status", "")).strip() or "idle"
-        if self.cfg.log_verbose:
-            print(
-                f"[heartbeat] resume session={self._fit_col(title, 14)} "
-                f"status={status_before}->{status_after} actions={action_count:>2}"
-            )
-        marker = "[工具执行结果]"
-        observations = ""
-        if marker in memory_recall:
-            observations = memory_recall.split(marker, 1)[1].strip()[:1800]
-        if observations:
-            self._append_session_record(
-                row,
-                role="assistant",
-                text=f"[heartbeat] {observations}",
-                content_type="text",
-                sender="",
-                source="heartbeat",
-                count_turn=False,
-            )
-        self._memory_dirty = True
-        return action_count > 0 or status_after != status_before
+        return False
 
     def _available_heartbeat_tools(self) -> list[str]:
         return ["read_impression", "write_impression", "write_memory"]
 
     def _heartbeat_identity_text(self) -> str:
-        paths = [Path("data/identity.md"), Path(self.cfg.workspace_dir) / "IDENTITY.md"]
+        paths = [Path("data/identity.md"), Path("data/config/IDENTITY.md")]
         parts: list[str] = []
         for path in paths:
             try:
@@ -4049,7 +3358,7 @@ class WeChatGuiRpaBot:
         return True
 
     def _maybe_run_heartbeat(self, now: float, rows: list[ChatRowState]) -> bool:
-        return self.heartbeat.maybe_run(now, rows)
+        return False
 
     def _is_ignored_title(self, row: ChatRowState) -> bool:
         return self._is_ignored_title_text(row.title)
@@ -5649,7 +4958,7 @@ class WeChatGuiRpaBot:
         print(f"[start] image-dir={image_root}")
         print(f"[start] image-gen: {self._image_generation_status_text()}")
         print(f"[start] image-edit: {self._image_editing_status_text()}")
-        print(f"[start] memory-sqlite: {self._workspace.sqlite_status_text()}")
+        print(f"[start] memory-sqlite: disabled (archived)")
         while True:
             self._cycle += 1
             now = time.time()
@@ -6335,8 +5644,8 @@ class WeChatGuiRpaBot:
         print(f"[start] web-search: {self._web_search_status_text()}")
         print(f"[start] image-gen: {self._image_generation_status_text()}")
         print(f"[start] image-edit: {self._image_editing_status_text()}")
-        print(f"[start] memory-sqlite: {self._workspace.sqlite_status_text()}")
-        print(f"[start] rerank: {self._workspace.rerank_status_text()}")
+        print(f"[start] memory-sqlite: disabled (archived)")
+        print(f"[start] rerank: disabled (archived)")
         print(f"        admin={self._fit_col(admin_titles, admin_w)}")
         while True:
             self._cycle += 1
