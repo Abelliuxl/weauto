@@ -289,6 +289,10 @@ class AppConfig:
     volc_ark_limit: int = 8
     volc_ark_max_keyword: int = 3
     volc_ark_timeout_sec: float = 20.0
+    # When True, run_python sandbox blocks imports and limits builtins for safety.
+    # Set False on trusted machines to allow full Python (import, file I/O, etc).
+    python_sandbox_restricted: bool = True
+
     # Agent Reach provider (via mcporter + Exa MCP)
     agent_reach_enabled: bool = False
     agent_reach_mcporter_cmd: str = "mcporter"
@@ -764,6 +768,7 @@ def load_config(path: str | Path | None) -> AppConfig:
     cfg.volc_ark_timeout_sec = float(
         data.get("volc_ark_timeout_sec", cfg.volc_ark_timeout_sec)
     )
+    cfg.python_sandbox_restricted = bool(data.get("python_sandbox_restricted", cfg.python_sandbox_restricted))
     cfg.agent_reach_enabled = bool(data.get("agent_reach_enabled", cfg.agent_reach_enabled))
     cfg.agent_reach_mcporter_cmd = str(
         data.get("agent_reach_mcporter_cmd", cfg.agent_reach_mcporter_cmd)

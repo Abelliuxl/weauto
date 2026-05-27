@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import os
 import subprocess
 import sys
 import textwrap
@@ -281,6 +282,12 @@ def _validate(code: str) -> ast.AST:
     return tree
 
 
+_UNRESTRICTED_WRAPPER = r"""
+import sys
+source = sys.stdin.read()
+exec(compile(source, "<calculation>", "exec"))
+"""
+
 _CHILD_WRAPPER = r"""
 import math
 import statistics
@@ -330,25 +337,34 @@ exec(compile(source, "<calculation>", "exec"), env, env)
 """
 
 
-def run_python_calculation(code: str, *, timeout_sec: float = 2.0, max_output_chars: int = 4000) -> PythonSandboxResult:
+def run_python_calculation(code: str, *, timeout_sec: float = 2.0, max_output_chars: int = 4000, restricted: bool = True) -> PythonSandboxResult:
     source = str(code or "").strip()
     if not source:
         return PythonSandboxResult(ok=False, output="", error="empty code")
-    try:
-        _validate(source)
-    except PythonSandboxError as exc:
-        return PythonSandboxResult(ok=False, output="", error=str(exc))
 
-    wrapper = textwrap.dedent(_CHILD_WRAPPER).strip()
+    if restricted:
+        try:
+            _validate(source)
+        except PythonSandboxError as exc:
+            return PythonSandboxResult(ok=False, output="", error=str(exc))
+
+    if restricted:
+        wrapper = textwrap.dedent(_CHILD_WRAPPER).strip()
+        child_args = [sys.executable, "-I", "-S", "-c", wrapper]
+        child_env: dict[str, str] = {}
+    else:
+        wrapper = textwrap.dedent(_UNRESTRICTED_WRAPPER).strip()
+        child_args = [sys.executable, "-c", wrapper]
+        child_env = dict(os.environ) if os.environ else {}
     try:
         with tempfile.TemporaryDirectory(prefix="weauto_calc_") as tmp:
             proc = subprocess.run(
-                [sys.executable, "-I", "-S", "-c", wrapper],
+                child_args,
                 input=source + "\n",
                 text=True,
                 capture_output=True,
                 cwd=tmp,
-                env={},
+                env=child_env or None,
                 timeout=timeout_sec,
             )
     except subprocess.TimeoutExpired:

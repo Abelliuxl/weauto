@@ -176,7 +176,10 @@ class ActionProcessor:
                     if not code:
                         status = "skip (empty code)"
                     else:
-                        result = run_python_calculation(code, timeout_sec=2.0, max_output_chars=4000)
+                        result = run_python_calculation(
+                            code, timeout_sec=2.0, max_output_chars=4000,
+                            restricted=bot.cfg.python_sandbox_restricted,
+                        )
                         status = "ok" if result.ok else "error"
                         obs = f"Python结果:\n{result.to_tool_text()}"[:1800]
                         ok = result.ok
