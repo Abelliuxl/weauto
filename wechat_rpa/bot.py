@@ -4483,6 +4483,9 @@ class WeChatGuiRpaBot:
             key = self._session_key_for_row(row)
             self._latest_image_by_session[key] = image_path
 
+    def _latest_image_for_row(self, row: ChatRowState) -> str:
+        return self._latest_image_by_session.get(self._session_key_for_row(row), "")
+
     def _image_followup_context_for_text(self, row: ChatRowState, text: str) -> str:
         clean = re.sub(r"\s+", " ", str(text or "")).strip()
         if not clean:
