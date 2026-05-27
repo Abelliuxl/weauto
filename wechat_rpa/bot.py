@@ -4652,18 +4652,21 @@ class WeChatGuiRpaBot:
     def _canonicalize_visible_messages(self, messages: list[dict]) -> list[dict]:
         return [self._canonicalize_visible_message(message) for message in messages]
 
-    def _detached_message_record(self, message: dict) -> dict:
+    def _detached_message_record(self, message: dict, *, window_title: str = "") -> dict:
         side = str(message.get("side", "")).strip()
         content_type = str(message.get("content_type", "text")).strip().lower() or "text"
         text = re.sub(r"\s+", " ", str(message.get("text", "") or "")).strip()
         if content_type == "image":
             image_hash = str(message.get("image_hash", "")).strip()
             text = f"[图片:{image_hash}]" if image_hash else "[图片]"
+        sender = str(message.get("sender", "") or "").strip()[:40]
+        if (not sender) and side == "other" and window_title:
+            sender = window_title[:40]
         return {
             "role": "assistant" if side == "self" else "user",
             "content_type": content_type,
             "text": text,
-            "sender": str(message.get("sender", "") or "").strip()[:40],
+            "sender": sender,
             "sender_raw": str(message.get("sender_raw", "") or "").strip()[:40],
         }
 
@@ -5049,7 +5052,7 @@ class WeChatGuiRpaBot:
                             row_for_merge,
                             str(image_message.get("image_path", "") or ""),
                         )
-                records = [self._detached_message_record(message) for message in snapshot.messages]
+                records = [self._detached_message_record(message, window_title=window.title) for message in snapshot.messages]
                 self._merge_session_records(row_for_merge, records, source="detached")
                 new_messages = self.visible_message_state.update(
                     window_id=window.window_id,
