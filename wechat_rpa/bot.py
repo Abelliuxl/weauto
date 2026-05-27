@@ -1680,6 +1680,7 @@ class WeChatGuiRpaBot:
 
     def _available_agent_tools(self, *, is_admin: bool) -> list[str]:
         tools = [
+            "list_skills",
             "write_memory",
             "write_skill",
             "delete_skill",

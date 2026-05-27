@@ -2281,6 +2281,10 @@ class LlmReplyGenerator:
                 },
                 "required": ["name", "content"],
             },
+            "list_skills": {
+                "description": "List all available skill names, summaries and keywords from data/skills/. No arguments needed.",
+                "properties": {},
+            },
             "write_skill": {
                 "description": "Save a reusable local strategy/procedure into data/skills/<name>/SKILL.md.",
                 "properties": {
@@ -2515,6 +2519,7 @@ class LlmReplyGenerator:
         total_remaining = max(0, min(total_limit, int(planner_total_actions_remaining)))
 
         tool_specs = {
+            "list_skills": "args={} 列出 data/skills/ 下所有已注册技能的名称和摘要",
             "write_memory": (
                 "args={\"name\":\"core|timeline\",\"content\":\"完整 markdown\"} "
                 "完整替换 data/memory/core.md 或 timeline.md"
@@ -2757,7 +2762,9 @@ class LlmReplyGenerator:
                 args_raw = item.get("args")
                 args_obj = args_raw if isinstance(args_raw, dict) else {}
                 args: dict[str, str] = {}
-                if tool == "write_memory":
+                if tool == "list_skills":
+                    args = {}
+                elif tool == "write_memory":
                     raw_name = str(args_obj.get("name", "core")).strip().lower()
                     name = "timeline" if raw_name in {"timeline", "time", "history", "events"} else "core"
                     content = str(args_obj.get("content", "") or args_obj.get("text", "")).strip()[:12000]

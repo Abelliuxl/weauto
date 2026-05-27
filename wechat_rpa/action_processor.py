@@ -84,6 +84,26 @@ class ActionProcessor:
                         status = "ok"
                         obs = f"技能已写入 data/skills/{name}/SKILL.md ({len(content)} chars)"
                         ok = True
+                elif tool == "list_skills":
+                    from wechat_rpa.prompt_context import list_skills as _list_skills
+
+                    metas = _list_skills()
+                    if not metas:
+                        status = "ok (empty)"
+                        obs = "当前没有已注册的技能"
+                    else:
+                        lines: list[str] = []
+                        for m in metas:
+                            name = str(m.get("name", "") or "?")
+                            summary = str(m.get("summary", "") or "无摘要")
+                            keywords = ", ".join(str(k) for k in (m.get("keywords") or []) if k)
+                            line = f"- {name}: {summary}"
+                            if keywords:
+                                line += f" ({keywords})"
+                            lines.append(line)
+                        obs = f"技能列表 ({len(metas)} 个):\n" + "\n".join(lines)
+                        status = "ok"
+                        ok = True
                 elif tool == "delete_skill":
                     name = bot.agent_skills.normalize_name(str(args.get("name", "") or args.get("skill", "")))
                     if not name:
@@ -343,6 +363,8 @@ class ActionProcessor:
                 elif tool == "write_skill":
                     name = re.sub(r"\s+", " ", str(args.get("name", "")).strip())[:80]
                     obs = f"技能写入[{name}]失败: {err}"
+                elif tool == "list_skills":
+                    obs = f"技能列表获取失败: {err}"
                 elif tool == "delete_skill":
                     name = re.sub(r"\s+", " ", str(args.get("name", "")).strip())[:80]
                     obs = f"技能删除[{name}]失败: {err}"
@@ -382,7 +404,7 @@ class ActionProcessor:
                 observations.append(obs)
             heartbeat_internal_tool = (
                 row.title == "__heartbeat__"
-                and tool in {"read_impression", "write_impression", "write_memory", "write_skill", "delete_skill"}
+                and tool in {"read_impression", "write_impression", "write_memory", "write_skill", "delete_skill", "list_skills"}
             )
             if ok and not heartbeat_internal_tool:
                 bot._append_session_record(
