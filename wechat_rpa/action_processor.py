@@ -94,6 +94,27 @@ class ActionProcessor:
                         status = "ok"
                         obs = f"记忆已写入 data/memory/{name}.md ({len(content)} chars)"
                         ok = True
+                elif tool == "write_skill":
+                    name = bot.agent_skills.normalize_name(str(args.get("name", "") or args.get("skill", "")))
+                    content = str(args.get("content", "") or args.get("text", "")).strip()
+                    if not name:
+                        status = "skip (empty name)"
+                    elif not content:
+                        status = "skip (empty content)"
+                    else:
+                        bot.agent_skills.write(name, content.rstrip() + "\n")
+                        status = "ok"
+                        obs = f"技能已写入 data/skills/{name}/SKILL.md ({len(content)} chars)"
+                        ok = True
+                elif tool == "delete_skill":
+                    name = bot.agent_skills.normalize_name(str(args.get("name", "") or args.get("skill", "")))
+                    if not name:
+                        status = "skip (empty name)"
+                    else:
+                        bot.agent_skills.delete(name)
+                        status = "ok"
+                        obs = f"技能已删除 data/skills/{name}"
+                        ok = True
                 elif tool == "read_impression":
                     name = re.sub(r"_[0-9a-f]{8}$", "", str(args.get("name", "")).strip())
                     name = bot._resolve_person_name(name) or name
@@ -322,9 +343,13 @@ class ActionProcessor:
                         status = "ok"
                         obs = f"工作区写入成功: {detail}"
                         ok = True
-                elif tool == "web_search":
+                elif tool in {"web_search", "search_web", "search_web_brave"}:
                     query = re.sub(r"\s+", " ", str(args.get("query", "")).strip())[:80]
-                    provider = bot._active_web_search_provider()
+                    provider = (
+                        "tavily"
+                        if tool == "search_web"
+                        else ("brave" if tool == "search_web_brave" else bot._active_web_search_provider())
+                    )
                     if not query:
                         status = "skip (empty query)"
                     elif not bot._web_search_enabled(provider):
@@ -340,15 +365,15 @@ class ActionProcessor:
                         cmd = str(bot.cfg.agent_reach_mcporter_cmd or "").strip()
                         status = f"skip (missing command: {cmd or 'mcporter'})"
                     else:
-                        active_provider, search_text = bot._web_search(query)
+                        active_provider, search_text = bot._web_search_with_provider(provider, query)
                         if search_text:
                             status = "ok"
-                            obs = f"网页检索[{query}]({active_provider}): {search_text}"
+                            obs = f"网页检索[{query}]({active_provider}): {search_text}"[:1800]
                         else:
                             status = "ok (no-hit)"
                             obs = f"网页检索[{query}]({active_provider})无命中"
                         ok = True
-                elif tool == "web_search_volc":
+                elif tool in {"web_search_volc", "search_web_volc"}:
                     query = re.sub(r"\s+", " ", str(args.get("query", "")).strip())[:80]
                     if not query:
                         status = "skip (empty query)"
@@ -390,6 +415,41 @@ class ActionProcessor:
                             status = "ok (no-hit)"
                             obs = f"网页检索[{query}](volc_ark)无命中"
                         ok = True
+                elif tool == "fetch_url":
+                    url = re.sub(r"\s+", "", str(args.get("url", "")).strip())[:1000]
+                    proxy_raw = args.get("proxy", True)
+                    use_proxy = (
+                        proxy_raw.strip().lower() in {"1", "true", "yes", "on"}
+                        if isinstance(proxy_raw, str)
+                        else bool(proxy_raw)
+                    )
+                    if not url:
+                        status = "skip (empty url)"
+                    else:
+                        text = bot._fetch_url(url, max_chars=6000, use_proxy=use_proxy)
+                        status = "ok" if text else "ok (empty)"
+                        obs = f"网页抓取[{url}]:\n{text or '无内容'}"[:1800]
+                        ok = True
+                elif tool == "browse_url":
+                    url = re.sub(r"\s+", "", str(args.get("url", "")).strip())[:1000]
+                    proxy_raw = args.get("proxy", True)
+                    use_proxy = (
+                        proxy_raw.strip().lower() in {"1", "true", "yes", "on"}
+                        if isinstance(proxy_raw, str)
+                        else bool(proxy_raw)
+                    )
+                    if not url:
+                        status = "skip (empty url)"
+                    else:
+                        text = bot._browse_url(url, max_chars=10000, use_proxy=use_proxy)
+                        status = "ok" if text else "ok (empty)"
+                        obs = f"网页浏览[{url}]:\n{text or '无内容'}"[:1800]
+                        ok = True
+                elif tool == "build_wow_character_url":
+                    result = bot._build_wow_character_url(args)
+                    status = "ok" if result.get("ok") else "error"
+                    obs = f"魔兽角色链接:\n{bot._format_wow_character_result(result)}"[:1800]
+                    ok = bool(result.get("ok"))
                 elif tool == "generate_image":
                     prompt = bot._clean_image_prompt(args.get("prompt", ""), limit=280)
                     if not prompt:
@@ -477,9 +537,12 @@ class ActionProcessor:
             except Exception as exc:
                 err = bot._compact_web_text(exc, limit=240)
                 status = f"error ({err})"
-                if tool in ("web_search", "web_search_volc"):
+                if tool in ("web_search", "search_web", "search_web_brave", "web_search_volc", "search_web_volc"):
                     query = re.sub(r"\s+", " ", str(args.get("query", "")).strip())[:80]
                     obs = f"网页检索[{query}]失败: {err}"
+                elif tool in ("fetch_url", "browse_url"):
+                    url = re.sub(r"\s+", "", str(args.get("url", "")).strip())[:120]
+                    obs = f"网页读取[{url}]失败: {err}"
                 elif tool == "search_memory":
                     query = re.sub(r"\s+", " ", str(args.get("query", "")).strip())[:80]
                     obs = f"记忆检索[{query}]失败: {err}"
@@ -491,6 +554,12 @@ class ActionProcessor:
                 elif tool == "write_memory":
                     name = re.sub(r"\s+", " ", str(args.get("name", "")).strip())[:40]
                     obs = f"记忆写入[{name}]失败: {err}"
+                elif tool == "write_skill":
+                    name = re.sub(r"\s+", " ", str(args.get("name", "")).strip())[:80]
+                    obs = f"技能写入[{name}]失败: {err}"
+                elif tool == "delete_skill":
+                    name = re.sub(r"\s+", " ", str(args.get("name", "")).strip())[:80]
+                    obs = f"技能删除[{name}]失败: {err}"
                 elif tool == "read_impression":
                     name = re.sub(r"\s+", " ", str(args.get("name", "")).strip())[:40]
                     obs = f"人物印象读取[{name}]失败: {err}"
@@ -511,6 +580,8 @@ class ActionProcessor:
                 elif tool == "workspace_write_file":
                     rel_path = re.sub(r"\s+", " ", str(args.get("path", "")).strip())[:120]
                     obs = f"工作区写入[{rel_path}]失败: {err}"
+                elif tool == "build_wow_character_url":
+                    obs = f"魔兽角色链接构建失败: {err}"
                 elif tool == "generate_image":
                     prompt = bot._clean_image_prompt(args.get("prompt", ""), limit=60)
                     obs = f"图片生成[{prompt}]失败: {err}"
@@ -534,7 +605,7 @@ class ActionProcessor:
                 observations.append(obs)
             heartbeat_internal_tool = (
                 row.title == "__heartbeat__"
-                and tool in {"read_impression", "write_impression", "write_memory"}
+                and tool in {"read_impression", "write_impression", "write_memory", "write_skill", "delete_skill"}
             )
             if ok and not heartbeat_internal_tool:
                 bot._append_session_record(

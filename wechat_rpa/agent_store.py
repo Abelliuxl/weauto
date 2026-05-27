@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import shutil
 import time
 from datetime import datetime
 from pathlib import Path
@@ -88,13 +89,25 @@ class SkillStore:
         self.base = Path(base_dir)
         self._files: dict[str, HotFile] = {}
 
+    @staticmethod
+    def normalize_name(name: str) -> str:
+        clean = str(name or "").strip().replace("\\", "/")
+        clean = re.sub(r"^(?:data/)?skills/", "", clean, flags=re.I)
+        clean = re.sub(r"/?SKILL\.md$", "", clean, flags=re.I)
+        parts = [part.strip() for part in clean.split("/") if part.strip()]
+        clean = parts[-1] if parts else ""
+        clean = re.sub(r"\s+", "-", clean)
+        clean = re.sub(r"[^0-9A-Za-z._\-\u4e00-\u9fff]+", "-", clean).strip(".-")
+        return clean[:80] or "skill"
+
     def _path(self, name: str) -> Path:
-        return self.base / name / "SKILL.md"
+        return self.base / self.normalize_name(name) / "SKILL.md"
 
     def _get(self, name: str) -> HotFile:
-        if name not in self._files:
-            self._files[name] = HotFile(self._path(name))
-        return self._files[name]
+        key = self.normalize_name(name)
+        if key not in self._files:
+            self._files[key] = HotFile(self._path(key))
+        return self._files[key]
 
     def list(self) -> list[str]:
         if not self.base.is_dir():
@@ -115,31 +128,14 @@ class SkillStore:
                 continue
             skill_file = d / "SKILL.md"
             if not skill_file.is_file() or not skill_file.read_text(encoding="utf-8", errors="replace").strip():
-                for f in d.iterdir():
-                    f.unlink()
-                d.rmdir()
-
-    def list(self) -> list[str]:
-        if not self.base.is_dir():
-            return []
-        return sorted(d.name for d in self.base.iterdir() if d.is_dir())
-
-    def read(self, name: str) -> str:
-        return self._get(name).read()
-
-    def write(self, name: str, content: str) -> None:
-        self._get(name).write(content)
+                shutil.rmtree(d, ignore_errors=True)
 
     def delete(self, name: str) -> None:
         path = self._path(name)
-        if path.is_file():
-            path.unlink()
         parent = path.parent
         if parent.is_dir():
-            for f in parent.iterdir():
-                f.unlink()
-            parent.rmdir()
-        self._files.pop(name, None)
+            shutil.rmtree(parent)
+        self._files.pop(self.normalize_name(name), None)
 
 
 class PeopleStore:

@@ -212,8 +212,13 @@ class VisibleMessageParser:
             & (g <= 245)
             & (b >= 225)
             & (b <= 245)
-            & (np.abs(r.astype(int) - g.astype(int)) < 4)
-            & (np.abs(g.astype(int) - b.astype(int)) < 4)
+            & (
+                (
+                    np.maximum.reduce([r, g, b]).astype(int)
+                    - np.minimum.reduce([r, g, b]).astype(int)
+                )
+                <= 16
+            )
         )
         non_background = (
             (
@@ -223,6 +228,7 @@ class VisibleMessageParser:
             )
             > 28
         )
+        avatars = self._detect_avatar_boxes(non_background & (body > 0), width)
 
         blocks: list[MessageBlock] = []
         for box in self._mask_boxes(non_background & (body > 0)):
@@ -230,7 +236,9 @@ class VisibleMessageParser:
             if x < width * 0.15:
                 continue
             if bw >= 150 and bh >= 120:
-                side = "self" if x > width * 0.55 else "other"
+                if self._bubble_fill_ratio(green | gray_bubble, [x, y, x + bw, y + bh]) >= 0.45:
+                    continue
+                side = self._infer_block_side([x, y, x + bw, y + bh], width, avatars)
                 blocks.append(MessageBlock(kind="image", side=side, bbox=[x, y, x + bw, y + bh]))
 
         for kind, mask in (("self_text", green), ("other_text", gray_bubble)):
@@ -246,7 +254,7 @@ class VisibleMessageParser:
                     continue
                 if any(self._boxes_overlap([x, y, x + bw, y + bh], image.bbox, min_ratio=0.45) for image in blocks if image.kind == "image"):
                     continue
-                side = "self" if x > width * 0.55 else "other"
+                side = self._infer_block_side([x, y, x + bw, y + bh], width, avatars)
                 blocks.append(MessageBlock(kind="text", side=side, bbox=[x, y, x + bw, y + bh]))
         return sorted(blocks, key=lambda block: (block.bbox[1], block.bbox[0]))
 
@@ -274,6 +282,58 @@ class VisibleMessageParser:
             if width * height >= 1800:
                 boxes.append((x, y, width, height))
         return boxes
+
+    @staticmethod
+    def _bubble_fill_ratio(mask: np.ndarray, bbox: list[int]) -> float:
+        x1, y1, x2, y2 = [int(v) for v in bbox]
+        x1 = max(0, min(mask.shape[1], x1))
+        x2 = max(0, min(mask.shape[1], x2))
+        y1 = max(0, min(mask.shape[0], y1))
+        y2 = max(0, min(mask.shape[0], y2))
+        if x2 <= x1 or y2 <= y1:
+            return 0.0
+        crop = mask[y1:y2, x1:x2]
+        return float(np.count_nonzero(crop)) / float(crop.size)
+
+    @staticmethod
+    def _detect_avatar_boxes(mask: np.ndarray, window_width: int) -> list[tuple[str, list[int]]]:
+        clean = mask.astype("uint8") * 255
+        clean = cv2.morphologyEx(clean, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5)))
+        contours, _ = cv2.findContours(clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        avatars: list[tuple[str, list[int]]] = []
+        for contour in contours:
+            x, y, width, height = cv2.boundingRect(contour)
+            if width < 44 or height < 44 or width > 100 or height > 100:
+                continue
+            aspect = width / max(1, height)
+            if aspect < 0.75 or aspect > 1.35:
+                continue
+            if x <= 130:
+                avatars.append(("other", [x, y, x + width, y + height]))
+            elif x >= window_width - 130:
+                avatars.append(("self", [x, y, x + width, y + height]))
+        return avatars
+
+    @staticmethod
+    def _infer_block_side(
+        bbox: list[int],
+        window_width: int,
+        avatars: list[tuple[str, list[int]]],
+    ) -> str:
+        x1, y1, x2, y2 = bbox
+        best_side = ""
+        best_distance = 10_000
+        for side, avatar in avatars:
+            _, ay1, _, ay2 = avatar
+            if ay2 < y1 - 24 or ay1 > y2 + 24:
+                continue
+            distance = min(abs(ay1 - y1), abs(ay2 - y1))
+            if distance < best_distance:
+                best_side = side
+                best_distance = distance
+        if best_side:
+            return best_side
+        return "self" if (window_width - x2) < x1 else "other"
 
     def _extract_bubble_text(
         self,

@@ -60,7 +60,7 @@ _DEFAULT_FILES: dict[str, str] = {
 
 这里定义工作区技能系统。
 
-- 技能目录：`skills/<skill_name>/SKILL.md`
+- 技能目录：`data/skills/<skill_name>/SKILL.md`
 - 一个技能就是一份可复用规则，适合放“遇到什么任务、按什么步骤做”
 - 当用户要求“给自己加能力 / 写个 skill / 以后遇到某类事按固定流程做”时，可以新建或更新 skill
 - 优先把稳定流程写成 skill，而不是只在当前回复里临时记住
@@ -181,7 +181,7 @@ class WorkspaceContextManager:
         self.enabled = bool(enabled)
         self.root = Path(root)
         self.memory_dir = self.root / "memory"
-        self.skills_dir = self.root / "skills"
+        self.skills_dir = Path("data/skills")
         self.session_dir = self.memory_dir / "sessions"
         self.session_state_dir = self.memory_dir / "session_state"
         self.people_dir = self.memory_dir / "people"
@@ -385,9 +385,12 @@ class WorkspaceContextManager:
 
     def _skill_meta_from_path(self, path: Path) -> dict:
         try:
-            rel = path.relative_to(self.root).as_posix()
+            rel = path.relative_to(Path.cwd()).as_posix()
         except Exception:
-            rel = path.name
+            try:
+                rel = path.relative_to(self.skills_dir).as_posix()
+            except Exception:
+                rel = path.name
         content = self._safe_read(path)
         lines = [line.strip() for line in content.splitlines() if line.strip()]
         title = path.parent.name if path.name.upper() == "SKILL.MD" else path.stem
@@ -505,18 +508,19 @@ class WorkspaceContextManager:
             if not content:
                 continue
             parts.append(f"[{name}]\n{content[:4000]}")
-        skills_index = self._skills_index_text()
-        if skills_index:
-            parts.append(f"[skills_index]\n{skills_index}")
-        selected_skills = self.select_skills(query=skill_query, limit=max_skills)
-        for meta in selected_skills:
-            name = self._clip_text(meta.get("name", ""), 40) or "skill"
-            path = self._clip_text(meta.get("path", ""), 120)
+
+        skill_texts: list[str] = []
+        for idx, path in enumerate(self._iter_skill_paths(), start=1):
+            meta = self._skill_meta_from_path(path)
+            name = self._clip_text(meta.get("name", ""), 60) or path.parent.name
+            rel_path = self._clip_text(meta.get("path", ""), 160)
             content = str(meta.get("content", "") or "").strip()
             if not content:
                 continue
-            parts.append(f"[SKILL:{name} path={path}]\n{content[:3200]}")
-        return "\n\n".join(parts)[:12000]
+            skill_texts.append(f"{idx}. {name} path={rel_path}\n{content[:5000]}")
+        if skill_texts:
+            parts.append(f"[skills ({len(skill_texts)} total)]\n" + "\n\n".join(skill_texts))
+        return "\n\n".join(parts)[:24000]
 
     def _format_record_line(
         self,

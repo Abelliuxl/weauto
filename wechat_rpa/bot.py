@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from difflib import SequenceMatcher
 import builtins
+import html
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -25,7 +27,7 @@ import pyautogui
 from PIL import Image
 
 from .action_processor import ActionProcessor
-from .agent_store import MemoryStore, PeopleStore
+from .agent_store import MemoryStore, PeopleStore, SkillStore
 from .config import AppConfig
 from .detector import ChatRowState, detect_chat_rows
 from .detached_window_receiver import capture_window_by_id, list_detached_wechat_windows, safe_window_name
@@ -186,6 +188,8 @@ class WeChatGuiRpaBot:
         self.image_generator = ImageGenerator(cfg.image_generation)
         self.image_editor = ImageEditor(cfg.image_editing)
         self.agent_memory = MemoryStore("data/memory")
+        self.agent_skills = SkillStore("data/skills")
+        self.agent_skills.cleanup()
         self.agent_people = PeopleStore("data/people")
         self.agent_people.cleanup()
         self.people_alias_resolver = PersonAliasResolver(
@@ -1819,6 +1823,8 @@ class WeChatGuiRpaBot:
             "remember_session_event",
             "set_session_summary",
             "search_memory",
+            "write_skill",
+            "delete_skill",
             "read_impression",
             "read_chat_history",
             "run_python",
@@ -1837,12 +1843,21 @@ class WeChatGuiRpaBot:
             tools.append("generate_image")
         if self._has_image_editing_tool():
             tools.append("edit_image")
+        if self._has_wow_character_url_tool():
+            tools.append("build_wow_character_url")
+        tools.append("fetch_url")
+        tools.append("browse_url")
         # Keep planner whitelist aligned with runtime capability checks:
         # expose each search tool independently when it is actually usable.
         if self._has_volc_web_search_tool():
             tools.append("web_search_volc")
+            tools.append("search_web_volc")
         if self._has_web_search_tool():
             tools.append("web_search")
+        if self._has_tavily_search_tool():
+            tools.append("search_web")
+        if self._has_brave_search_tool():
+            tools.append("search_web_brave")
         if is_admin:
             tools.extend(
                 [
@@ -1950,6 +1965,15 @@ class WeChatGuiRpaBot:
             return bool(cmd and shutil.which(cmd))
         return bool(self._resolve_web_search_api_key(provider))
 
+    def _has_tavily_search_tool(self) -> bool:
+        return bool(self.cfg.tavily_enabled and self._resolve_tavily_api_key())
+
+    def _has_brave_search_tool(self) -> bool:
+        return bool(self.cfg.brave_enabled and self._resolve_brave_api_key())
+
+    def _has_wow_character_url_tool(self) -> bool:
+        return (Path("data/skills/wow-character-link") / "builder.py").is_file()
+
     def _volc_web_search_key_hint(self) -> str:
         env_name = (self.cfg.volc_ark_api_key_env or "").strip()
         return (
@@ -2054,73 +2078,6 @@ class WeChatGuiRpaBot:
             if str(item.get("tool", "")).strip() == target:
                 return True
         return False
-
-    @staticmethod
-    def _is_web_lookup_intent(text: str) -> bool:
-        raw = re.sub(r"\s+", " ", (text or "").strip())
-        if not raw:
-            return False
-        lowered = raw.lower()
-        if "wowhead" in lowered:
-            return True
-        verbs = (
-            "查",
-            "搜",
-            "检索",
-            "查询",
-            "搜索",
-            "看看",
-            "看下",
-            "看一下",
-            "帮我查",
-            "帮我看",
-            "找一下",
-            "查下",
-            "查一下",
-            "搜下",
-            "搜一下",
-        )
-        topics = (
-            "消息",
-            "更新",
-            "公告",
-            "新闻",
-            "官网",
-            "蓝贴",
-            "hotfix",
-            "patch",
-            "补丁",
-            "装备",
-            "装等",
-            "材料",
-            "需求",
-            "赛季",
-            "大秘境",
-            "掉落",
-            "攻略",
-            "词缀",
-        )
-        temporal = ("今天", "最新", "最近", "刚刚", "什么时候", "何时", "几号", "哪天")
-        has_verb = any(v in raw for v in verbs)
-        has_topic = any(t in raw for t in topics) or any(t in lowered for t in topics)
-        has_temporal = any(t in raw for t in temporal)
-        # NOTE: \b is unreliable around CJK text (e.g. "魔兽12.0"), so use digit-boundaries.
-        has_version = bool(re.search(r"(?<!\d)\d+\.\d+(?:\.\d+)?(?!\d)", raw))
-        explicit_lookup = (
-            ("检索" in raw)
-            or ("搜索" in raw)
-            or ("查询" in raw)
-            or ("联网" in raw)
-            or ("上网查" in raw)
-        )
-        memory_cues = ("记得", "记不记得", "你还记得", "之前说过", "以前提过", "在记忆里")
-        has_memory_cue = any(c in raw for c in memory_cues)
-        return (
-            (has_verb and (has_topic or has_temporal or has_version))
-            or (has_topic and (has_temporal or has_version))
-            or (explicit_lookup and (not has_memory_cue))
-            or has_memory_cue
-        )
 
     @staticmethod
     def _is_opinion_prompt(text: str) -> bool:
@@ -2345,9 +2302,6 @@ class WeChatGuiRpaBot:
         memory_recall: str,
         tools: list[str],
         per_round_max_actions: int,
-        lookup_intent: bool,
-        lookup_query: str,
-        enforce_lookup_round1: bool,
         max_rounds_override: int | None = None,
         max_total_actions_override: int | None = None,
     ) -> tuple[str, str, int, bool, dict]:
@@ -2466,71 +2420,6 @@ class WeChatGuiRpaBot:
                         print("             hint=(dropped by normalize)")
                     print(f"             send_reply={send_reply_now}")
 
-                if (
-                    enforce_lookup_round1
-                    and round_idx == 1
-                    and lookup_intent
-                    and lookup_query
-                ):
-                    if self.cfg.log_verbose:
-                        print(
-                            f"[agent] round1-lookup-enforce intent={lookup_intent} "
-                            f"query={self._fit_col(lookup_query, max(24, self._term_width() - 35))}"
-                        )
-                    enforced: list[dict] = []
-                    planned_tool_names = {
-                        str(x.get("tool", "")).strip()
-                        for x in planned_actions
-                        if isinstance(x, dict)
-                    }
-                    has_lookup_tool = ("web_search_volc" in planned_tool_names) or (
-                        "web_search" in planned_tool_names
-                    )
-                    if (not has_lookup_tool) and self._has_volc_web_search_tool() and ("web_search_volc" in tools):
-                        if not self._plan_has_tool(planned_actions, "web_search_volc"):
-                            enforced.append(
-                                {
-                                    "tool": "web_search_volc",
-                                    "args": {"query": lookup_query},
-                                    "reason": "auto lookup intent (trusted)",
-                                }
-                            )
-                    elif (not has_lookup_tool) and self._has_web_search_tool() and ("web_search" in tools):
-                        if not self._plan_has_tool(planned_actions, "web_search"):
-                            enforced.append(
-                                {
-                                    "tool": "web_search",
-                                    "args": {"query": lookup_query},
-                                    "reason": "auto lookup intent",
-                                }
-                            )
-                    enforced_tool_names = [str(x.get("tool", "")).strip() for x in enforced]
-                    if (
-                        (not has_lookup_tool)
-                        and ("web_search_volc" not in enforced_tool_names)
-                        and ("web_search" not in enforced_tool_names)
-                        and ("search_memory" in tools)
-                    ):
-                        if not self._plan_has_tool(planned_actions, "search_memory"):
-                            enforced.append(
-                                {
-                                    "tool": "search_memory",
-                                    "args": {"query": lookup_query},
-                                    "reason": "auto memory lookup",
-                                }
-                            )
-                    if enforced:
-                        planned_actions = enforced + list(planned_actions or [])
-                        planned_actions = planned_actions[:this_round_max]
-                        if self.cfg.log_verbose:
-                            names = ",".join(
-                                str(x.get("tool", "")).strip() for x in enforced
-                            )
-                            print(
-                                f"[agent] auto-add lookup tools={names or '-'} | "
-                                f"query={self._fit_col(lookup_query, max(24, self._term_width() - 49))}"
-                            )
-
                 filtered_actions: list[dict] = []
                 for action in planned_actions:
                     if not isinstance(action, dict):
@@ -2626,84 +2515,18 @@ class WeChatGuiRpaBot:
                 if not self.cfg.agent_actions_fail_open:
                     raise
                 print(f"[warn] agent action planner failed, fail-open: {exc}")
-                if lookup_intent and lookup_query:
-                    fallback_actions: list[dict] = []
-                    if self._has_volc_web_search_tool() and ("web_search_volc" in tools):
-                        fallback_actions.append(
-                            {
-                                "tool": "web_search_volc",
-                                "args": {"query": lookup_query},
-                                "reason": "planner fail fallback",
-                            }
-                        )
-                    else:
-                        if "search_memory" in tools:
-                            fallback_actions.append(
-                                {
-                                    "tool": "search_memory",
-                                    "args": {"query": lookup_query},
-                                    "reason": "planner fail fallback",
-                                }
-                            )
-                        if self._has_web_search_tool() and ("web_search" in tools):
-                            fallback_actions.append(
-                                {
-                                    "tool": "web_search",
-                                    "args": {"query": lookup_query},
-                                    "reason": "planner fail fallback",
-                                }
-                            )
-                    fallback_actions = fallback_actions[:per_round_limit]
-                    if fallback_actions:
-                        trace, observations = self._execute_agent_actions(
-                            row,
-                            fallback_actions,
-                            is_admin=is_admin,
-                            max_actions_override=per_round_limit,
-                        )
-                        if trace and self.cfg.log_verbose:
-                            print(
-                                f"[agent] fallback row={row.row_idx:>2} | "
-                                f"actions={len(fallback_actions):>2}"
-                            )
-                            for ln in trace.split("\n"):
-                                if ln.strip():
-                                    print(f"        {ln}")
-                        if observations:
-                            observed_blocks.append(f"[fallback]\n{observations}")
-                            observed = "\n\n".join(observed_blocks)
-                            merged_memory = (
-                                f"{base_memory}\n\n[工具执行结果]\n{observed}".strip()
-                            )[:obs_limit]
-                            task_state = self._merge_agent_task_state(
-                                task_state,
-                                {"status": "running"},
-                                last_result=observations,
-                            )
-                            task_state = self._save_agent_task_state(
-                                session_key=session_key,
-                                title=row.title,
-                                task=task_state,
-                            )
                 break
 
         planned_reply = ""
         observed_text = "\n\n".join(observed_blocks)
         has_lookup_observation = self._has_lookup_observation(observed_text)
         has_lookup_error = ("网页检索[" in observed_text) and ("失败" in observed_text)
-        if lookup_intent and has_lookup_error:
+        if has_lookup_error:
             planned_reply = (
                 "我这轮已经发起检索了，但接口超时/异常，没拿到可用结果。"
                 "我马上缩短关键词再重查一轮。"
             )
-        elif lookup_intent and (not observed_text):
-            planned_reply = (
-                "我刚试着查了，但这轮没拿到可用结果（可能检索接口异常）。"
-                "要不要我立刻换关键词再查一次？"
-            )
         if total_actions > 0 and final_hint:
-            final_hint = ""
-        if lookup_intent and final_hint:
             final_hint = ""
         if has_lookup_observation and final_hint:
             final_hint = ""
@@ -2890,6 +2713,137 @@ class WeChatGuiRpaBot:
         size = int(target.stat().st_size)
         return f"written {rel} ({size}B, mode={write_mode})"
 
+    def _build_wow_character_url(self, args: dict) -> dict:
+        skill_dir = Path("data/skills/wow-character-link")
+        module_path = skill_dir / "builder.py"
+        if not module_path.is_file():
+            return {"ok": False, "error": f"wow-character-link builder not found: {module_path}"}
+        spec = importlib.util.spec_from_file_location("weauto_wow_character_link_builder", module_path)
+        if spec is None or spec.loader is None:
+            return {"ok": False, "error": "failed to load wow-character-link builder"}
+        module = importlib.util.module_from_spec(spec)
+        try:
+            spec.loader.exec_module(module)
+            build = getattr(module, "build")
+            return dict(
+                build(
+                    character=str(args.get("character", "") or ""),
+                    server=str(args.get("server", "") or ""),
+                    player=str(args.get("player", "") or ""),
+                    class_name=str(args.get("class_name", "") or ""),
+                    skill_dir=skill_dir,
+                )
+            )
+        except Exception as exc:
+            return {"ok": False, "error": f"wow-character-link failed: {exc}"}
+
+    @staticmethod
+    def _format_wow_character_result(result: dict) -> str:
+        if result.get("ok"):
+            return str(result.get("message") or result.get("url") or "").strip()
+        candidates = result.get("candidates")
+        if isinstance(candidates, list) and candidates:
+            rows = []
+            for item in candidates[:8]:
+                if not isinstance(item, dict):
+                    continue
+                rows.append(
+                    f"{item.get('player', '')} / {item.get('character', '')} / "
+                    f"{item.get('server', '')} / {item.get('class', '')}"
+                )
+            if rows:
+                return str(result.get("error") or "没唯一匹配到角色") + "\n" + "\n".join(rows)
+        return str(result.get("error") or "没构建出角色链接")
+
+    @staticmethod
+    def _strip_html(raw: str) -> str:
+        text = str(raw or "")
+        text = re.sub(r"<script[^>]*>.*?</script>", " ", text, flags=re.S | re.I)
+        text = re.sub(r"<style[^>]*>.*?</style>", " ", text, flags=re.S | re.I)
+        text = re.sub(r"<[^>]+>", " ", text)
+        text = html.unescape(text)
+        return re.sub(r"\s+", " ", text).strip()
+
+    def _open_url(self, req: urllib.request.Request, *, timeout: float, use_proxy: bool):
+        if use_proxy:
+            return urllib.request.urlopen(req, timeout=timeout, context=ssl.create_default_context())
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        return opener.open(req, timeout=timeout)
+
+    def _fetch_url(self, url: str, *, max_chars: int = 6000, use_proxy: bool = True) -> str:
+        clean_url = str(url or "").strip()
+        if not re.match(r"^https?://", clean_url, flags=re.I):
+            raise RuntimeError("fetch_url only supports http/https URL")
+        req = urllib.request.Request(
+            clean_url,
+            method="GET",
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125 Safari/537.36"
+                ),
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,text/plain;q=0.8,*/*;q=0.5",
+            },
+        )
+        try:
+            with self._open_url(req, timeout=15, use_proxy=use_proxy) as resp:
+                raw_bytes = resp.read(max(1000, int(max_chars)) * 4)
+                charset = resp.headers.get_content_charset() or "utf-8"
+                content_type = str(resp.headers.get("content-type", "")).lower()
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"fetch_url http error: {exc.code} {detail[:300]}") from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"fetch_url network error: {exc}") from exc
+        text = raw_bytes.decode(charset, errors="replace")
+        if "html" in content_type or "<html" in text[:500].lower():
+            text = self._strip_html(text)
+        else:
+            text = re.sub(r"\s+", " ", html.unescape(text)).strip()
+        return text[: max(200, int(max_chars))]
+
+    def _browse_url(self, url: str, *, max_chars: int = 10000, use_proxy: bool = True) -> str:
+        clean_url = str(url or "").strip()
+        if not re.match(r"^https?://", clean_url, flags=re.I):
+            raise RuntimeError("browse_url only supports http/https URL")
+        try:
+            from playwright.sync_api import sync_playwright
+        except Exception:
+            fetched = self._fetch_url(clean_url, max_chars=max_chars, use_proxy=use_proxy)
+            return "Playwright unavailable; used fetch_url fallback:\n" + fetched
+        try:
+            with sync_playwright() as p:
+                launch_kwargs = {"headless": True}
+                if use_proxy:
+                    proxy_url = os.getenv("HTTPS_PROXY") or os.getenv("https_proxy") or os.getenv("HTTP_PROXY") or os.getenv("http_proxy")
+                    if proxy_url:
+                        launch_kwargs["proxy"] = {"server": proxy_url}
+                browser = p.chromium.launch(**launch_kwargs)
+                page = browser.new_page()
+                try:
+                    page.goto(clean_url, wait_until="domcontentloaded", timeout=15000)
+                    page.wait_for_timeout(1500)
+                    text = page.evaluate("() => document.body ? document.body.innerText : ''") or ""
+                finally:
+                    browser.close()
+            text = re.sub(r"\s+", " ", str(text)).strip()
+            if not text:
+                return "page returned empty text"
+            return text[: max(200, int(max_chars))]
+        except Exception as exc:
+            fetched = self._fetch_url(clean_url, max_chars=max_chars, use_proxy=use_proxy)
+            return f"browse_url failed ({exc}); used fetch_url fallback:\n{fetched}"
+
+    def _web_search_with_provider(self, provider: str, query: str) -> tuple[str, str]:
+        clean_provider = str(provider or "").strip().lower()
+        if clean_provider == "volc_ark":
+            return clean_provider, self._volc_web_search(query)
+        if clean_provider == "agent_reach":
+            return clean_provider, self._agent_reach_search(query)
+        if clean_provider == "brave":
+            return clean_provider, self._brave_search(query)
+        return "tavily", self._tavily_search(query)
+
     def _format_web_search_text(
         self,
         *,
@@ -2956,14 +2910,7 @@ class WeChatGuiRpaBot:
             return self.llm_reply.describe_image(image.convert("RGB"), prompt=prompt)
 
     def _web_search(self, query: str) -> tuple[str, str]:
-        provider = self._active_web_search_provider()
-        if provider == "volc_ark":
-            return provider, self._volc_web_search(query)
-        if provider == "agent_reach":
-            return provider, self._agent_reach_search(query)
-        if provider == "brave":
-            return provider, self._brave_search(query)
-        return provider, self._tavily_search(query)
+        return self._web_search_with_provider(self._active_web_search_provider(), query)
 
     @staticmethod
     def _extract_json_from_text(raw: str) -> object | None:
@@ -3925,9 +3872,6 @@ class WeChatGuiRpaBot:
                 if int(self.cfg.heartbeat_max_actions) > 0
                 else 999
             ),
-            lookup_intent=self._is_web_lookup_intent(task_seed),
-            lookup_query=task_seed[:80],
-            enforce_lookup_round1=False,
         )
         status_after = str(task_after.get("status", "")).strip() or "idle"
         if self.cfg.log_verbose:
@@ -4089,9 +4033,6 @@ class WeChatGuiRpaBot:
             memory_recall="",
             tools=tools,
             per_round_max_actions=action_limit,
-            lookup_intent=False,
-            lookup_query="",
-            enforce_lookup_round1=False,
             max_rounds_override=2,
             max_total_actions_override=action_limit,
         )
@@ -5652,9 +5593,6 @@ class WeChatGuiRpaBot:
                     memory_recall=memory_recall,
                     tools=tools,
                     per_round_max_actions=self.cfg.agent_actions_max_per_turn,
-                    lookup_intent=self._is_web_lookup_intent(latest_text or row.preview),
-                    lookup_query=(latest_text or row.preview)[:80],
-                    enforce_lookup_round1=True,
                 )
         if not planner_send_reply:
             if self.cfg.log_verbose:

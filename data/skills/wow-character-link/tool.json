@@ -1,0 +1,29 @@
+{
+  "name": "build_wow_character_url",
+  "description": "Resolve a WoW CN character from character/server or player/class using this skill's TSV tables, then build the official character page URL.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "title": {
+        "type": "string",
+        "description": "WeChat chat title to send to. Defaults to the inbound chat."
+      },
+      "character": {
+        "type": "string",
+        "description": "Exact character name when known."
+      },
+      "server": {
+        "type": "string",
+        "description": "Chinese server name or realm slug when known."
+      },
+      "player": {
+        "type": "string",
+        "description": "Canonical player name or alias, e.g. 吴松竹 or 吴工."
+      },
+      "class_name": {
+        "type": "string",
+        "description": "Class/job to resolve under the player, e.g. 战士."
+      }
+    }
+  }
+}

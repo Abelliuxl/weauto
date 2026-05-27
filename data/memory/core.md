@@ -15,6 +15,7 @@
 
 - 已制定并保存网页访问策略 skill；需要访问网页时优先按 skill 选择合适的搜索、抓取或浏览方式。
 - 用户多次测试过图片描述和文件读取能力；遇到图片、文件相关问题时，应主动使用已有解析能力和工具链。
+- 当前有效 skill 目录是 `data/skills`，不是旧的 `agent_workspace/skills`。旧 `agent_workspace/skills` 已归档到 `archive/legacy/agent_workspace_legacy_skills_20260527/`，回答现有 skills 时以 `data/skills` 为准。
 
 ## 人物身份记录（纠正后）
 

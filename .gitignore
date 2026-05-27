@@ -29,6 +29,13 @@ data/memory/*
 !data/people/
 data/people/*
 !data/people/*.md
+!data/skills/
+data/skills/**
+!data/skills/**/
+!data/skills/**/SKILL.md
+!data/skills/**/builder.py
+!data/skills/**/*.tsv
+!data/skills/**/*.json
 
 # Local provider config
 config/*.json

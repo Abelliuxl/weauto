@@ -268,28 +268,9 @@ class MessageHandler:
             bot._save_persistent_memory()
             return
 
-        lookup_query = re.sub(
-            r"\s+",
-            " ",
-            (latest_user_message or row.preview or row.text or "").strip(),
-        )[:80]
-        lookup_intent = bot._is_web_lookup_intent(lookup_query)
-        if not lookup_intent and bot._is_opinion_prompt(latest_user_message or row.preview or ""):
-            topic_query = bot._extract_lookup_topic_from_context(chat_context)
-            if topic_query:
-                lookup_query = topic_query[:80]
-                lookup_intent = True
-        if bot.cfg.log_verbose:
-            print(
-                f"[agent] lookup-intent={lookup_intent} "
-                f"query={bot._fit_col(lookup_query, max(24, bot._term_width() - 28))}"
-            )
-
         reply_budget = max(1, int(bot.cfg.agent_reply_max_messages_per_turn))
         sent_in_event = 0
         follow_reason = reason
-        follow_lookup_intent = lookup_intent
-        follow_lookup_query = lookup_query
 
         while sent_in_event < reply_budget:
             planner_hint = ""
@@ -311,9 +292,6 @@ class MessageHandler:
                         memory_recall=memory_recall,
                         tools=tools,
                         per_round_max_actions=bot.cfg.agent_actions_max_per_turn,
-                        lookup_intent=follow_lookup_intent,
-                        lookup_query=follow_lookup_query,
-                        enforce_lookup_round1=(sent_in_event == 0),
                     )
                 if planner_hint and bot.cfg.log_verbose:
                     print(
@@ -383,8 +361,6 @@ class MessageHandler:
             chat_context = bot._build_session_history_text(row)
             session_context = bot._build_session_context(row)
             follow_reason = "planner_follow_up"
-            follow_lookup_intent = False
-            follow_lookup_query = ""
             if bot.cfg.log_verbose:
                 print(
                     f"[agent] multi-send continue row={row.row_idx:>2} "

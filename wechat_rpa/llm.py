@@ -643,8 +643,15 @@ class LlmReplyGenerator:
 
         # 7) Escape unescaped double quotes between CJK characters inside string values.
         # LLMs often output literal "..." around quoted terms in Chinese content fields.
-        t7 = re.sub(r'(?<=[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef])"(?=[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef，。、；：])', r'\u201c', t6)
-        t7 = re.sub(r'(?<=[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef，。、；：])"(?=[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef])', r'\u201d', t7)
+        cjk_chars = r"\u4e00-\u9fff\u3000-\u303f\uff00-\uffef"
+        cjk_or_punct = cjk_chars + r"，。、；："
+        t7 = re.sub(
+            rf'(?<=[{cjk_chars}])"([^"\n\r{{}}\[\]]*?[{cjk_chars}][^"\n\r{{}}\[\]]*?)"(?=[{cjk_or_punct}])',
+            r"“\1”",
+            t6,
+        )
+        t7 = re.sub(r'(?<=[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef])"(?=[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef，。、；：])', "“", t7)
+        t7 = re.sub(r'(?<=[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef，。、；：])"(?=[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef])', "”", t7)
         attempts.append(t7)
 
         # De-duplicate while preserving order.
@@ -1090,6 +1097,52 @@ class LlmReplyGenerator:
             if clean:
                 return clean.strip()
         return ""
+
+    @staticmethod
+    def _first_chat_message(data: dict) -> dict:
+        choices = data.get("choices") if isinstance(data, dict) else []
+        if not isinstance(choices, list) or not choices:
+            return {}
+        first = choices[0] if isinstance(choices[0], dict) else {}
+        message = first.get("message") if isinstance(first, dict) else {}
+        return message if isinstance(message, dict) else {}
+
+    def _post_openai_chat_completion(self, payload: dict) -> dict:
+        api_key = self._resolve_api_key()
+        url = f"{self.cfg.base_url}/chat/completions"
+        controlled_payload, controlled = self._apply_reasoning_controls(
+            payload,
+            self.cfg.base_url,
+            exclude=self.cfg.reasoning_exclude,
+            effort=self.cfg.reasoning_effort,
+            think_mode=self.cfg.openai_compat_think_mode,
+        )
+        self._log_transport_debug(
+            label="llm",
+            native=False,
+            think_raw=self.cfg.ollama_think,
+            compat_think_mode=self.cfg.openai_compat_think_mode,
+            controlled=controlled,
+        )
+        try:
+            return self._request_completion(
+                url=url,
+                api_key=api_key,
+                timeout_sec=self.cfg.timeout_sec,
+                payload=controlled_payload,
+                label="llm",
+            )
+        except Exception as exc:
+            if controlled and self._should_retry_without_controls(exc):
+                print(f"[warn] llm controlled payload rejected, retrying raw payload: {exc}")
+                return self._request_completion(
+                    url=url,
+                    api_key=api_key,
+                    timeout_sec=self.cfg.timeout_sec,
+                    payload=payload,
+                    label="llm",
+                )
+            raise
 
     def _extract_content_from_ollama_chat(self, data: dict) -> str:
         if not isinstance(data, dict):
@@ -2217,6 +2270,264 @@ class LlmReplyGenerator:
         }
         return self._post_chat(payload)
 
+    @staticmethod
+    def _agent_tool_specs_for_names(tool_names: list[str]) -> list[dict]:
+        specs: dict[str, dict] = {
+            "remember_session_fact": {
+                "description": "Record a stable fact about the current chat session.",
+                "properties": {"fact": {"type": "string", "description": "Fact, <=120 Chinese chars."}},
+                "required": ["fact"],
+            },
+            "remember_session_event": {
+                "description": "Record a recent event in the current chat session.",
+                "properties": {"event": {"type": "string", "description": "Event, <=120 Chinese chars."}},
+                "required": ["event"],
+            },
+            "set_session_summary": {
+                "description": "Update the compact profile/summary of the current chat session.",
+                "properties": {"summary": {"type": "string", "description": "Summary, <=200 Chinese chars."}},
+                "required": ["summary"],
+            },
+            "search_memory": {
+                "description": "Search the local memory database for related past context.",
+                "properties": {"query": {"type": "string", "description": "Search query, <=80 chars."}},
+                "required": ["query"],
+            },
+            "search_person_impression": {
+                "description": "Search stored person impressions.",
+                "properties": {"query": {"type": "string", "description": "Person name or clue, <=80 chars."}},
+                "required": ["query"],
+            },
+            "write_memory": {
+                "description": "Replace core or timeline memory markdown.",
+                "properties": {
+                    "name": {"type": "string", "enum": ["core", "timeline"]},
+                    "content": {"type": "string", "description": "Complete markdown content."},
+                },
+                "required": ["name", "content"],
+            },
+            "write_skill": {
+                "description": "Save a reusable local strategy/procedure into data/skills/<name>/SKILL.md.",
+                "properties": {
+                    "name": {"type": "string", "description": "Skill directory name."},
+                    "content": {"type": "string", "description": "Complete SKILL.md content."},
+                },
+                "required": ["name", "content"],
+            },
+            "delete_skill": {
+                "description": "Delete an obsolete saved skill from data/skills.",
+                "properties": {"name": {"type": "string", "description": "Skill directory name."}},
+                "required": ["name"],
+            },
+            "read_impression": {
+                "description": "Read one person's stored impression before replying or updating it.",
+                "properties": {"name": {"type": "string", "description": "Canonical Chinese name."}},
+                "required": ["name"],
+            },
+            "read_chat_history": {
+                "description": "Read recent chat history. Defaults to current chat when chat_title is omitted.",
+                "properties": {
+                    "chat_title": {"type": "string", "description": "Exact chat title; optional."},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+                },
+            },
+            "run_python": {
+                "description": (
+                    "Run short sandboxed Python for math, statistics, date arithmetic, unit conversion, "
+                    "modular arithmetic, or power calculations. Print the result. No files/network/system access."
+                ),
+                "properties": {"code": {"type": "string", "description": "Short Python code using print(...)."}},
+                "required": ["code"],
+            },
+            "write_impression": {
+                "description": "Replace one person's impression markdown.",
+                "properties": {
+                    "name": {"type": "string", "description": "Canonical Chinese name."},
+                    "content": {"type": "string", "description": "Complete markdown content."},
+                },
+                "required": ["name", "content"],
+            },
+            "workspace_list_files": {
+                "description": "List files in the agent workspace.",
+                "properties": {
+                    "path": {"type": "string", "description": "Relative path; optional."},
+                    "recursive": {"type": "boolean"},
+                    "max_entries": {"type": "integer", "minimum": 1, "maximum": 200},
+                },
+            },
+            "workspace_read_file": {
+                "description": "Read a UTF-8 file from the agent workspace.",
+                "properties": {"path": {"type": "string", "description": "Relative file path."}},
+                "required": ["path"],
+            },
+            "workspace_write_file": {
+                "description": "Write a UTF-8 file in the agent workspace.",
+                "properties": {
+                    "path": {"type": "string", "description": "Relative file path."},
+                    "content": {"type": "string", "description": "Content, <=4000 chars."},
+                    "mode": {"type": "string", "enum": ["overwrite", "append"]},
+                },
+                "required": ["path", "content"],
+            },
+            "web_search": {
+                "description": "Search public web pages with the configured provider.",
+                "properties": {"query": {"type": "string", "description": "Search query, <=80 chars."}},
+                "required": ["query"],
+            },
+            "search_web": {
+                "description": "Search public web pages with Tavily.",
+                "properties": {
+                    "query": {"type": "string", "description": "Search query, <=80 chars."},
+                    "proxy": {"type": "boolean", "description": "Accepted for wx-cli skill compatibility."},
+                },
+                "required": ["query"],
+            },
+            "search_web_brave": {
+                "description": "Search public web pages with Brave Search.",
+                "properties": {
+                    "query": {"type": "string", "description": "Search query, <=80 chars."},
+                    "proxy": {"type": "boolean", "description": "Accepted for wx-cli skill compatibility."},
+                },
+                "required": ["query"],
+            },
+            "web_search_volc": {
+                "description": "Search the web with Volcengine Ark built-in trusted web search.",
+                "properties": {"query": {"type": "string", "description": "Search query, <=80 chars."}},
+                "required": ["query"],
+            },
+            "search_web_volc": {
+                "description": "Search the web with Volcengine Ark built-in trusted web search.",
+                "properties": {"query": {"type": "string", "description": "Search query, <=80 chars."}},
+                "required": ["query"],
+            },
+            "fetch_url": {
+                "description": "Fetch raw HTML/text from a URL and return readable text.",
+                "properties": {
+                    "url": {"type": "string", "description": "HTTP/HTTPS URL."},
+                    "proxy": {"type": "boolean", "description": "Use system proxy env if true; disable env proxy if false."},
+                },
+                "required": ["url"],
+            },
+            "browse_url": {
+                "description": "Fetch a rendered page with Playwright when available, falling back to fetch_url.",
+                "properties": {
+                    "url": {"type": "string", "description": "HTTP/HTTPS URL."},
+                    "proxy": {"type": "boolean", "description": "Use system proxy env if true; disable env proxy if false."},
+                },
+                "required": ["url"],
+            },
+            "build_wow_character_url": {
+                "description": (
+                    "Build an official WoW CN character page URL using data/skills/wow-character-link. "
+                    "Use for 魔兽/WoW角色主页/玩家职业角色; do not use run_python for URL building."
+                ),
+                "properties": {
+                    "title": {"type": "string", "description": "WeChat chat title; optional."},
+                    "character": {"type": "string", "description": "Exact character name, if known."},
+                    "server": {"type": "string", "description": "Chinese server name or realm slug, if known."},
+                    "player": {"type": "string", "description": "Player name or alias."},
+                    "class_name": {"type": "string", "description": "Class/job under the player, e.g. 战士."},
+                },
+            },
+            "generate_image": {
+                "description": "Generate an image and send the local file.",
+                "properties": {
+                    "prompt": {"type": "string", "description": "Concrete image prompt, <=280 chars."},
+                    "size": {"type": "string", "description": "Optional size like 1024x1024."},
+                },
+                "required": ["prompt"],
+            },
+            "edit_image": {
+                "description": "Edit the latest/current image or a provided image path/url.",
+                "properties": {
+                    "prompt": {"type": "string", "description": "Concrete edit instruction, <=800 chars."},
+                    "image_path": {"type": "string", "description": "Optional local image path."},
+                    "image_url": {"type": "string", "description": "Optional image URL."},
+                    "size": {"type": "string", "description": "Optional size like 1024x1024."},
+                },
+                "required": ["prompt"],
+            },
+            "remember_long_term": {
+                "description": "Admin only: write a long-term memory note.",
+                "properties": {"note": {"type": "string", "description": "Note, <=200 chars."}},
+                "required": ["note"],
+            },
+            "maintain_memory": {
+                "description": "Admin only: consolidate recent memory into MEMORY.md.",
+                "properties": {"days": {"type": "integer", "minimum": 1, "maximum": 14}},
+            },
+            "maintain_person_impressions": {
+                "description": "Admin only: maintain person impression files from recent chats.",
+                "properties": {
+                    "days": {"type": "integer", "minimum": 1, "maximum": 3650},
+                    "max_people": {"type": "integer", "minimum": 1, "maximum": 200},
+                },
+            },
+            "refine_persona_files": {
+                "description": "Admin only: refine SOUL/IDENTITY/USER/TOOLS persona files.",
+                "properties": {},
+            },
+            "mute_session": {"description": "Admin only: mute current session.", "properties": {}},
+            "unmute_session": {"description": "Admin only: unmute current session.", "properties": {}},
+        }
+        out: list[dict] = []
+        for name in tool_names:
+            spec = specs.get(name)
+            if not spec:
+                continue
+            parameters = {"type": "object", "properties": spec.get("properties", {})}
+            required = spec.get("required")
+            if isinstance(required, list):
+                parameters["required"] = required
+            out.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "description": spec.get("description", ""),
+                        "parameters": parameters,
+                    },
+                }
+            )
+        return out
+
+    def _parse_tool_call_arguments(self, raw: object) -> dict:
+        if isinstance(raw, dict):
+            return dict(raw)
+        text = str(raw or "").strip()
+        if not text:
+            return {}
+        try:
+            data = json.loads(text)
+        except Exception:
+            try:
+                data = self._extract_json_payload(text)
+            except Exception:
+                return {}
+        return dict(data) if isinstance(data, dict) else {}
+
+    def _raw_actions_from_tool_calls(self, message: dict, *, tool_set: set[str]) -> list[dict]:
+        raw_calls = message.get("tool_calls") or []
+        if not isinstance(raw_calls, list):
+            raw_calls = []
+        function_call = message.get("function_call")
+        if isinstance(function_call, dict):
+            raw_calls.append({"function": function_call})
+
+        actions: list[dict] = []
+        for call in raw_calls:
+            if not isinstance(call, dict):
+                continue
+            fn = call.get("function")
+            if not isinstance(fn, dict):
+                continue
+            name = str(fn.get("name", "")).strip()
+            if not name or name not in tool_set:
+                continue
+            args = self._parse_tool_call_arguments(fn.get("arguments"))
+            actions.append({"tool": name, "args": args, "reason": "tool_call"})
+        return actions
+
     def plan_actions(
         self,
         *,
@@ -2261,6 +2572,11 @@ class LlmReplyGenerator:
                 "args={\"name\":\"core|timeline\",\"content\":\"完整 markdown\"} "
                 "完整替换 data/memory/core.md 或 timeline.md"
             ),
+            "write_skill": (
+                "args={\"name\":\"技能名\",\"content\":\"完整 SKILL.md\"} "
+                "写入 data/skills/<name>/SKILL.md"
+            ),
+            "delete_skill": "args={\"name\":\"技能名\"} 删除 data/skills/<name>",
             "read_impression": "args={\"name\":\"规范中文名\"} 读取 data/people/<name>.md 人物印象",
             "read_chat_history": (
                 "args={\"chat_title\":\"可选，不填为当前会话\",\"limit\":1-100} "
@@ -2280,14 +2596,23 @@ class LlmReplyGenerator:
             ),
             "workspace_read_file": (
                 "args={\"path\":\"相对 agent_workspace 的文件路径\"} "
-                "读取 agent_workspace 文件，可用于读取 skills/<name>/SKILL.md"
+                "读取 agent_workspace 非技能文件；技能内容已从 data/skills 自动注入上下文"
             ),
             "workspace_write_file": (
                 "args={\"path\":\"相对路径\",\"content\":\"<=4000字\",\"mode\":\"overwrite|append\"} "
-                "写入 agent_workspace 文件；创建或更新技能时优先写到 skills/<name>/SKILL.md"
+                "写入 agent_workspace 非技能文件；创建或更新技能必须使用 write_skill"
             ),
             "web_search": "args={\"query\":\"<=80字\"} 联网检索公开网页信息（provider 可配置）",
+            "search_web": "args={\"query\":\"<=80字\"} Tavily 联网检索",
+            "search_web_brave": "args={\"query\":\"<=80字\"} Brave 联网检索",
             "web_search_volc": "args={\"query\":\"<=80字\"} 联网检索（火山方舟内置搜索，单次可信模式）",
+            "search_web_volc": "args={\"query\":\"<=80字\"} 联网检索（火山方舟内置搜索，单次可信模式）",
+            "fetch_url": "args={\"url\":\"http(s)://...\"} 抓取静态网页/文本内容",
+            "browse_url": "args={\"url\":\"http(s)://...\"} 读取渲染后页面文本，失败时可降级抓取",
+            "build_wow_character_url": (
+                "args={\"character\":\"角色名\",\"server\":\"服务器\"} 或 "
+                "{\"player\":\"玩家/别名\",\"class_name\":\"职业\"} 构建国服魔兽角色主页链接"
+            ),
             "generate_image": (
                 "args={\"prompt\":\"<=280字\",\"size\":\"可选，如1024x1024\"} "
                 "生成图片并发送本地文件"
@@ -2310,8 +2635,12 @@ class LlmReplyGenerator:
 
         system_prompt = (
             "你是微信机器人动作规划器。"
+            "你只负责决定是否调用工具，不负责写最终聊天回复。"
             "你只能从给定工具白名单中选择动作，不允许发明新工具。"
-            "你必须严格输出一个 JSON 对象，不要输出 markdown、解释或前缀。"
+            "如果当前接口提供了 tools/function calling，优先使用原生工具调用；"
+            "原生工具调用模式下：需要动作就调用工具；不需要动作就不要输出正文，让 actions 为空。"
+            "禁止在 planner 阶段直接写给用户看的自然语言答案。"
+            "如果接口没有工具调用能力，才严格输出一个 JSON 对象，不要输出 markdown、解释或前缀。"
             "JSON 中所有字符串值内的双引号必须转义为 \\\"，例如 content 字段中有中文引号时用 \\\"魔法少女\\\"。"
             "输出格式必须是："
             '{"actions":[{"tool":"...","args":{},"reason":"<=40字"}],"reply_hint":"<=120字","send_reply":true|false,"task":{"status":"idle|running|blocked|waiting_user|done","goal":"<=120字","plan":"<=200字","next_step":"<=120字","blocked_reason":"<=120字","continue_on_heartbeat":true|false}}。'
@@ -2345,8 +2674,8 @@ class LlmReplyGenerator:
             + "不能写类似“顺着这个话题调侃”“用轻松语气回一句”“符合群聊氛围”这样的元提示。\n"
             + "5) reply_hint 不能索要红包/稿费/转账，不能以先给条件为前提拒绝回答。\n"
             + "6) 如果已有检索结果仍不足，请换关键词继续检索，不要机械重复同一参数。\n"
-            + "7) 若选择 web_search_volc，本轮只保留它一个检索动作，不要再同时规划 search_memory/web_search。\n"
-            + "8) 若工具观察中已有网页检索结果（web_search 或 web_search_volc），默认直接信任该结果；"
+            + "7) 若选择 web_search_volc/search_web_volc，本轮只保留它一个检索动作，不要再同时规划 search_memory/web_search/search_web。\n"
+            + "8) 若工具观察中已有网页检索结果（web_search/search_web/search_web_brave/web_search_volc/search_web_volc），默认直接信任该结果；"
             + "除非明确失败/无结果，否则不要再追加 search_memory 或记忆写入动作。\n"
             + "9) 当 web_search_volc 与其他来源冲突时，以 web_search_volc 为准，并优先结束动作规划（actions 为空）。\n"
             + "10) send_reply=false 表示当前不要对用户发送最终回复；send_reply=true 表示本轮可发送最终回复。\n"
@@ -2354,10 +2683,14 @@ class LlmReplyGenerator:
             + "若需求是纯文本答复，不要调用 generate_image。"
             + "\n11b) 当用户要求改图、修图、换风格、增删画面内容时优先用 edit_image；"
             + "如果当前消息或近期上下文已有图片，可省略 image_path。"
-            + "\n12) task.status=running 表示任务未完成，后续还要继续；若希望空闲时后台续跑，设 continue_on_heartbeat=true。"
-            + "\n13) task.status=waiting_user 表示缺用户信息，continue_on_heartbeat 必须为 false。"
-            + "\n14) task.status=done 表示当前任务已完成；task.status=blocked 表示被外部条件卡住，需写 blocked_reason。"
-            + "\n15) 当用户要求你增加能力、沉淀流程、写 skill、以后按固定套路处理某类事时，优先读取/写入 skills 目录，技能文件路径用 skills/<name>/SKILL.md。"
+            + "\n12) 遇到数学、统计、日期、单位换算、取模、幂运算等需要精确计算的问题，必须先调用 run_python；"
+            + "没有 Python 工具观察结果时，不要直接给数值结论。"
+            + "\n13) 遇到最新信息、官网公告、新闻、版本改动、价格、规则等时效事实，必须优先调用 web_search_volc/search_web_volc 或 web_search/search_web；"
+            + "没有检索观察结果时，不要声称已经查过。"
+            + "\n14) task.status=running 表示任务未完成，后续还要继续；若希望空闲时后台续跑，设 continue_on_heartbeat=true。"
+            + "\n15) task.status=waiting_user 表示缺用户信息，continue_on_heartbeat 必须为 false。"
+            + "\n16) task.status=done 表示当前任务已完成；task.status=blocked 表示被外部条件卡住，需写 blocked_reason。"
+            + "\n17) 当用户要求你增加能力、沉淀流程、写 skill、以后按固定套路处理某类事时，优先使用 write_skill 写入 data/skills/<name>/SKILL.md；过时技能用 delete_skill。"
         )
         payload = {
             "model": self.cfg.model,
@@ -2369,12 +2702,50 @@ class LlmReplyGenerator:
         }
         planner_max_tokens = self._effective_text_max_tokens(self.cfg.max_tokens)
         if planner_max_tokens is not None:
-            if {"write_memory", "write_impression"} & tool_set:
+            if {"write_memory", "write_impression", "write_skill"} & tool_set:
                 payload["max_tokens"] = planner_max_tokens
             else:
                 payload["max_tokens"] = max(120, min(520, planner_max_tokens))
-        content = self._post_chat(payload)
-        parsed_any = self._extract_json_payload(content)
+
+        native_tool_specs = []
+        if (not self._is_native_ollama_llm()) and self._api_format() == "openai":
+            native_tool_specs = self._agent_tool_specs_for_names(tools)
+        content = ""
+        parsed: dict | None = None
+        if native_tool_specs:
+            native_payload = dict(payload)
+            native_payload["tools"] = native_tool_specs
+            native_payload["tool_choice"] = "auto"
+            try:
+                data = self._post_openai_chat_completion(native_payload)
+                message = self._first_chat_message(data)
+                tool_call_actions = self._raw_actions_from_tool_calls(message, tool_set=tool_set)
+                if tool_call_actions:
+                    parsed = {
+                        "actions": tool_call_actions,
+                        "reply_hint": "",
+                        "send_reply": True,
+                        "task": {"status": "idle"},
+                    }
+                else:
+                    content = self._extract_content_from_completion(data)
+                    stripped = str(content or "").strip()
+                    if stripped and not stripped.startswith(("{", "[")):
+                        parsed = {
+                            "actions": [],
+                            "reply_hint": "",
+                            "send_reply": True,
+                            "task": {"status": "idle"},
+                        }
+            except Exception as exc:
+                print(f"[warn] agent native tool_calls unavailable, falling back to JSON actions: {exc}")
+
+        if parsed is None:
+            if not content:
+                content = self._post_chat(payload)
+            parsed_any = self._extract_json_payload(content)
+        else:
+            parsed_any = parsed
         if isinstance(parsed_any, dict):
             parsed = parsed_any
             # Some providers wrap the real payload as {"plan": {...}}.
@@ -2518,6 +2889,25 @@ class LlmReplyGenerator:
                     if not content:
                         continue
                     args = {"name": name, "content": content}
+                elif tool == "write_skill":
+                    name = re.sub(
+                        r"\s+",
+                        "-",
+                        str(args_obj.get("name", "") or args_obj.get("skill", "")).strip(),
+                    )[:80]
+                    content = str(args_obj.get("content", "") or args_obj.get("text", "")).strip()[:20000]
+                    if (not name) or (not content):
+                        continue
+                    args = {"name": name, "content": content}
+                elif tool == "delete_skill":
+                    name = re.sub(
+                        r"\s+",
+                        "-",
+                        str(args_obj.get("name", "") or args_obj.get("skill", "")).strip(),
+                    )[:80]
+                    if not name:
+                        continue
+                    args = {"name": name}
                 elif tool == "read_impression":
                     name = re.sub(
                         r"\s+",
@@ -2597,7 +2987,7 @@ class LlmReplyGenerator:
                     mode_raw = str(args_obj.get("mode", "overwrite")).strip().lower()
                     mode = "append" if mode_raw in {"append", "a", "追加"} else "overwrite"
                     args = {"path": rel_path, "content": content, "mode": mode}
-                elif tool == "web_search":
+                elif tool in {"web_search", "search_web", "search_web_brave", "web_search_volc", "search_web_volc"}:
                     query = re.sub(
                         r"\s+",
                         " ",
@@ -2606,15 +2996,43 @@ class LlmReplyGenerator:
                     if not query:
                         continue
                     args = {"query": query}
-                elif tool == "web_search_volc":
-                    query = re.sub(
+                    if tool in {"search_web", "search_web_brave"} and "proxy" in args_obj:
+                        proxy_raw = args_obj.get("proxy")
+                        if isinstance(proxy_raw, str):
+                            args["proxy"] = proxy_raw.strip().lower() in {"1", "true", "yes", "on"}
+                        else:
+                            args["proxy"] = bool(proxy_raw)
+                elif tool in {"fetch_url", "browse_url"}:
+                    url = re.sub(
                         r"\s+",
-                        " ",
-                        str(args_obj.get("query", "") or args_obj.get("text", "")).strip(),
-                    )[:80]
-                    if not query:
+                        "",
+                        str(args_obj.get("url", "") or args_obj.get("href", "")).strip(),
+                    )[:1000]
+                    if not url:
                         continue
-                    args = {"query": query}
+                    args = {"url": url}
+                    if "proxy" in args_obj:
+                        proxy_raw = args_obj.get("proxy")
+                        if isinstance(proxy_raw, str):
+                            args["proxy"] = proxy_raw.strip().lower() in {"1", "true", "yes", "on"}
+                        else:
+                            args["proxy"] = bool(proxy_raw)
+                elif tool == "build_wow_character_url":
+                    args = {}
+                    for src, dst, limit in (
+                        ("title", "title", 80),
+                        ("chat_title", "title", 80),
+                        ("character", "character", 40),
+                        ("server", "server", 40),
+                        ("player", "player", 40),
+                        ("class_name", "class_name", 40),
+                        ("class", "class_name", 40),
+                    ):
+                        value = re.sub(r"\s+", " ", str(args_obj.get(src, "")).strip())[:limit]
+                        if value and dst not in args:
+                            args[dst] = value
+                    if not any(args.get(k) for k in ("character", "server", "player", "class_name")):
+                        continue
                 elif tool == "generate_image":
                     prompt = re.sub(
                         r"\s+",
