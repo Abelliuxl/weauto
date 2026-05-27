@@ -249,6 +249,38 @@ class WeChatGuiRpaBot:
             except Exception:
                 pass
 
+    @staticmethod
+    def _strip_markdown_formatting(text: str) -> str:
+        text = re.sub(r"\*\*\*(.+?)\*\*\*", r"\1", text)
+        text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
+        text = re.sub(r"\*(.+?)\*", r"\1", text)
+        text = re.sub(r"__(.+?)__", r"\1", text)
+        text = re.sub(r"~~(.+?)~~", r"\1", text)
+        text = re.sub(r"`{1,3}[^`\n]+`{1,3}", "", text)
+        text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
+        return text
+
+    @staticmethod
+    def _format_long_reply(text: str) -> str:
+        lines = text.splitlines()
+        out: list[str] = []
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if not stripped:
+                out.append("")
+                continue
+            out.append(stripped)
+            if i + 1 >= len(lines):
+                break
+            next_line = lines[i + 1].strip()
+            if not next_line:
+                continue
+            cur_starts_item = bool(re.match(r"^(?:\d+\.|\*\*|[•\-])", stripped))
+            next_starts_item = bool(re.match(r"^(?:\d+\.|\*\*|[•\-])", next_line))
+            if cur_starts_item and next_starts_item:
+                out.append("")
+        return "\n".join(out)
+
     def _normalize_preview(self, text: str) -> str:
         s = re.sub(r"\s+", "", text or "")
         # Suppress OCR jitter from punctuation/ellipsis differences.
@@ -4560,6 +4592,10 @@ class WeChatGuiRpaBot:
             memory_recall,
             latest_message=latest_message,
         )
+        if message:
+            message = self._strip_markdown_formatting(message)
+            if reason == "mention" and len(message) > 120:
+                message = self._format_long_reply(message)
         if not (message or "").strip():
             if self.cfg.log_verbose:
                 print(
