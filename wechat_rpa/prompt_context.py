@@ -118,6 +118,7 @@ def list_skills(skills_dir: Path = SKILLS_DIR) -> list[dict]:
             "path": meta.get("path", ""),
             "summary": meta.get("summary", ""),
             "keywords": list(meta.get("keywords", []) or []),
+            "content": meta.get("content", ""),
         })
     return out
 
