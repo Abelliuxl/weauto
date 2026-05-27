@@ -2628,6 +2628,7 @@ class LlmReplyGenerator:
             + "\n15) task.status=waiting_user 表示缺用户信息，continue_on_heartbeat 必须为 false。"
             + "\n16) task.status=done 表示当前任务已完成；task.status=blocked 表示被外部条件卡住，需写 blocked_reason。"
             + "\n17) 当用户要求你增加能力、沉淀流程、写 skill、以后按固定套路处理某类事时，优先使用 write_skill 写入 data/skills/<name>/SKILL.md；过时技能用 delete_skill。"
+            + "\n18) 若 [skills] 中的 skill 文件对某类任务有明确的查询流程/步骤规定，优先遵循 skill 规定，不受上述全局检索优先级约束。"
         )
         payload = {
             "model": self.cfg.model,
