@@ -4953,11 +4953,14 @@ class WeChatGuiRpaBot:
             return
         while not q.empty():
             title, messages, message, now = q.get_nowait()
-            if self.visible_message_state.is_incoming(message):
-                self._handle_detached_new_message(
-                    window_id=window_id, title=title,
-                    messages=messages, message=message, now=now,
-                )
+            try:
+                if self.visible_message_state.is_incoming(message):
+                    self._handle_detached_new_message(
+                        window_id=window_id, title=title,
+                        messages=messages, message=message, now=now,
+                    )
+            except Exception as exc:
+                print(f"[warn] detached msg queue error window={window_id}: {exc}")
         with self._state_lock:
             self._session_busy[window_id] = False
         if q and not q.empty():
