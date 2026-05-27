@@ -5103,6 +5103,9 @@ class WeChatGuiRpaBot:
                 q = self._session_queues.setdefault(window.window_id, queue.Queue())
                 for message in messages_to_handle:
                     q.put((window.title, snapshot.messages, message, now))
+                if self._session_busy.get(window.window_id):
+                    if self.cfg.log_verbose and messages_to_handle:
+                        print(f"[queue] window={window.window_id} busy, {q.qsize()} queued")
                 if not self._session_busy.get(window.window_id):
                     self._session_busy[window.window_id] = True
                     self._msg_executor.submit(
