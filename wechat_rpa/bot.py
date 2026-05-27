@@ -16,6 +16,7 @@ import shutil
 import ssl
 import subprocess
 import sys
+import threading
 import time
 import unicodedata
 import urllib.error
@@ -201,6 +202,12 @@ class WeChatGuiRpaBot:
         self.visible_message_parser = VisibleMessageParser(self.ocr_engine)
         self.visible_message_state = VisibleMessageStateStore()
         self._detached_bootstrapped = False
+        self._state_lock = threading.RLock()
+        self._send_lock = threading.Lock()
+        self._msg_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(8, max(2, os.cpu_count() or 4)),
+            thread_name_prefix="msg",
+        )
         self._baseline: dict[int, RowMemory] = {}
         # title_key -> (normalized_sent_text, sent_ts)
         self._sent_by_title: dict[str, tuple[str, float]] = {}
@@ -459,21 +466,22 @@ class WeChatGuiRpaBot:
         sess.loaded = True
 
     def _get_or_create_session(self, key: str, *, load_history: bool = True) -> SessionState:
-        sess = self._sessions.get(key)
-        if sess is not None:
-            if load_history and (not sess.loaded):
-                self._load_session_payload(key, sess)
-            return sess
-        meta = self._session_index.get(key)
-        if isinstance(meta, dict):
-            sess = self._session_state_from_index(key, meta)
+        with self._state_lock:
+            sess = self._sessions.get(key)
+            if sess is not None:
+                if load_history and (not sess.loaded):
+                    self._load_session_payload(key, sess)
+                return sess
+            meta = self._session_index.get(key)
+            if isinstance(meta, dict):
+                sess = self._session_state_from_index(key, meta)
+                self._sessions[key] = sess
+                if load_history:
+                    self._load_session_payload(key, sess)
+                return sess
+            sess = SessionState(short=[], history=[], summary="", muted=False, titles=set(), loaded=True)
             self._sessions[key] = sess
-            if load_history:
-                self._load_session_payload(key, sess)
             return sess
-        sess = SessionState(short=[], history=[], summary="", muted=False, titles=set(), loaded=True)
-        self._sessions[key] = sess
-        return sess
 
     def _remember_session_alias(self, alias: str, canonical: str) -> None:
         if not alias:
@@ -650,6 +658,7 @@ class WeChatGuiRpaBot:
         norm_role = role_map.get(role, "unknown")
         key = self._session_key_for_row(row)
         sess = self._get_or_create_session(key)
+        sender_clean = (sender or "").strip()
         sender_clean = (sender or "").strip()
         sender_raw = ""
         if norm_role == "user":
@@ -1269,9 +1278,10 @@ class WeChatGuiRpaBot:
     def _remember_sent_for_row(self, row: ChatRowState, sent_norm: str, now: float) -> None:
         if not sent_norm:
             return
-        key = self._title_key(row.title)
-        if key:
-            self._sent_by_title[key] = (sent_norm, now)
+        with self._state_lock:
+            key = self._title_key(row.title)
+            if key:
+                self._sent_by_title[key] = (sent_norm, now)
 
     def _is_group_chat(self, row: ChatRowState) -> bool:
         title = row.title or ""
@@ -4465,12 +4475,9 @@ class WeChatGuiRpaBot:
         return True
 
     def _remember_latest_image_for_row(self, row: ChatRowState, image_path: str) -> None:
-        clean = str(image_path or "").strip()
-        if clean:
-            self._latest_image_by_session[self._session_key_for_row(row)] = clean
-
-    def _latest_image_for_row(self, row: ChatRowState) -> str:
-        return self._latest_image_by_session.get(self._session_key_for_row(row), "")
+        with self._state_lock:
+            key = self._session_key_for_row(row)
+            self._latest_image_by_session[key] = image_path
 
     def _image_followup_context_for_text(self, row: ChatRowState, text: str) -> str:
         clean = re.sub(r"\s+", " ", str(text or "")).strip()
@@ -4557,7 +4564,8 @@ class WeChatGuiRpaBot:
             return message
 
         if self.cfg.receiver_mode == "detached_windows":
-            raised = self.sender.paste_and_send_to_window(row.title, message)
+            with self._send_lock:
+                raised = self.sender.paste_and_send_to_window(row.title, message)
             if not raised:
                 print(f"[warn] detached send window raise not confirmed: {row.title!r}")
             msg_w = max(24, self._term_width() - 12)
@@ -5044,7 +5052,8 @@ class WeChatGuiRpaBot:
                         f"handle={self._fit_col(picked_text, max(24, self._term_width() - 40))}"
                     )
                 for message in messages_to_handle:
-                    self._handle_detached_new_message(
+                    self._msg_executor.submit(
+                        self._handle_detached_new_message,
                         window_id=window.window_id,
                         title=window.title,
                         messages=snapshot.messages,
