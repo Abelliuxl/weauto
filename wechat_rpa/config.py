@@ -285,7 +285,7 @@ class AppConfig:
     # Allow reply LLM to explicitly skip sending in group chats via [NO_REPLY].
     group_allow_llm_no_reply: bool = True
     group_reply_keywords: list[str] = field(
-        default_factory=lambda: ["@助手", "@机器人", "机器人", "bot", "小助手"]
+        default_factory=lambda: ["@助手", "@机器人", "机器人", "bot", "小助手", "@萨比", "萨比"]
     )
     ignore_title_keywords: list[str] = field(default_factory=lambda: ["折叠的聊天"])
     use_manual_row_boxes: bool = False
