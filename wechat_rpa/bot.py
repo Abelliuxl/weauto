@@ -4594,7 +4594,7 @@ class WeChatGuiRpaBot:
         )
         if message:
             message = self._strip_markdown_formatting(message)
-            if reason == "mention" and len(message) > 120:
+            if reason == "mention":
                 message = self._format_long_reply(message)
         if not (message or "").strip():
             if self.cfg.log_verbose:
