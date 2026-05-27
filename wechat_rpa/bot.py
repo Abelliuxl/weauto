@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 import concurrent.futures
+import queue
 from dataclasses import dataclass
 from datetime import datetime
 from difflib import SequenceMatcher
@@ -208,6 +209,8 @@ class WeChatGuiRpaBot:
             max_workers=min(8, max(2, os.cpu_count() or 4)),
             thread_name_prefix="msg",
         )
+        self._session_queues: dict[int, queue.Queue] = {}
+        self._session_busy: dict[int, bool] = {}
         self._baseline: dict[int, RowMemory] = {}
         # title_key -> (normalized_sent_text, sent_ts)
         self._sent_by_title: dict[str, tuple[str, float]] = {}
@@ -4934,6 +4937,27 @@ class WeChatGuiRpaBot:
                 self._last_normal_reply_at = now
         self._save_persistent_memory()
 
+    def _process_session_queue(self, window_id: int) -> None:
+        q = self._session_queues.get(window_id)
+        if q is None:
+            return
+        while not q.empty():
+            title, messages, message, now = q.get_nowait()
+            if self.visible_message_state.is_incoming(message):
+                self._handle_detached_new_message(
+                    window_id=window_id, title=title,
+                    messages=messages, message=message, now=now,
+                )
+        with self._state_lock:
+            self._session_busy[window_id] = False
+        if q and not q.empty():
+            with self._state_lock:
+                if not self._session_busy.get(window_id):
+                    self._session_busy[window_id] = True
+                    self._msg_executor.submit(
+                        self._process_session_queue, window_id
+                    )
+
     @staticmethod
     def _detached_context_snapshot(text: str):
         from types import SimpleNamespace
@@ -5051,14 +5075,13 @@ class WeChatGuiRpaBot:
                         f"[batch] detached title={self._fit_col(window.title, 14)} "
                         f"handle={self._fit_col(picked_text, max(24, self._term_width() - 40))}"
                     )
+                q = self._session_queues.setdefault(window.window_id, queue.Queue())
                 for message in messages_to_handle:
+                    q.put((window.title, snapshot.messages, message, now))
+                if not self._session_busy.get(window.window_id):
+                    self._session_busy[window.window_id] = True
                     self._msg_executor.submit(
-                        self._handle_detached_new_message,
-                        window_id=window.window_id,
-                        title=window.title,
-                        messages=snapshot.messages,
-                        message=message,
-                        now=now,
+                        self._process_session_queue, window.window_id
                     )
             if not self._detached_bootstrapped:
                 self._detached_bootstrapped = True
