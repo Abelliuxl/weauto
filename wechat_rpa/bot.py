@@ -4541,6 +4541,8 @@ class WeChatGuiRpaBot:
         memory_recall: str = "",
         latest_message: str = "",
         force_message: str = "",
+        *,
+        mention_reply_to: str = "",
     ) -> str:
         preview_w = max(24, self._term_width() - 18)
         print(
@@ -4571,12 +4573,13 @@ class WeChatGuiRpaBot:
             return message
 
         if self.cfg.receiver_mode == "detached_windows":
+            send_text = f"@{mention_reply_to} {message}" if mention_reply_to else message
             with self._send_lock:
-                raised = self.sender.paste_and_send_to_window(row.title, message)
+                raised = self.sender.paste_and_send_to_window(row.title, send_text)
             if not raised:
                 print(f"[warn] detached send window raise not confirmed: {row.title!r}")
             msg_w = max(24, self._term_width() - 12)
-            print(f"[sent] to={self._fit_col(row.title, 14)} msg={self._fit_col(message, msg_w)}")
+            print(f"[sent] to={self._fit_col(row.title, 14)} msg={self._fit_col(send_text, msg_w)}")
             return message
 
         if focused_bounds is not None:
@@ -4939,6 +4942,11 @@ class WeChatGuiRpaBot:
             self._save_persistent_memory()
             return
 
+        mention_reply_to = (
+            (message.get("sender") or "").strip()
+            if reason == "mention" and is_group
+            else ""
+        )
         reply_text = self._reply(
             row,
             reason,
@@ -4947,6 +4955,7 @@ class WeChatGuiRpaBot:
             workspace_context=workspace_context,
             memory_recall=memory_recall,
             latest_message=latest_text or row.preview,
+            mention_reply_to=mention_reply_to,
         )
         if reply_text:
             sent_norm = self._normalize_preview(reply_text)
