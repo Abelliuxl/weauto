@@ -2309,9 +2309,11 @@ class LlmReplyGenerator:
             "run_python": {
                 "description": (
                     "Run short sandboxed Python for math, statistics, date arithmetic, unit conversion, "
-                    "modular arithmetic, or power calculations. Print the result. No files/network/system access."
+                    "modular arithmetic, or power calculations. Print the result. No files/network/system access. "
+                    "NOTE: import is NOT supported. math/statistics/datetime/Decimal/Fraction are pre-imported; "
+                    "use math.gcd(), math.sqrt() etc directly without import."
                 ),
-                "properties": {"code": {"type": "string", "description": "Short Python code using print(...)."}},
+                "properties": {"code": {"type": "string", "description": "Short Python code using print(...). No import statements."}},
                 "required": ["code"],
             },
             "write_impression": {
@@ -2529,7 +2531,8 @@ class LlmReplyGenerator:
             ),
             "run_python": (
                 "args={\"code\":\"短代码，需 print 输出\"} "
-                "仅用于数学、统计、日期计算；无文件/网络/系统访问"
+                "仅用于数学、统计、日期计算；无文件/网络/系统访问。"
+                "注意：不支持 import 语句，math/statistics/datetime 等已预置可直接调用"
             ),
             "write_impression": (
                 "args={\"name\":\"规范中文名\",\"content\":\"完整 markdown\"} "
@@ -2609,7 +2612,7 @@ class LlmReplyGenerator:
             + "若需求是纯文本答复，不要调用 generate_image。"
             + "\n11b) 当用户要求改图、修图、换风格、增删画面内容时优先用 edit_image；"
             + "如果当前消息或近期上下文已有图片，可省略 image_path。"
-            + "\n12) 遇到数学、统计、日期、单位换算、取模、幂运算等需要精确计算的问题，必须先调用 run_python；"
+            + "\n12) 遇到数学、统计、日期、单位换算、取模、幂运算等需要精确计算的问题，必须先调用 run_python；run_python 不支持 import 语句，math/statistics/datetime/Decimal/Fraction 已预置可直接用；"
             + "没有 Python 工具观察结果时，不要直接给数值结论。"
             + "\n13) 遇到最新信息、官网公告、新闻、版本改动、价格、规则等时效事实，必须优先调用 web_search_volc/search_web_volc 或 web_search/search_web；"
             + "没有检索观察结果时，不要声称已经查过。"

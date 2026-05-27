@@ -1,134 +1,103 @@
 # 架构与代码地图
 
-## 1. 目录与模块
+## 1. 接收模式
 
-- `run.py`：启动入口；解析命令 `run/recover/recover-auto`
-- `start_rpa.sh`：一键运行脚本（venv、依赖、env、日志）
-- `wechat_rpa/config.py`：dataclass 默认值与 `config.toml` 加载/回退逻辑
+当前唯一支持的接收模式是 **detached windows**（`receiver_mode = "detached_windows"`）。
+
+每个微信聊天窗口被识别为一个独立 macOS 窗口，通过窗口 ID 捕获并 OCR：
+- `detached_window_receiver.py` — 枚举 detach 窗口、截图
+- `visible_message_parser.py` — OCR 解析聊天区内容
+- `visible_message_state.py` — 去重和增量跟踪
+
+旧版统一列表模式（`legacy_list`）已归档至 `archive/legacy/`。
+
+## 2. 目录与模块
+
+- `run.py`：启动入口
+- `start_rpa.sh`：一键运行脚本（venv、依赖、env、日志、日志清理）
+- `start_rpa_watchdog.sh`：定期重启守护
+- `wechat_rpa/config.py`：dataclass 默认值与 `config.toml` 加载
 - `wechat_rpa/window.py`：微信窗口定位、区域截图
-- `wechat_rpa/ocr.py`：OCR 引擎封装（`rapidocr/paddleocr/cnocr`），支持增强与 A/B 对比日志
-- `wechat_rpa/detector.py`：左侧会话列表识别与事件特征提取，支持手工行框与自动行模式
-- `wechat_rpa/llm.py`：OpenAI-compatible / Ollama-native 请求封装，Vision 解析与文本 LLM 能力
-- `wechat_rpa/workspace_context.py`：`agent_workspace` bootstrap、记忆写入/检索、SQLite/embedding/rerank
-- `wechat_rpa/bot.py`：主状态机与消息处理链路（focus、session memory、agent actions、heartbeat）
+- `wechat_rpa/ocr.py`：OCR 引擎封装（`rapidocr/paddleocr/cnocr`）
+- `wechat_rpa/detector.py`：专用窗口检测器（detached window 模式）
+- `wechat_rpa/llm.py`：LLM 请求封装（文本 + Vision + planner）
+- `wechat_rpa/bot.py`：主状态机与消息处理链路
+- `wechat_rpa/message_handler.py`：事件处理流程（focus、context、reply）
+- `wechat_rpa/action_processor.py`：Agent 工具执行器
+- `wechat_rpa/agent_store.py`：MemoryStore / SkillStore / PeopleStore / ChatHistoryStore
+- `wechat_rpa/prompt_context.py`：人格配置（`data/config/`）+ 技能（`data/skills/`）上下文构建
+- `wechat_rpa/sender.py`：消息发送（剪贴板 + AppleScript / pyautogui）
+- `wechat_rpa/image_generation.py`：图片生成
+- `wechat_rpa/image_editing.py`：图片编辑
+- `wechat_rpa/people_aliases.py`：人物别名解析
+- `wechat_rpa/python_sandbox.py`：安全 Python 沙盒（数学/统计/日期计算）
 
-## 2. 主数据流（普通模式）
+## 3. 主数据流
 
 1. `run.py` 加载配置并构造 `WeChatGuiRpaBot`
-2. `bot.run_forever()` 循环截图微信窗口
-3. `detector.detect_chat_rows()` 输出 `ChatRowState[]`
-4. `_pick_event()` 选定待处理会话与触发原因
-5. 规则过滤（静音、群聊前缀、节流、自回声等）
-6. `_focus_chat()` 聚焦目标会话并做标题校验
-7. `_extract_chat_context()` 截图右侧聊天区并走 Vision
-8. 整合上下文：session summary/history + workspace context + memory recall
-9. 管理员命令优先执行（若命中）
-10. 可选 `_run_agent_planner_loop()` 执行工具规划循环
-11. `_reply_text()` 生成回复（含防复读与 `[NO_REPLY]` 处理）
-12. `_reply()` 真实发送或 dry-run 输出
-13. 更新 `session_memory.json` 与 `agent_workspace` 记忆文件
+2. `bot.run_forever()` 循环检测 detach 窗口
+3. `visible_message_parser` OCR 解析消息变化
+4. `message_handler.handle_event()` 处理事件
+5. `_reply()` 生成并发送回复
 
-## 3. 检测层
+## 4. 存储层（System A）
 
-### 3.1 手工行框模式
+所有运行时数据统一在 `data/` 下：
 
-- 条件：`use_manual_row_boxes=true`
-- 数据：`manual_row_boxes.json`
-- 特点：稳定性高，推荐生产使用
+| 目录 | 存储 | 访问类 |
+|---|---|---|
+| `data/memory/` | core.md / timeline.md | `MemoryStore` |
+| `data/people/` | 人物印象 `<name>.md` | `PeopleStore` |
+| `data/skills/` | 技能 `<name>/SKILL.md` | `SkillStore` |
+| `data/config/` | 人格配置（SOUL/IDENTITY/USER/TOOLS/AGENTS/SKILLS/PEOPLE_ALIASES） | `prompt_context.py` |
+| `data/session_memory.json` | 会话状态（history/summary/muted） | bot 内部 |
 
-### 3.2 自动行模式
+## 5. Agent 工具
 
-- 条件：`use_manual_row_boxes=false`
-- 依赖：`list_region + row_height_ratio + rows_max`
-- 特点：快速起步，但对窗口变化更敏感
+**当前可用工具（System A）：**
 
-### 3.3 触发优先级
+- `write_memory` — 写入 `data/memory/core.md` 或 `timeline.md`
+- `read_impression` / `write_impression` — 读写 `data/people/` 人物印象
+- `write_skill` / `delete_skill` — 管理 `data/skills/` 技能
+- `read_chat_history` — 读取当前/指定会话历史
+- `run_python` — 安全沙盒 Python 计算
+- `web_search` / `web_search_volc` / `search_web` / `search_web_brave` — 联网检索
+- `fetch_url` / `browse_url` — 网页内容抓取
+- `generate_image` / `edit_image` — 图片生成与编辑
+- `mute_session` / `unmute_session` — 会话静音控制
+- `build_wow_character_url` — 魔兽角色链接构建
 
-1. mention
-2. unread/new_message
-3. preview change（若 `trigger_on_preview_change=true`）
+## 6. Heartbeat
 
-## 4. 回复层分工
+心跳空闲自驱任务。触发条件：
+- `heartbeat_enabled=true`
+- 达到 `heartbeat_interval_sec`
+- 空闲超过 `heartbeat_min_idle_sec`
 
-- Vision：只做“观察层”解析，输出 `context + environment`
-- Decision：是否回复判断
-- Reply：最终回复生成
-- Planner：工具动作规划
-- Summary：会话摘要更新
+可用工具：`read_impression`、`write_impression`、`write_memory`
 
-回复兜底：
+## 7. 数据目录
 
-- LLM 不可用或失败 -> `reply_on_new_message/reply_on_mention`
-- 群聊可配置允许 `[NO_REPLY]` 静默
+```
+data/
+  memory/              MemoryStore（core.md, timeline.md）
+    core.md
+    timeline.md
+  people/              PeopleStore（人物印象）
+    <name>.md
+  skills/              SkillStore（技能）
+    <name>/SKILL.md
+  config/              人格配置
+    SOUL.md, IDENTITY.md, USER.md, TOOLS.md
+    AGENTS.md, SKILLS.md, PEOPLE_ALIASES.md
+  session_memory.json  会话状态
+  generated_images/    生图输出
+  edited_images/       改图输出
+```
 
-## 5. 记忆层
+## 8. 平台依赖
 
-### 5.1 会话记忆（JSON）
-
-`data/session_memory.json` + `data/session_memory.sessions/*.json`：
-
-- `short`
-- `history`
-- `summary`
-- `muted`
-- `aliases`
-
-### 5.2 工作区记忆（Markdown/JSON）
-
-`agent_workspace/`：
-
-- `AGENTS.md` / `SOUL.md` / `IDENTITY.md` / `USER.md` / `TOOLS.md`
-- `MEMORY.md`
-- `memory/YYYY-MM-DD.md`
-- `memory/sessions/*.md`
-- `memory/session_state/*.json`
-
-### 5.3 recall 增强
-
-可选链路：
-
-- SQLite FTS 索引召回
-- embedding 相似度加权
-- rerank 精排
-
-## 6. Agent 工具执行
-
-普通消息可用工具（按配置与权限）：
-
-- `remember_session_fact`
-- `remember_session_event`
-- `set_session_summary`
-- `search_memory`
-- `web_search`
-- `web_search_volc`
-- 管理员额外：`remember_long_term`、`mute_session`、`unmute_session`
-
-Heartbeat 额外支持：
-
-- `maintain_memory`
-- `refine_persona_files`
-
-## 7. Heartbeat 支线
-
-入口：主循环 idle 分支 `_maybe_run_heartbeat()`。
-
-触发条件：
-
-- 心跳开关开启
-- 达到间隔
-- 达到最小空闲时长
-
-执行顺序：
-
-1. 读取 `HEARTBEAT.md`
-2. 优先解析直接动作
-3. 否则 LLM 规划动作
-4. 复用同一工具执行器落盘记忆
-
-## 8. 平台耦合
-
-当前实现依赖 macOS：
-
-- Quartz：窗口枚举/坐标
-- AppleScript：应用激活、粘贴发送
-- `pyautogui`：鼠标键盘动作
+- macOS：
+  - Quartz：窗口枚举/坐标
+  - AppleScript：粘贴发送
+  - `pyautogui`：鼠标键盘动作
