@@ -293,11 +293,16 @@ class MessageHandler:
                         tools=tools,
                         per_round_max_actions=bot.cfg.agent_actions_max_per_turn,
                     )
-                if planner_hint and bot.cfg.log_verbose:
-                    print(
-                        f"[agent] planner hint ignored (reply by llm) row={row.row_idx:>2} "
-                        f"hint={bot._fit_col(planner_hint, max(24, bot._term_width() - 45))}"
-                    )
+                if planner_hint:
+                    memory_recall = (
+                        f"[planner reply hint]\n{planner_hint}\n\n"
+                        + memory_recall
+                    )[:3600]
+                    if bot.cfg.log_verbose:
+                        print(
+                            f"[agent] planner hint injected row={row.row_idx:>2} "
+                            f"hint={bot._fit_col(planner_hint, max(24, bot._term_width() - 45))}"
+                        )
                 if not planner_send_reply:
                     if sent_in_event == 0:
                         if bot.cfg.log_verbose:

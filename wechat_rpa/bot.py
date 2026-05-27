@@ -4897,10 +4897,11 @@ class WeChatGuiRpaBot:
             return
 
         planner_send_reply = True
+        planner_hint = ""
         if self.cfg.agent_actions_enabled:
             tools = self._available_agent_tools(is_admin=is_admin)
             if tools:
-                memory_recall, _, _, planner_send_reply, _ = self._run_agent_planner_loop(
+                memory_recall, planner_hint, _, planner_send_reply, _ = self._run_agent_planner_loop(
                     planner=self.llm_planner,
                     row=row,
                     reason=reason,
@@ -4915,6 +4916,11 @@ class WeChatGuiRpaBot:
                     tools=tools,
                     per_round_max_actions=self.cfg.agent_actions_max_per_turn,
                 )
+                if planner_hint:
+                    memory_recall = (
+                        f"[planner reply hint]\n{planner_hint}\n\n"
+                        + memory_recall
+                    )[:3600]
         if not planner_send_reply:
             if self.cfg.log_verbose:
                 print(f"[agent] detached planner requested hold-send title={title!r}")
