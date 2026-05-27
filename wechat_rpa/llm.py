@@ -2314,9 +2314,10 @@ class LlmReplyGenerator:
                 "description": (
                     "Run short sandboxed Python for math, statistics, date arithmetic, unit conversion, "
                     "modular arithmetic, or power calculations. Print the result. No files/network/system access. "
-                    "NOTE: import and from...import are NOT supported. "
-                    "math/statistics/datetime/Decimal/Fraction are pre-imported; "
-                    "use them directly without import, e.g. datetime.now() not from datetime import datetime."
+                    "NOTE: import/from...import are NOT supported. "
+                    "Pre-imported and usable directly: math, statistics, datetime, date, timedelta, Decimal, Fraction, "
+                    "mean, median. Examples: math.gcd(a,b), datetime.now(), date.today(), Decimal('3.14'), "
+                    "Fraction(1,3), statistics.mean([1,2,3]), pow(base, exp, mod)."
                 ),
                 "properties": {"code": {"type": "string", "description": "Short Python code using print(...). No import statements."}},
                 "required": ["code"],
@@ -2538,7 +2539,7 @@ class LlmReplyGenerator:
             "run_python": (
                 "args={\"code\":\"短代码，需 print 输出\"} "
                 "仅用于数学、统计、日期计算；无文件/网络/系统访问。"
-                "注意：不支持 import/from...import，math/statistics/datetime 等已预置，如直接写 datetime.now() 而非 from datetime import datetime"
+                "注意：不支持 import/from...import；已预置可直接用：math, statistics, datetime, date, timedelta, Decimal, Fraction, mean, median；如 math.gcd(a,b), datetime.now(), Decimal('3.14'), pow(x,y,mod)"
             ),
             "write_impression": (
                 "args={\"name\":\"规范中文名\",\"content\":\"完整 markdown\"} "
@@ -2618,7 +2619,7 @@ class LlmReplyGenerator:
             + "若需求是纯文本答复，不要调用 generate_image。"
             + "\n11b) 当用户要求改图、修图、换风格、增删画面内容时优先用 edit_image；"
             + "如果当前消息或近期上下文已有图片，可省略 image_path。"
-            + "\n12) 遇到数学、统计、日期、单位换算、取模、幂运算等需要精确计算的问题，必须先调用 run_python；run_python 不支持 import 和 from...import，math/statistics/datetime/Decimal/Fraction 已预置可直接用（如 datetime.now() 即可）；"
+            + "\n12) 遇到数学、统计、日期、单位换算、取模、幂运算等需要精确计算的问题，必须先调用 run_python；run_python 不支持 import/from...import；已预置可直接用：math, statistics, datetime, date, timedelta, Decimal, Fraction, mean, median；示例 math.gcd(a,b), datetime.now(), Decimal('3.14'), pow(x,y,mod)；"
             + "没有 Python 工具观察结果时，不要直接给数值结论。"
             + "\n13) 遇到最新信息、官网公告、新闻、版本改动、价格、规则等时效事实，必须优先调用 web_search_volc/search_web_volc 或 web_search/search_web；"
             + "没有检索观察结果时，不要声称已经查过。"
