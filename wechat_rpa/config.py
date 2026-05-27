@@ -693,9 +693,6 @@ def load_config(path: str | Path | None) -> AppConfig:
     cfg.heartbeat_max_actions = int(
         data.get("heartbeat_max_actions", cfg.heartbeat_max_actions)
     )
-    cfg.heartbeat_fail_open = bool(
-        data.get("heartbeat_fail_open", cfg.heartbeat_fail_open)
-    )
     cfg.heartbeat_prompt = str(data.get("heartbeat_prompt", cfg.heartbeat_prompt))
     cfg.reply_on_new_message = str(
         data.get("reply_on_new_message", cfg.reply_on_new_message)
