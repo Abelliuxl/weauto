@@ -6,6 +6,8 @@
 receiver_mode = "detached_windows"
 detached_window_title_filter = []
 detached_window_output_dir = "data/detached_window_images"
+# screencapture: memory-stable but slower; quartz: faster but may grow Mach memory, use watchdog.
+detached_window_capture_backend = "screencapture"
 detached_debug_save = false
 detached_reply_on_image = false
 detached_process_existing_on_start = false
@@ -29,6 +31,8 @@ send_after_paste_delay_sec = 0.5
 log_verbose = true
 debug_scan = false
 skip_first_action_on_start = true
+memory_gc_interval_sec = 60.0
+memory_watchdog_max_rss_mb = 8192
 
 # ============================================================
 # Session Memory
@@ -110,7 +114,7 @@ python_sandbox_restricted = true
 heartbeat_enabled = false
 heartbeat_interval_sec = 300.0
 heartbeat_min_idle_sec = 20.0
-heartbeat_max_actions = 4
+heartbeat_max_actions = 8
 
 # ============================================================
 # Reply Policy & Group Rules

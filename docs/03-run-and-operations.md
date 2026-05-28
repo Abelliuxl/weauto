@@ -15,7 +15,9 @@ python run.py --config config.toml
 
 `start_rpa.sh` 自动处理：
 - 创建/复用 `.venv312` 虚拟环境
-- 安装 `requirements.txt` 依赖
+- 优先通过 `uv sync` 安装 `pyproject.toml` / `uv.lock` 依赖
+- 未安装 `uv` 时回退到 `requirements.txt + pip`
+- 安装 Playwright Chromium（供 `browse_url` 抓取动态网页）
 - 从 `config.toml.example` 复制初始配置（不存在时）
 - 加载 `.env.weauto` / `.env` 环境变量
 - 日志输出到 `logs/rpa_YYYYmmdd_HHMMSS.log`
@@ -28,7 +30,7 @@ python run.py --config config.toml
 - 终端/ Python 已授权：
   - Accessibility（辅助功能）
   - Screen Recording（屏幕录制）
-- `.venv312` 已安装依赖
+- 推荐安装 `uv`；未安装时 `start_rpa.sh` 会自动使用 pip 回退路径
 
 ## 3. 运行模式
 

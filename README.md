@@ -54,6 +54,8 @@ archive/legacy/          旧版归档
 python run.py --config config.toml
 ```
 
+依赖管理优先使用 UV：`start_rpa.sh` 检测到 `uv` 时会执行 `uv sync`，并把项目环境放在 `.venv312`。如果本机未安装 `uv`，脚本会回退到 `requirements.txt + pip`。
+
 ## 前置条件
 
 - macOS（依赖 Quartz、AppleScript）

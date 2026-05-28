@@ -18,6 +18,7 @@ if (( "$#" > 1 )); then
   EXTRA_ARGS=("${@:2}")
 fi
 DEPS_MARKER="$VENV_DIR/.deps_installed"
+PLAYWRIGHT_MARKER="$VENV_DIR/.playwright_chromium_installed"
 LOG_DIR="$ROOT_DIR/logs"
 LOG_KEEP_MAX_FILES="${LOG_KEEP_MAX_FILES:-40}"
 LOG_KEEP_MAX_TOTAL_MB="${LOG_KEEP_MAX_TOTAL_MB:-512}"
@@ -52,13 +53,6 @@ _prune_old_logs() {
   done < <(ls -1t "$LOG_DIR"/rpa_*.log 2>/dev/null || true)
 }
 
-if [[ ! -d "$VENV_DIR" ]]; then
-  echo "[setup] creating venv: $VENV_DIR"
-  "$PYTHON_BIN" -m venv "$VENV_DIR"
-fi
-
-source "$VENV_DIR/bin/activate"
-
 # Optional local env files (not committed) for secrets/endpoints.
 for env_file in "$ROOT_DIR/.env.weauto" "$ROOT_DIR/.env"; do
   if [[ -f "$env_file" ]]; then
@@ -70,11 +64,56 @@ for env_file in "$ROOT_DIR/.env.weauto" "$ROOT_DIR/.env"; do
   fi
 done
 
-if [[ ! -f "$DEPS_MARKER" || requirements.txt -nt "$DEPS_MARKER" ]]; then
-  echo "[setup] installing dependencies"
-  python -m pip install --upgrade pip >/dev/null
-  python -m pip install -r requirements.txt
-  date > "$DEPS_MARKER"
+_needs_refresh() {
+  local marker="$1"
+  shift
+  if [[ ! -f "$marker" ]]; then
+    return 0
+  fi
+  local dep=""
+  for dep in "$@"; do
+    if [[ -f "$dep" && "$dep" -nt "$marker" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+UV_BIN="${UV_BIN:-}"
+if [[ -z "$UV_BIN" ]] && command -v uv >/dev/null 2>&1; then
+  UV_BIN="$(command -v uv)"
+fi
+if [[ -z "$UV_BIN" && -x "$VENV_DIR/bin/uv" ]]; then
+  UV_BIN="$VENV_DIR/bin/uv"
+fi
+
+if [[ -n "$UV_BIN" && -f pyproject.toml ]]; then
+  echo "[setup] syncing dependencies with uv"
+  UV_PROJECT_ENVIRONMENT="$VENV_DIR" "$UV_BIN" sync --python "$PYTHON_BIN"
+else
+  if [[ ! -d "$VENV_DIR" ]]; then
+    echo "[setup] creating venv: $VENV_DIR"
+    "$PYTHON_BIN" -m venv "$VENV_DIR"
+  fi
+  source "$VENV_DIR/bin/activate"
+  if _needs_refresh "$DEPS_MARKER" requirements.txt pyproject.toml; then
+    echo "[setup] installing dependencies with pip fallback"
+    python -m pip install --upgrade pip >/dev/null
+    python -m pip install -r requirements.txt
+    date > "$DEPS_MARKER"
+  fi
+fi
+
+if [[ -z "${VIRTUAL_ENV:-}" ]]; then
+  source "$VENV_DIR/bin/activate"
+fi
+
+if python -c "import playwright" >/dev/null 2>&1; then
+  if _needs_refresh "$PLAYWRIGHT_MARKER" requirements.txt pyproject.toml uv.lock; then
+    echo "[setup] installing Playwright Chromium"
+    python -m playwright install chromium
+    date > "$PLAYWRIGHT_MARKER"
+  fi
 fi
 
 if [[ ! -f "$CONFIG_PATH" ]]; then

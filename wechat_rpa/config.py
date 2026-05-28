@@ -87,7 +87,7 @@ class LlmConfig:
         "长度控制在1-2句，不要编造事实。"
     )
     decision_enabled: bool = True
-    decision_on_group: bool = True
+    decision_on_group: bool = False
     decision_on_private: bool = False
     decision_fail_open: bool = False
     # <=0 means do not send max_tokens to provider (no client-side cap).
@@ -186,6 +186,9 @@ class AppConfig:
     receiver_mode: str = "detached_windows"
     detached_window_title_filter: list[str] = field(default_factory=list)
     detached_window_output_dir: str = "data/detached_window_images"
+    # screencapture: slower but keeps CoreGraphics capture in a short-lived subprocess.
+    # quartz: faster in-process CoreGraphics capture, but may grow Mach memory over time.
+    detached_window_capture_backend: str = "screencapture"
     detached_debug_save: bool = False
     detached_reply_on_image: bool = False
     detached_process_existing_on_start: bool = False
@@ -207,6 +210,8 @@ class AppConfig:
     log_snapshot_rows: int = 6
     process_existing_unread_on_start: bool = True
     skip_first_action_on_start: bool = True
+    memory_gc_interval_sec: float = 60.0
+    memory_watchdog_max_rss_mb: int = 0
     memory_enabled: bool = True
     memory_store_path: str = "data/session_memory.json"
     memory_short_max_items: int = 12
@@ -266,7 +271,7 @@ class AppConfig:
     heartbeat_enabled: bool = False
     heartbeat_interval_sec: float = 300.0
     heartbeat_min_idle_sec: float = 20.0
-    heartbeat_max_actions: int = 4
+    heartbeat_max_actions: int = 8
     heartbeat_prompt: str = (
         "Scheduled self-reflection heartbeat. Maintain data/memory/core.md, "
         "data/memory/timeline.md, and data/people/*.md only when recent chat "
@@ -514,6 +519,12 @@ def load_config(path: str | Path | None) -> AppConfig:
     cfg.detached_window_output_dir = str(
         data.get("detached_window_output_dir", cfg.detached_window_output_dir)
     ).strip() or cfg.detached_window_output_dir
+    capture_backend = str(
+        data.get("detached_window_capture_backend", cfg.detached_window_capture_backend)
+    ).strip().lower()
+    cfg.detached_window_capture_backend = (
+        capture_backend if capture_backend in {"screencapture", "quartz"} else "screencapture"
+    )
     cfg.detached_debug_save = bool(data.get("detached_debug_save", cfg.detached_debug_save))
     cfg.detached_reply_on_image = bool(
         data.get("detached_reply_on_image", cfg.detached_reply_on_image)
@@ -554,6 +565,12 @@ def load_config(path: str | Path | None) -> AppConfig:
     )
     cfg.skip_first_action_on_start = bool(
         data.get("skip_first_action_on_start", cfg.skip_first_action_on_start)
+    )
+    cfg.memory_gc_interval_sec = float(
+        data.get("memory_gc_interval_sec", cfg.memory_gc_interval_sec)
+    )
+    cfg.memory_watchdog_max_rss_mb = int(
+        data.get("memory_watchdog_max_rss_mb", cfg.memory_watchdog_max_rss_mb)
     )
     cfg.memory_enabled = bool(data.get("memory_enabled", cfg.memory_enabled))
     cfg.memory_store_path = str(data.get("memory_store_path", cfg.memory_store_path))

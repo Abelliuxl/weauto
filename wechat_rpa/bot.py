@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 import concurrent.futures
+import gc
 import queue
 from dataclasses import dataclass
 from datetime import datetime
@@ -230,6 +231,8 @@ class WeChatGuiRpaBot:
         self._skip_first_action_pending = bool(self.cfg.skip_first_action_on_start)
         self._last_heartbeat_at = 0.0
         self._last_activity_at = 0.0
+        self._last_memory_gc_at = 0.0
+        self._memory_restart_pending = False
         self._load_persistent_memory()
 
     def _to_np_rgb(self, pil_image) -> np.ndarray:
@@ -248,6 +251,73 @@ class WeChatGuiRpaBot:
                 pil_image.close()
             except Exception:
                 pass
+
+    @staticmethod
+    def _current_rss_mb() -> int:
+        try:
+            proc = subprocess.run(
+                ["ps", "-o", "rss=", "-p", str(os.getpid())],
+                capture_output=True,
+                text=True,
+                timeout=2.0,
+            )
+            if proc.returncode == 0:
+                kb = int((proc.stdout or "0").strip() or "0")
+                return max(0, kb // 1024)
+        except Exception:
+            pass
+        return 0
+
+    def _has_pending_message_work(self) -> bool:
+        with self._state_lock:
+            if any(bool(v) for v in self._session_busy.values()):
+                return True
+            for q in self._session_queues.values():
+                try:
+                    if q.qsize() > 0:
+                        return True
+                except Exception:
+                    if not q.empty():
+                        return True
+        return False
+
+    def _maybe_run_memory_maintenance(self, now: float) -> None:
+        interval = float(getattr(self.cfg, "memory_gc_interval_sec", 0.0) or 0.0)
+        max_rss_mb = int(getattr(self.cfg, "memory_watchdog_max_rss_mb", 0) or 0)
+        if interval <= 0 and max_rss_mb <= 0:
+            return
+        if (
+            not self._memory_restart_pending
+            and interval > 0
+            and now - self._last_memory_gc_at < interval
+        ):
+            return
+        self._last_memory_gc_at = now
+        collected = gc.collect()
+        rss_mb = self._current_rss_mb()
+        if self.cfg.log_verbose and rss_mb:
+            print(f"[memory] rss={rss_mb}MB gc_collected={collected}")
+        should_restart = max_rss_mb > 0 and rss_mb > max_rss_mb
+        if should_restart:
+            self._memory_restart_pending = True
+        if self._memory_restart_pending:
+            if self._has_pending_message_work():
+                reason = (
+                    f"rss={rss_mb}MB exceeds limit={max_rss_mb}MB"
+                    if should_restart
+                    else f"restart pending; rss={rss_mb}MB limit={max_rss_mb}MB"
+                )
+                print(
+                    f"[memory] {reason}; "
+                    "restart deferred until message/send queues are idle"
+                )
+                return
+            print(
+                f"[memory] rss={rss_mb}MB restart pending; "
+                "queues idle, saving state and restarting process"
+            )
+            self._save_persistent_memory()
+            os.execv(sys.executable, [sys.executable, "-u", *sys.argv])
 
     @staticmethod
     def _strip_markdown_formatting(text: str) -> str:
@@ -1324,6 +1394,12 @@ class WeChatGuiRpaBot:
             if prefix and title.startswith(prefix):
                 return True
 
+        # Detached windows already expose the chat title. Their previews are
+        # normalized as "sender: message" for both private and group chats, so
+        # sender-prefix detection would incorrectly classify private chats as groups.
+        if self.cfg.receiver_mode == "detached_windows":
+            return False
+
         if self.cfg.group_detect_sender_prefix and "：" in (row.preview or ""):
             sender = row.preview.split("：", 1)[0].strip()
             if 1 <= len(sender) <= 24:
@@ -1713,10 +1789,16 @@ class WeChatGuiRpaBot:
     def _available_agent_tools(self, *, is_admin: bool) -> list[str]:
         tools = [
             "list_skills",
+            "read_skill",
+            "read_memory",
+            "recall_memory",
+            "remember_fact",
             "write_memory",
+            "update_skill",
             "write_skill",
             "delete_skill",
             "read_impression",
+            "update_impression",
             "write_impression",
             "read_chat_history",
             "run_python",
@@ -2208,7 +2290,7 @@ class WeChatGuiRpaBot:
         action_repeat: dict[str, int] = {}
         total_actions = 0
         final_hint = ""
-        planner_send_reply = True
+        final_hint_terminal = False
         session_key = self._session_key_for_row(row)
         task_state = self._load_agent_task_state(session_key=session_key, title=row.title)
 
@@ -2260,14 +2342,6 @@ class WeChatGuiRpaBot:
                     if isinstance(plan, dict) and isinstance(plan.get("actions"), list)
                     else []
                 )
-                raw_send_reply = plan.get("send_reply", True) if isinstance(plan, dict) else True
-                if isinstance(raw_send_reply, bool):
-                    send_reply_now = raw_send_reply
-                elif isinstance(raw_send_reply, str):
-                    send_reply_now = raw_send_reply.strip().lower() not in {"0", "false", "no", "off"}
-                else:
-                    send_reply_now = bool(raw_send_reply)
-                planner_send_reply = send_reply_now
                 raw_hint = str(plan.get("reply_hint", "")).strip() if isinstance(plan, dict) else ""
                 planned_task = {}
                 if isinstance(plan, dict):
@@ -2279,10 +2353,9 @@ class WeChatGuiRpaBot:
                     reason=reason,
                     latest_message=latest_message or row.preview or row.text or "",
                 )
-                if send_reply_now and hint:
+                if hint:
                     final_hint = hint
-                elif not send_reply_now:
-                    final_hint = ""
+                    final_hint_terminal = not bool(planned_actions)
                 if self.cfg.log_verbose:
                     names = ",".join(
                         str(item.get("tool", "")).strip()
@@ -2300,7 +2373,6 @@ class WeChatGuiRpaBot:
                         )
                     elif raw_hint:
                         print("             hint=(dropped by normalize)")
-                    print(f"             send_reply={send_reply_now}")
 
                 filtered_actions: list[dict] = []
                 for action in planned_actions:
@@ -2408,7 +2480,7 @@ class WeChatGuiRpaBot:
                 "我这轮已经发起检索了，但接口超时/异常，没拿到可用结果。"
                 "我马上缩短关键词再重查一轮。"
             )
-        if total_actions > 0 and final_hint:
+        if total_actions > 0 and final_hint and not final_hint_terminal:
             final_hint = ""
         if has_lookup_observation and final_hint:
             final_hint = ""
@@ -2439,14 +2511,12 @@ class WeChatGuiRpaBot:
         if final_hint and not planned_reply:
             fallback = self.cfg.reply_on_mention if reason == "mention" else self.cfg.reply_on_new_message
             planned_reply = self._sanitize_generated_reply(final_hint, fallback=fallback)
-        if not planner_send_reply:
-            planned_reply = ""
         task_state = self._save_agent_task_state(
             session_key=session_key,
             title=row.title,
             task=task_state,
         )
-        return merged_memory, planned_reply, total_actions, planner_send_reply, task_state
+        return merged_memory, planned_reply, total_actions, True, task_state
 
     @staticmethod
     def _clean_web_query(query: str) -> str:
@@ -3262,7 +3332,14 @@ class WeChatGuiRpaBot:
         return False
 
     def _available_heartbeat_tools(self) -> list[str]:
-        return ["read_impression", "write_impression", "write_memory"]
+        return [
+            "read_memory",
+            "recall_memory",
+            "remember_fact",
+            "read_impression",
+            "update_impression",
+            "read_chat_history",
+        ]
 
     def _heartbeat_identity_text(self) -> str:
         paths = [Path("data/identity.md"), Path("data/config/IDENTITY.md")]
@@ -3308,7 +3385,69 @@ class WeChatGuiRpaBot:
                 lines.append(f"{ts_text} {who}: {text[:180]}")
         return "\n".join(lines)[:6000]
 
-    def _heartbeat_current_state(self, now: float) -> str:
+    def _heartbeat_recent_people(self, *, max_people: int = 4, per_chat_records: int = 20) -> list[str]:
+        candidates: list[tuple[int, str]] = []
+        skip_names = {
+            "",
+            "user",
+            "unknown",
+            "unknown user",
+            "sender",
+            "member",
+            "someone",
+            "other",
+            "self",
+            "assistant",
+            "system",
+            "系统",
+            "用户",
+            "未知",
+            "未知用户",
+            "群成员",
+            "其他人",
+            "大家",
+            "有人",
+            "萨比",
+            "sabi",
+        }
+        for sess in self._sessions.values():
+            history = [x for x in sess.history[-max(1, per_chat_records) :] if isinstance(x, dict)]
+            for record in history:
+                if str(record.get("role", "")).strip().lower() != "user":
+                    continue
+                text = re.sub(r"\s+", " ", str(record.get("text", "") or "")).strip()
+                if not text:
+                    continue
+                sender = re.sub(r"\s+", " ", str(record.get("sender", "") or "")).strip()
+                if not sender:
+                    sender = re.sub(r"\s+", " ", str(record.get("sender_raw", "") or "")).strip()
+                if not sender:
+                    continue
+                sender_key = sender.strip().lower()
+                if sender_key in skip_names or sender.startswith("群-") or sender.endswith("群"):
+                    continue
+                if re.fullmatch(r"[\d_ -]+", sender_key):
+                    continue
+                name = self._resolve_person_name(sender) or sender
+                name = re.sub(r"_[0-9a-f]{8}$", "", name).strip()[:40]
+                if not name or name.lower() in skip_names or name.startswith("群-"):
+                    continue
+                candidates.append((int(record.get("observed_at", 0) or 0), name))
+
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        people: list[str] = []
+        seen: set[str] = set()
+        for _, name in candidates:
+            key = re.sub(r"\s+", "", name).lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            people.append(name)
+            if len(people) >= max(1, max_people):
+                break
+        return people
+
+    def _heartbeat_current_state(self, now: float, *, target_people: list[str] | None = None) -> str:
         parts: list[str] = []
         core = self.agent_memory.read("core").strip()
         if core:
@@ -3325,6 +3464,13 @@ class WeChatGuiRpaBot:
                 "Use read_impression with a canonical Chinese name before updating an existing record.\n"
                 f"Available names: {', '.join(people_names[:120])}"
             )
+        targets = [str(x).strip() for x in (target_people or []) if str(x).strip()]
+        if targets:
+            parts.append(
+                "[heartbeat target people]\n"
+                "Short-term recent speakers selected by code. Read and update only these people unless recent chat clearly requires otherwise.\n"
+                + "\n".join(f"- {name}" for name in targets)
+            )
         recent = self._heartbeat_recent_chat_activity()
         if recent:
             parts.append(f"[recent chat activity]\n{recent}")
@@ -3332,32 +3478,76 @@ class WeChatGuiRpaBot:
         parts.append(f"[current_time]\n{now_text}")
         return "\n\n".join(parts)
 
-    def _heartbeat_prompt_text(self, now: float) -> str:
+    def _heartbeat_prompt_text(self, now: float, *, target_people: list[str] | None = None) -> str:
+        targets = [str(x).strip() for x in (target_people or []) if str(x).strip()]
+        target_text = ", ".join(targets) if targets else "none"
         return (
             f"[system]\n{self.cfg.llm_reply.system_prompt}\n\n"
             f"[identity]\n{self._heartbeat_identity_text()}\n\n"
-            f"[current state]\n{self._heartbeat_current_state(now)}\n\n"
+            f"[current state]\n{self._heartbeat_current_state(now, target_people=targets)}\n\n"
             f"[heartbeat instruction]\n{self.cfg.heartbeat_prompt}\n\n"
             "This is a scheduled self-reflection heartbeat. "
-            "Scan the [recent chat activity] section below. For EVERY person who appears there, "
-            "update or create their impression with new observations from today's conversations. "
-            "People impressions are not preloaded; use read_impression for relevant people before updating "
-            "an existing impression. Maintain memory only through write_memory name=core or name=timeline.\n\n"
-            "IMPORTANT write_memory rules:\n"
-            "- write_memory FULLY REPLACES either data/memory/core.md or data/memory/timeline.md\n"
-            "- name=core stores stable facts, preferences, self-improvement rules, and durable knowledge\n"
-            "- name=timeline stores dated events and recent activity, newest first when practical\n\n"
-            "IMPORTANT write_impression rules:\n"
-            "- write_impression FULLY REPLACES the entire impression for that person\n"
-            "- Use read_impression first when preserving an existing person record matters\n"
+            f"Target people selected from short-term recent speakers: {target_text}. "
+            "Focus on these target people only. "
+            "Use remember_fact for durable memory additions. "
+            "Use update_impression to append or merge observations about people; it preserves existing records. "
+            "Their existing impressions have already been read before this write phase when available. "
+            "Update up to 4 relevant people only when recent chat activity contains enough evidence.\n\n"
+            "IMPORTANT remember_fact rules:\n"
+            "- scope=core stores stable facts, user preferences, self-improvement rules, and durable knowledge\n"
+            "- scope=timeline stores dated events and recent activity\n"
+            "- Keep each fact short and evidence-based.\n\n"
+            "IMPORTANT update_impression rules:\n"
+            "- Add only observations grounded in recent chat activity or provided context\n"
+            "- Do not invent relationships, private facts, or motives\n"
             "- Use canonical Chinese name (NOT a file path)\n"
-            "- Recommended markdown structure:\n"
-            "  ## 基本特征\n  Personality, background, habits.\n"
-            "  ## 事件纪要\n  Key past interactions with approximate dates.\n"
-            "  ## 人物关系\n  Relationships to other known people.\n\n"
-            "Supported internal tools: read_impression, write_impression, write_memory. "
-            "If nothing needs maintenance, return no actions."
+            "Supported internal write-phase tools: remember_fact, update_impression. "
+            "If no target person has a meaningful new observation, return no actions."
         )
+
+    def _heartbeat_memory_prompt_text(
+        self,
+        now: float,
+        *,
+        recent_chat: str,
+    ) -> str:
+        now_text = datetime.fromtimestamp(now).strftime("%Y-%m-%d %H:%M:%S")
+        return (
+            f"[system]\n{self.cfg.llm_reply.system_prompt}\n\n"
+            f"[identity]\n{self._heartbeat_identity_text()}\n\n"
+            f"[current_time]\n{now_text}\n\n"
+            f"[short-term recent chat]\n{recent_chat or '无'}\n\n"
+            "[heartbeat phase]\n"
+            "Phase 1: memory maintenance. The previous read phase has already produced current memory observations, "
+            "and short-term recent chat is provided here. Your only job is to append durable memory if the read observations "
+            "and recent chat contain a meaningful stable fact, rule, user preference, or dated event. Use remember_fact only. "
+            "Before writing, compare against the read memory observations and avoid duplicate notes caused by repeated chat events. "
+            "Do not update person impressions in this phase. If nothing is worth remembering, return no actions."
+        )[:12000]
+
+    def _heartbeat_person_prompt_text(
+        self,
+        now: float,
+        *,
+        person: str,
+        recent_chat: str,
+        existing_impression: str,
+    ) -> str:
+        now_text = datetime.fromtimestamp(now).strftime("%Y-%m-%d %H:%M:%S")
+        return (
+            f"[system]\n{self.cfg.llm_reply.system_prompt}\n\n"
+            f"[identity]\n{self._heartbeat_identity_text()}\n\n"
+            f"[current_time]\n{now_text}\n\n"
+            f"[target person]\n{person}\n\n"
+            f"[existing impression for {person}]\n{existing_impression or '无'}\n\n"
+            f"[short-term recent chat]\n{recent_chat or '无'}\n\n"
+            "[heartbeat phase]\n"
+            f"Phase 2: person impression maintenance for exactly one target person: {person}. "
+            "The code selected this person from short-term recent speakers. The previous read phase has already produced their existing impression. "
+            "Your only job is to call update_impression for this exact person when recent chat contains a new, grounded, "
+            "useful observation about them. Do not update any other person. "
+            "Do not repeat facts already present in the existing impression. If there is no meaningful new observation, return no actions."
+        )[:12000]
 
     def _run_heartbeat(self, now: float, rows: list[ChatRowState]) -> bool:
         if not self.cfg.heartbeat_enabled:
@@ -3374,47 +3564,131 @@ class WeChatGuiRpaBot:
                     row = item
                     break
 
-        tools = self._available_heartbeat_tools()
-        if not tools:
-            return False
-
         is_admin = bool(self.cfg.admin_commands_enabled)
         action_limit = int(self.cfg.heartbeat_max_actions)
         if action_limit <= 0:
             action_limit = 4
-        action_limit = max(1, min(6, action_limit))
-        environment_context = self._heartbeat_prompt_text(now)[:12000]
-        memory_recall, _, action_count, _, task_state = self._run_agent_planner_loop(
+        action_limit = max(1, min(12, action_limit))
+
+        recent_chat = self._heartbeat_recent_chat_activity(max_chats=10, max_lines=80)
+        total_actions = 0
+        memory_actions = 0
+        person_write_actions = 0
+        person_read_actions = 0
+
+        memory_read_trace, memory_read_observations = self._execute_agent_actions(
+            row,
+            [{"tool": "read_memory", "args": {"name": "all"}, "reason": "记忆流程化读档"}],
+            is_admin=is_admin,
+            max_actions_override=1,
+        )
+        if memory_read_trace and self.cfg.log_verbose:
+            for ln in memory_read_trace.split("\n"):
+                if ln.strip():
+                    print(f"        {ln}")
+        memory_read_context = (
+            "[工具执行结果]\n"
+            "[memory read phase]\n"
+            f"{memory_read_observations or '记忆读取无内容'}\n\n"
+            "[short-term chat read phase]\n"
+            f"{recent_chat or '无'}"
+        )[:6000]
+
+        _, _, memory_actions, _, _ = self._run_agent_planner_loop(
             planner=self.llm_heartbeat,
             row=row,
             reason="heartbeat",
             is_group=False,
             is_admin=is_admin,
-            latest_message="Heartbeat tick. Reflect and maintain durable memory.",
-            chat_context=self._heartbeat_recent_chat_activity(max_chats=10, max_lines=80),
-            environment_context=environment_context,
+            latest_message="Heartbeat memory phase. Read current memory and short-term chat, then append durable memory if needed.",
+            chat_context=recent_chat,
+            environment_context=self._heartbeat_memory_prompt_text(
+                now,
+                recent_chat=recent_chat,
+            ),
             session_context="",
             workspace_context="",
-            memory_recall="",
-            tools=tools,
-            per_round_max_actions=action_limit,
-            max_rounds_override=2,
-            max_total_actions_override=action_limit,
+            memory_recall=memory_read_context,
+            tools=["remember_fact"],
+            per_round_max_actions=min(2, action_limit),
+            max_rounds_override=1,
+            max_total_actions_override=min(2, action_limit),
         )
-        if action_count <= 0 and not task_state:
+        total_actions += 1 + memory_actions
+
+        target_people = self._heartbeat_recent_people(max_people=4)
+        if target_people and self.cfg.log_verbose:
+            print(f"[heartbeat] selected people={', '.join(target_people)}")
+        for person in target_people[:4]:
+            read_trace, read_observations = self._execute_agent_actions(
+                row,
+                [{"tool": "read_impression", "args": {"name": person}, "reason": "人物印象流程化读档"}],
+                is_admin=is_admin,
+                max_actions_override=1,
+            )
+            person_read_actions += 1
+            total_actions += 1
+            if read_trace and self.cfg.log_verbose:
+                for ln in read_trace.split("\n"):
+                    if ln.strip():
+                        print(f"        {ln}")
+
+            _, _, update_count, _, _ = self._run_agent_planner_loop(
+                planner=self.llm_heartbeat,
+                row=row,
+                reason="heartbeat",
+                is_group=False,
+                is_admin=is_admin,
+                latest_message=f"Heartbeat person phase. Update impression for {person} only if needed.",
+                chat_context=recent_chat,
+                environment_context=self._heartbeat_person_prompt_text(
+                    now,
+                    person=person,
+                    recent_chat=recent_chat,
+                    existing_impression=self.agent_people.read(person).strip(),
+                ),
+                session_context="",
+                workspace_context="",
+                memory_recall=(
+                    f"[工具执行结果]\n[read impression for {person}]\n{read_observations}".strip()
+                    if read_observations
+                    else ""
+                ),
+                tools=["update_impression"],
+                per_round_max_actions=1,
+                max_rounds_override=1,
+                max_total_actions_override=1,
+            )
+            person_write_actions += update_count
+            total_actions += update_count
+
+        if total_actions <= 0:
             if self.cfg.log_verbose:
                 print("[heartbeat] no actions planned")
             return False
 
         print(
-            f"[heartbeat] ran actions={action_count:>2} "
-            f"title={self._fit_col(row.title, 14)}"
+            f"[heartbeat] ran actions={total_actions:>2} "
+            f"title={self._fit_col(row.title, 14)} "
+            f"memory_writes={memory_actions} person_reads={person_read_actions} "
+            f"person_writes={person_write_actions} people={','.join(target_people)}"
         )
         self._memory_dirty = True
         return True
 
     def _maybe_run_heartbeat(self, now: float, rows: list[ChatRowState]) -> bool:
-        return False
+        if not self.cfg.heartbeat_enabled:
+            return False
+        interval = float(self.cfg.heartbeat_interval_sec)
+        if interval <= 0:
+            return False
+        if self._last_heartbeat_at > 0 and now - self._last_heartbeat_at < interval:
+            return False
+        min_idle = float(self.cfg.heartbeat_min_idle_sec)
+        if min_idle > 0 and self._last_activity_at > 0 and now - self._last_activity_at < min_idle:
+            return False
+        self._last_heartbeat_at = now
+        return self._run_heartbeat(now, rows)
 
     def _is_ignored_title(self, row: ChatRowState) -> bool:
         return self._is_ignored_title_text(row.title)
@@ -3436,13 +3710,13 @@ class WeChatGuiRpaBot:
         return True
 
     def _should_use_llm_decision(self, is_group: bool) -> bool:
-        if not self.llm_heartbeat.is_enabled():
+        if not self.llm_decision.is_enabled():
             return False
-        if not self.cfg.llm.decision_enabled:
+        if not self.cfg.llm_decision.decision_enabled:
             return False
-        if is_group and self.cfg.llm.decision_on_group:
+        if is_group and self.cfg.llm_decision.decision_on_group:
             return True
-        if (not is_group) and self.cfg.llm.decision_on_private:
+        if (not is_group) and self.cfg.llm_decision.decision_on_private:
             return True
         return False
 
@@ -3474,7 +3748,7 @@ class WeChatGuiRpaBot:
         if not self._should_use_llm_decision(is_group):
             return True
         try:
-            should_reply, why = self.llm.should_reply(
+            should_reply, why = self.llm_decision.should_reply(
                 title=row.title,
                 preview=row.preview,
                 reason=reason,
@@ -4957,12 +5231,11 @@ class WeChatGuiRpaBot:
             self._save_persistent_memory()
             return
 
-        planner_send_reply = True
         planner_hint = ""
         if self.cfg.agent_actions_enabled:
             tools = self._available_agent_tools(is_admin=is_admin)
             if tools:
-                memory_recall, planner_hint, _, planner_send_reply, _ = self._run_agent_planner_loop(
+                memory_recall, planner_hint, _, _, _ = self._run_agent_planner_loop(
                     planner=self.llm_planner,
                     row=row,
                     reason=reason,
@@ -4982,11 +5255,6 @@ class WeChatGuiRpaBot:
                         f"[planner reply hint]\n{planner_hint}\n\n"
                         + memory_recall
                     )[:3600]
-        if not planner_send_reply:
-            if self.cfg.log_verbose:
-                print(f"[agent] detached planner requested hold-send title={title!r}")
-            self._save_persistent_memory()
-            return
 
         mention_reply_to = (
             (message.get("sender") or "").strip()
@@ -5064,6 +5332,7 @@ class WeChatGuiRpaBot:
         image_root = Path(self.cfg.detached_window_output_dir).expanduser()
         print("[start] WeChat detached-window receiver started")
         print(f"[start] receiver=detached_windows poll={self.cfg.poll_interval_sec:.1f}s dry_run={self.cfg.dry_run}")
+        print(f"[start] capture-backend={self.cfg.detached_window_capture_backend}")
         print(f"[start] image-dir={image_root}")
         print(f"[start] image-gen: {self._image_generation_status_text()}")
         print(f"[start] image-edit: {self._image_editing_status_text()}")
@@ -5077,8 +5346,12 @@ class WeChatGuiRpaBot:
                 print(f"[cycle] id={self._cycle:>4} detached_windows={len(windows)} {self._fit_col(names, max(24, self._term_width() - 34))}")
             any_new = False
             for window in windows:
+                image = None
                 try:
-                    image = capture_window_by_id(window.window_id)
+                    image = capture_window_by_id(
+                        window.window_id,
+                        backend=self.cfg.detached_window_capture_backend,
+                    )
                     title_slug = safe_window_name(window.title)
                     snapshot = self.visible_message_parser.parse(
                         image,
@@ -5094,6 +5367,11 @@ class WeChatGuiRpaBot:
                     snapshot.latest_message = snapshot.messages[-1] if snapshot.messages else None
                 except Exception as exc:
                     print(f"[warn] detached capture/parse failed title={window.title!r}: {exc}")
+                    if image is not None:
+                        try:
+                            image.close()
+                        except Exception:
+                            pass
                     continue
 
                 if self.cfg.detached_debug_save:
@@ -5104,6 +5382,11 @@ class WeChatGuiRpaBot:
                         json.dumps(snapshot.messages, ensure_ascii=False, indent=2),
                         encoding="utf-8",
                     )
+                if image is not None:
+                    try:
+                        image.close()
+                    except Exception:
+                        pass
 
                 row_for_merge = ChatRowState(
                     row_idx=int(window.window_id),
@@ -5161,7 +5444,7 @@ class WeChatGuiRpaBot:
                 if self._session_busy.get(window.window_id):
                     if self.cfg.log_verbose and messages_to_handle:
                         print(f"[queue] window={window.window_id} busy, {q.qsize()} queued")
-                if not self._session_busy.get(window.window_id):
+                if not self._session_busy.get(window.window_id) and not q.empty():
                     self._session_busy[window.window_id] = True
                     self._msg_executor.submit(
                         self._process_session_queue, window.window_id
@@ -5174,6 +5457,7 @@ class WeChatGuiRpaBot:
             else:
                 self._maybe_run_heartbeat(now, [])
             self._save_persistent_memory()
+            self._maybe_run_memory_maintenance(time.time())
             time.sleep(max(0.2, float(self.cfg.poll_interval_sec)))
 
     def _detect_active_chat_title(
@@ -5769,6 +6053,7 @@ class WeChatGuiRpaBot:
                 bounds = get_front_window_bounds(self.cfg.app_name)
             except WindowNotFoundError as exc:
                 print(f"[warn] {exc}")
+                self._maybe_run_memory_maintenance(time.time())
                 time.sleep(self.cfg.poll_interval_sec)
                 continue
 
@@ -5787,6 +6072,7 @@ class WeChatGuiRpaBot:
             self._log_cycle_snapshot(detected.rows, now)
             if not self._baseline:
                 self._set_baseline(detected.rows, now)
+                self._maybe_run_memory_maintenance(time.time())
                 time.sleep(self.cfg.poll_interval_sec)
                 continue
 
@@ -5808,4 +6094,5 @@ class WeChatGuiRpaBot:
                 self._maybe_run_heartbeat(now, detected.rows)
                 self._save_persistent_memory()
 
+            self._maybe_run_memory_maintenance(time.time())
             time.sleep(self.cfg.poll_interval_sec)

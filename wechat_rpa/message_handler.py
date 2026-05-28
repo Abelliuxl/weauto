@@ -273,11 +273,10 @@ class MessageHandler:
 
         while sent_in_event < reply_budget:
             planner_hint = ""
-            planner_send_reply = True
             if bot.cfg.agent_actions_enabled:
                 tools = bot._available_agent_tools(is_admin=is_admin)
                 if tools:
-                    memory_recall, planner_hint, _, planner_send_reply, _ = bot._run_agent_planner_loop(
+                    memory_recall, planner_hint, _, _, _ = bot._run_agent_planner_loop(
                         planner=bot.llm_planner,
                         row=row,
                         reason=follow_reason,
@@ -302,25 +301,10 @@ class MessageHandler:
                             f"[agent] planner hint injected row={row.row_idx:>2} "
                             f"hint={bot._fit_col(planner_hint, max(24, bot._term_width() - 45))}"
                         )
-                if not planner_send_reply:
-                    if sent_in_event == 0:
-                        if bot.cfg.log_verbose:
-                            print(
-                                f"[agent] planner requested hold-send row={row.row_idx:>2} "
-                                f"title={bot._fit_col(row.title, 14)}"
-                            )
-                        self._mark_event_done(row, now)
-                        bot._save_persistent_memory()
-                    elif bot.cfg.log_verbose:
-                        print(
-                            f"[agent] planner stop after sent={sent_in_event} "
-                            f"row={row.row_idx:>2}"
-                        )
-                    break
                 if sent_in_event > 0:
                     if bot.cfg.log_verbose:
                         print(
-                            f"[agent] stop follow-up (planner direct reply disabled) "
+                            f"[agent] stop follow-up after first reply "
                             f"row={row.row_idx:>2} sent={sent_in_event}"
                         )
                     break

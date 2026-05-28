@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 import shutil
 import time
+import urllib.parse
 from typing import TYPE_CHECKING
 
 from .python_sandbox import run_python_calculation
@@ -10,6 +11,45 @@ from .python_sandbox import run_python_calculation
 if TYPE_CHECKING:
     from .bot import WeChatGuiRpaBot
     from .detector import ChatRowState
+
+
+def _url_host_matches(url: str, domain: str) -> bool:
+    host = (urllib.parse.urlparse(str(url or "")).hostname or "").lower().rstrip(".")
+    clean_domain = domain.lower().strip().rstrip(".")
+    return bool(host and clean_domain and (host == clean_domain or host.endswith(f".{clean_domain}")))
+
+
+def _compact_note(raw: object, *, limit: int = 1200) -> str:
+    return re.sub(r"\s+", " ", str(raw or "")).strip()[:limit]
+
+
+def _append_unique_note(existing: str, *, heading: str, bullet: str) -> tuple[str, bool]:
+    clean_bullet = bullet.strip()
+    if not clean_bullet:
+        return existing.rstrip() + ("\n" if existing.strip() else ""), False
+    normalized_existing = re.sub(r"\s+", " ", existing or "").strip()
+    normalized_note = re.sub(r"\s+", " ", clean_bullet.lstrip("- ").strip())
+    if normalized_note and normalized_note in normalized_existing:
+        return existing.rstrip() + ("\n" if existing.strip() else ""), False
+    body = (existing or "").rstrip()
+    if body:
+        body += "\n\n"
+    body += f"{heading}\n{clean_bullet}\n"
+    return body, True
+
+
+def _memory_snippets(*, label: str, content: str, query_terms: list[str], limit: int) -> list[str]:
+    rows: list[str] = []
+    for raw_line in (content or "").splitlines():
+        line = re.sub(r"\s+", " ", raw_line).strip()
+        if not line:
+            continue
+        hay = line.lower()
+        if not query_terms or any(term in hay for term in query_terms):
+            rows.append(f"[{label}] {line[:220]}")
+        if len(rows) >= limit:
+            break
+    return rows
 
 
 class ActionProcessor:
@@ -61,7 +101,79 @@ class ActionProcessor:
                     f"args={bot._fit_col(arg_preview, max(20, bot._term_width() - 60))}"
                 )
             try:
-                if tool == "write_memory":
+                if tool == "read_memory":
+                    raw_name = str(args.get("name", "") or args.get("scope", "") or "all").strip().lower()
+                    names = ["core", "timeline"] if raw_name in {"", "all", "*"} else [bot.agent_memory.normalize_name(raw_name)]
+                    parts: list[str] = []
+                    for name in names:
+                        content = bot.agent_memory.read(name).strip()
+                        parts.append(f"记忆[{name}]:\n{content[:2000] if content else '无'}")
+                    status = "ok"
+                    obs = "\n\n".join(parts)[:2600]
+                    ok = True
+                elif tool == "recall_memory":
+                    query = _compact_note(args.get("query", "") or args.get("text", ""), limit=80)
+                    limit_raw = args.get("limit", 6)
+                    try:
+                        limit = int(limit_raw)
+                    except Exception:
+                        limit = 6
+                    limit = max(1, min(10, limit))
+                    if not query:
+                        status = "skip (empty query)"
+                    else:
+                        terms = [
+                            term.lower()
+                            for term in re.findall(r"[A-Za-z0-9_]+|[\u4e00-\u9fff]{1,4}", query)
+                            if len(term.strip()) >= 2
+                        ][:8]
+                        rows: list[str] = []
+                        rows.extend(_memory_snippets(label="core", content=bot.agent_memory.read("core"), query_terms=terms, limit=limit))
+                        if len(rows) < limit:
+                            rows.extend(_memory_snippets(label="timeline", content=bot.agent_memory.read("timeline"), query_terms=terms, limit=limit - len(rows)))
+                        if len(rows) < limit:
+                            for person in bot.agent_people.list():
+                                if len(rows) >= limit:
+                                    break
+                                content = bot.agent_people.read(person)
+                                snippets = _memory_snippets(
+                                    label=f"people/{person}",
+                                    content=content,
+                                    query_terms=terms,
+                                    limit=limit - len(rows),
+                                )
+                                if snippets or any(term in person.lower() for term in terms):
+                                    rows.extend(snippets or [f"[people/{person}] {content.strip()[:220] or '空记录'}"])
+                        status = "ok" if rows else "ok (no-hit)"
+                        obs = "记忆检索结果:\n" + ("\n".join(rows) if rows else "无")
+                        ok = True
+                elif tool == "remember_fact":
+                    raw_scope = str(args.get("scope", "") or args.get("name", "") or "core").strip().lower()
+                    name = "timeline" if raw_scope in {"timeline", "time", "history", "events"} else "core"
+                    content = _compact_note(args.get("content", "") or args.get("fact", "") or args.get("text", ""), limit=1200)
+                    source = _compact_note(args.get("source", ""), limit=80)
+                    if not content:
+                        status = "skip (empty content)"
+                    else:
+                        bot.agent_memory.backup(name)
+                        existing = bot.agent_memory.read(name)
+                        date = time.strftime("%Y-%m-%d")
+                        if name == "timeline":
+                            note = f"- {date}: {content}"
+                        else:
+                            note = f"- {content}"
+                        if source:
+                            note += f"（来源：{source}）"
+                        merged, changed = _append_unique_note(existing, heading="## 追加记忆", bullet=note)
+                        if changed:
+                            bot.agent_memory.write(name, merged)
+                            status = "ok"
+                            obs = f"记忆已追加 data/memory/{name}.md: {content[:120]}"
+                        else:
+                            status = "ok (duplicate)"
+                            obs = f"记忆已存在 data/memory/{name}.md: {content[:120]}"
+                        ok = True
+                elif tool == "write_memory":
                     name = bot.agent_memory.normalize_name(str(args.get("name", "core")))
                     content = str(args.get("content", "") or args.get("text", "")).strip()
                     if not content:
@@ -80,6 +192,7 @@ class ActionProcessor:
                     elif not content:
                         status = "skip (empty content)"
                     else:
+                        bot.agent_skills.backup(name)
                         bot.agent_skills.write(name, content.rstrip() + "\n")
                         status = "ok"
                         obs = f"技能已写入 data/skills/{name}/SKILL.md ({len(content)} chars)"
@@ -104,6 +217,41 @@ class ActionProcessor:
                         obs = f"技能列表 ({len(metas)} 个):\n" + "\n".join(lines)
                         status = "ok"
                         ok = True
+                elif tool == "read_skill":
+                    name = bot.agent_skills.normalize_name(str(args.get("name", "") or args.get("skill", "")))
+                    if not name:
+                        status = "skip (empty name)"
+                    else:
+                        content = bot.agent_skills.read(name).strip()
+                        status = "ok" if content else "ok (no-hit)"
+                        obs = f"技能[{name}]:\n{content[:5000] if content else '无'}"
+                        ok = True
+                elif tool == "update_skill":
+                    name = bot.agent_skills.normalize_name(str(args.get("name", "") or args.get("skill", "")))
+                    note = _compact_note(
+                        args.get("note", "") or args.get("content", "") or args.get("text", ""),
+                        limit=1800,
+                    )
+                    source = _compact_note(args.get("source", ""), limit=80)
+                    if not name:
+                        status = "skip (empty name)"
+                    elif not note:
+                        status = "skip (empty content)"
+                    else:
+                        existing = bot.agent_skills.read(name)
+                        bullet = f"- {note}"
+                        if source:
+                            bullet += f"（来源：{source}）"
+                        merged, changed = _append_unique_note(existing, heading="## 追加维护", bullet=bullet)
+                        if changed:
+                            bot.agent_skills.backup(name)
+                            bot.agent_skills.write(name, merged)
+                            status = "ok"
+                            obs = f"技能已追加 data/skills/{name}/SKILL.md: {note[:120]}"
+                        else:
+                            status = "ok (duplicate)"
+                            obs = f"技能内容已存在 data/skills/{name}/SKILL.md: {note[:120]}"
+                        ok = True
                 elif tool == "delete_skill":
                     name = bot.agent_skills.normalize_name(str(args.get("name", "") or args.get("skill", "")))
                     if not name:
@@ -126,6 +274,31 @@ class ActionProcessor:
                             if content
                             else f"人物印象[{name}]不存在"
                         )
+                        ok = True
+                elif tool == "update_impression":
+                    name = re.sub(r"_[0-9a-f]{8}$", "", str(args.get("name", "")).strip())
+                    name = bot._resolve_person_name(name) or name
+                    note = _compact_note(args.get("note", "") or args.get("content", "") or args.get("text", ""), limit=1200)
+                    source = _compact_note(args.get("source", ""), limit=80)
+                    if not name:
+                        status = "skip (empty name)"
+                    elif not note:
+                        status = "skip (empty note)"
+                    else:
+                        existing = bot.agent_people.read(name).strip()
+                        date = time.strftime("%Y-%m-%d")
+                        bullet = f"- {date}: {note}"
+                        if source:
+                            bullet += f"（来源：{source}）"
+                        base = existing or f"# {name}\n"
+                        merged, changed = _append_unique_note(base, heading="## 补充观察", bullet=bullet)
+                        if changed:
+                            bot.agent_people.write(name, merged)
+                            status = "ok"
+                            obs = f"人物印象已更新 data/people/{name}.md: {note[:120]}"
+                        else:
+                            status = "ok (duplicate)"
+                            obs = f"人物印象已存在 data/people/{name}.md: {note[:120]}"
                         ok = True
                 elif tool == "write_impression":
                     name = re.sub(r"_[0-9a-f]{8}$", "", str(args.get("name", "")).strip())
@@ -242,10 +415,23 @@ class ActionProcessor:
                     )
                     if not url:
                         status = "skip (empty url)"
+                    elif _url_host_matches(url, "wowhead.com"):
+                        text = bot._browse_url(url, max_chars=10000, use_proxy=use_proxy)
+                        status = "ok (auto browse_url)" if text else "ok (empty; auto browse_url)"
+                        obs = f"网页浏览[{url}](fetch_url自动改用browse_url):\n{text or '无内容'}"[:1800]
+                        ok = True
                     else:
-                        text = bot._fetch_url(url, max_chars=6000, use_proxy=use_proxy)
-                        status = "ok" if text else "ok (empty)"
-                        obs = f"网页抓取[{url}]:\n{text or '无内容'}"[:1800]
+                        try:
+                            text = bot._fetch_url(url, max_chars=6000, use_proxy=use_proxy)
+                            status = "ok" if text else "ok (empty)"
+                            obs = f"网页抓取[{url}]:\n{text or '无内容'}"[:1800]
+                        except Exception as exc:
+                            err_text = str(exc)
+                            if "403" not in err_text:
+                                raise
+                            text = bot._browse_url(url, max_chars=10000, use_proxy=use_proxy)
+                            status = "ok (403 fallback browse_url)" if text else "ok (empty; 403 fallback browse_url)"
+                            obs = f"网页浏览[{url}](fetch_url 403 后自动改用 browse_url):\n{text or '无内容'}"[:1800]
                         ok = True
                 elif tool == "browse_url":
                     url = re.sub(r"\s+", "", str(args.get("url", "")).strip())[:1000]
@@ -363,9 +549,24 @@ class ActionProcessor:
                 elif tool == "write_memory":
                     name = re.sub(r"\s+", " ", str(args.get("name", "")).strip())[:40]
                     obs = f"记忆写入[{name}]失败: {err}"
+                elif tool == "read_memory":
+                    name = re.sub(r"\s+", " ", str(args.get("name", "")).strip())[:40]
+                    obs = f"记忆读取[{name or 'all'}]失败: {err}"
+                elif tool == "remember_fact":
+                    name = re.sub(r"\s+", " ", str(args.get("scope", "")).strip())[:40]
+                    obs = f"记忆追加[{name or 'core'}]失败: {err}"
+                elif tool == "recall_memory":
+                    query = re.sub(r"\s+", " ", str(args.get("query", "")).strip())[:80]
+                    obs = f"记忆检索[{query}]失败: {err}"
                 elif tool == "write_skill":
                     name = re.sub(r"\s+", " ", str(args.get("name", "")).strip())[:80]
                     obs = f"技能写入[{name}]失败: {err}"
+                elif tool == "read_skill":
+                    name = re.sub(r"\s+", " ", str(args.get("name", "")).strip())[:80]
+                    obs = f"技能读取[{name}]失败: {err}"
+                elif tool == "update_skill":
+                    name = re.sub(r"\s+", " ", str(args.get("name", "")).strip())[:80]
+                    obs = f"技能更新[{name}]失败: {err}"
                 elif tool == "list_skills":
                     obs = f"技能列表获取失败: {err}"
                 elif tool == "delete_skill":
@@ -374,6 +575,9 @@ class ActionProcessor:
                 elif tool == "read_impression":
                     name = re.sub(r"\s+", " ", str(args.get("name", "")).strip())[:40]
                     obs = f"人物印象读取[{name}]失败: {err}"
+                elif tool == "update_impression":
+                    name = re.sub(r"\s+", " ", str(args.get("name", "")).strip())[:40]
+                    obs = f"人物印象更新[{name}]失败: {err}"
                 elif tool == "write_impression":
                     name = re.sub(r"\s+", " ", str(args.get("name", "")).strip())[:40]
                     obs = f"人物印象写入[{name}]失败: {err}"
@@ -406,8 +610,22 @@ class ActionProcessor:
             if obs:
                 observations.append(obs)
             heartbeat_internal_tool = (
-                row.title == "__heartbeat__"
-                and tool in {"read_impression", "write_impression", "write_memory", "write_skill", "delete_skill", "list_skills"}
+                (row.row_idx < 0 or row.title == "__heartbeat__")
+                and tool in {
+                    "read_memory",
+                    "recall_memory",
+                    "remember_fact",
+                    "read_impression",
+                    "update_impression",
+                    "write_impression",
+                    "write_memory",
+                    "read_skill",
+                    "update_skill",
+                    "write_skill",
+                    "delete_skill",
+                    "list_skills",
+                    "read_chat_history",
+                }
             )
             if ok and not heartbeat_internal_tool:
                 bot._append_session_record(

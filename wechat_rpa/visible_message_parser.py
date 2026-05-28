@@ -184,8 +184,13 @@ class VisibleMessageParser:
         if isinstance(image, np.ndarray):
             if image.ndim == 2:
                 return cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
-            return image
-        return cv2.cvtColor(np.array(image.convert("RGB")), cv2.COLOR_RGB2BGR)
+            return image.copy()
+        rgb_image = image.convert("RGB")
+        try:
+            rgb = np.array(rgb_image, dtype=np.uint8, copy=True)
+        finally:
+            rgb_image.close()
+        return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
 
     @staticmethod
     def _chat_body_bounds(height: int) -> tuple[int, int]:
@@ -407,5 +412,9 @@ class VisibleMessageParser:
         crop = img_bgr[max(0, y1) : min(img_bgr.shape[0], y2), max(0, x1) : min(img_bgr.shape[1], x2)]
         path = output_dir / f"{image_hash}.png"
         if crop.size > 0:
-            Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)).save(path)
+            out = Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
+            try:
+                out.save(path)
+            finally:
+                out.close()
         return path

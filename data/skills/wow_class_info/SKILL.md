@@ -9,7 +9,8 @@
 ### 一级来源（官方/权威报道）
 
 1. **wowhead.com**
-   - 使用 fetch_url 或 browse_url，proxy=true
+   - 直接使用 browse_url，proxy=true（Playwright/Chromium 渲染）
+   - 不要先用 fetch_url 抓 wowhead：首页和新闻页正文抓取容易被 CloudFront 返回 403
    - 首页/分类页通常有 Latest News / PTR 板块
    - 搜索建议：site:wowhead.com + 职业名 + 版本号 + 改动/nerf/buff
    - wowhead 会汇总蓝贴内容并附分析和数据挖掘
@@ -42,4 +43,5 @@
 - 一级来源（wowhead + 蓝贴追踪器）没找到的内容，大概率不是官方正式改动，只是 PTR 测试的临时状态
 - 二级来源的内容是玩家主观判断，不是官方蓝贴改动，回复时必须注明"这是玩家测试反馈/论坛讨论，并非官方蓝贴"
 - 如果检索了以上所有来源仍无结果，如实告知用户"目前没有找到相关官方改动信息"
-- 每次查询尽量先用 fetch_url 抓 wowhead 首页或蓝贴页面，如果返回不完整再换 browse_url
+- 查询 wowhead 时直接用 browse_url；如果 browse_url 失败，再改用 search_web/search_web_brave 搜索 `site:wowhead.com` 的具体文章
+- 查询暴雪官方新闻页/论坛蓝贴时优先 browse_url；若 fetch_url 已经明确成功，可使用 fetch_url 的结果

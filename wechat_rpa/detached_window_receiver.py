@@ -4,6 +4,8 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 import re
+import subprocess
+import tempfile
 
 import Quartz
 from PIL import Image
@@ -39,10 +41,11 @@ def _cgimage_to_pil(cg_image) -> Image.Image:
     bytes_per_row = int(Quartz.CGImageGetBytesPerRow(cg_image))
     provider = Quartz.CGImageGetDataProvider(cg_image)
     data = Quartz.CGDataProviderCopyData(provider)
+    raw = bytes(data)
     return Image.frombytes(
         "RGBA",
         (width, height),
-        bytes(data),
+        raw,
         "raw",
         "BGRA",
         bytes_per_row,
@@ -95,7 +98,7 @@ def list_detached_wechat_windows(app_name: str = "WeChat") -> list[DetachedWindo
     return windows
 
 
-def capture_window_by_id(window_id: int) -> Image.Image:
+def _capture_window_by_id_quartz(window_id: int) -> Image.Image:
     with _autorelease_pool():
         cg_img = Quartz.CGWindowListCreateImage(
             Quartz.CGRectNull,
@@ -106,6 +109,37 @@ def capture_window_by_id(window_id: int) -> Image.Image:
         if cg_img is None:
             raise RuntimeError(f"window capture failed: window_id={window_id}")
         return _cgimage_to_pil(cg_img)
+
+
+def _capture_window_by_id_screencapture(window_id: int) -> Image.Image:
+    # macOS screencapture treats "-" as a literal filename for window captures
+    # on some versions, so capture to an explicit temporary PNG.
+    with tempfile.TemporaryDirectory(prefix="weauto-window-") as tmp_dir:
+        tmp_path = Path(tmp_dir) / "window.png"
+        result = subprocess.run(
+            ["screencapture", "-l", str(window_id), "-x", str(tmp_path)],
+            capture_output=True,
+            timeout=15,
+        )
+        if result.returncode != 0:
+            stderr = result.stderr.decode("utf-8", errors="replace").strip()
+            detail = f": {stderr}" if stderr else ""
+            raise RuntimeError(
+                f"window capture failed: window_id={window_id} "
+                f"(exit={result.returncode}){detail}"
+            )
+        try:
+            with Image.open(tmp_path) as image:
+                return image.copy()
+        except Exception as exc:
+            raise RuntimeError(f"window capture produced invalid image: window_id={window_id}") from exc
+
+
+def capture_window_by_id(window_id: int, *, backend: str = "screencapture") -> Image.Image:
+    clean_backend = str(backend or "").strip().lower()
+    if clean_backend == "quartz":
+        return _capture_window_by_id_quartz(window_id)
+    return _capture_window_by_id_screencapture(window_id)
 
 
 def safe_window_name(text: str) -> str:

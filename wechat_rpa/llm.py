@@ -2201,9 +2201,12 @@ class LlmReplyGenerator:
         allow_no_reply_signal: bool = True,
     ) -> str:
         avoid_replies = avoid_replies or []
-        has_web_search_observation = (
+        has_web_observation = (
             ("[工具执行结果]" in (memory_recall or ""))
-            and ("网页检索[" in (memory_recall or ""))
+            and any(
+                marker in (memory_recall or "")
+                for marker in ("网页检索[", "网页浏览[", "网页抓取[", "网页读取[")
+            )
         )
         avoid_txt = ""
         if avoid_replies:
@@ -2214,9 +2217,11 @@ class LlmReplyGenerator:
                     "\n请避免与下列你最近回复重复（措辞和语义都要明显不同）：\n- "
                     + "\n- ".join(clipped)
                 )
-        if has_web_search_observation:
+        if has_web_observation:
             source_guard = (
-                "\n当前存在网页检索结果。你可以基于[工具执行结果]中的网页检索内容回答，"
+                "\n当前存在网页访问/检索工具结果。必须优先依据[工具执行结果]回答；"
+                "如果工具结果与聊天历史冲突，以最新工具结果为准。"
+                "网页浏览/网页抓取返回正文内容表示访问成功，禁止沿用历史里的 403 失败结论。"
                 "但不要编造不存在的官网、公告、链接、时间或搜索过程。"
             )
         else:
@@ -2280,6 +2285,29 @@ class LlmReplyGenerator:
     @staticmethod
     def _agent_tool_specs_for_names(tool_names: list[str]) -> list[dict]:
         specs: dict[str, dict] = {
+            "read_memory": {
+                "description": "Read current core/timeline memory markdown. Use this before careful memory edits.",
+                "properties": {
+                    "name": {"type": "string", "enum": ["core", "timeline", "all"], "description": "Memory file to read."},
+                },
+            },
+            "recall_memory": {
+                "description": "Search durable memory, timeline, and person impressions for relevant snippets.",
+                "properties": {
+                    "query": {"type": "string", "description": "What to recall, <=80 chars."},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 10},
+                },
+                "required": ["query"],
+            },
+            "remember_fact": {
+                "description": "Append a short durable memory fact without replacing the whole memory file.",
+                "properties": {
+                    "scope": {"type": "string", "enum": ["core", "timeline"], "description": "core for stable facts/rules, timeline for dated events."},
+                    "content": {"type": "string", "description": "Short evidence-based fact to remember."},
+                    "source": {"type": "string", "description": "Optional source note, e.g. current chat."},
+                },
+                "required": ["content"],
+            },
             "write_memory": {
                 "description": "Replace core or timeline memory markdown.",
                 "properties": {
@@ -2292,6 +2320,11 @@ class LlmReplyGenerator:
                 "description": "List all available skill names, summaries and keywords from data/skills/. No arguments needed.",
                 "properties": {},
             },
+            "read_skill": {
+                "description": "Read one complete skill file from data/skills/<name>/SKILL.md before careful edits.",
+                "properties": {"name": {"type": "string", "description": "Skill directory name."}},
+                "required": ["name"],
+            },
             "write_skill": {
                 "description": "Save a reusable local strategy/procedure into data/skills/<name>/SKILL.md.",
                 "properties": {
@@ -2299,6 +2332,15 @@ class LlmReplyGenerator:
                     "content": {"type": "string", "description": "Complete SKILL.md content."},
                 },
                 "required": ["name", "content"],
+            },
+            "update_skill": {
+                "description": "Append a small rule or maintenance note to one skill while preserving existing content.",
+                "properties": {
+                    "name": {"type": "string", "description": "Skill directory name."},
+                    "note": {"type": "string", "description": "Short grounded rule or update to append."},
+                    "source": {"type": "string", "description": "Optional source note, e.g. current chat."},
+                },
+                "required": ["name", "note"],
             },
             "delete_skill": {
                 "description": "Delete an obsolete saved skill from data/skills.",
@@ -2338,6 +2380,15 @@ class LlmReplyGenerator:
                 },
                 "required": ["name", "content"],
             },
+            "update_impression": {
+                "description": "Append or merge a grounded observation into one person's impression while preserving existing content.",
+                "properties": {
+                    "name": {"type": "string", "description": "Canonical Chinese name."},
+                    "note": {"type": "string", "description": "Short observation grounded in chat/context."},
+                    "source": {"type": "string", "description": "Optional source note, e.g. chat title or date."},
+                },
+                "required": ["name", "note"],
+            },
             "web_search": {
                 "description": "Search public web pages with the configured provider.",
                 "properties": {"query": {"type": "string", "description": "Search query, <=80 chars."}},
@@ -2370,7 +2421,7 @@ class LlmReplyGenerator:
                 "required": ["query"],
             },
             "fetch_url": {
-                "description": "Fetch raw HTML/text from a URL and return readable text.",
+                "description": "Fetch raw HTML/text from a URL and return readable text. Do not use for Wowhead; use browse_url.",
                 "properties": {
                     "url": {"type": "string", "description": "HTTP/HTTPS URL."},
                     "proxy": {"type": "boolean", "description": "Use system proxy env if true; disable env proxy if false."},
@@ -2378,7 +2429,7 @@ class LlmReplyGenerator:
                 "required": ["url"],
             },
             "browse_url": {
-                "description": "Fetch a rendered page with Playwright when available, falling back to fetch_url.",
+                "description": "Fetch a rendered page with Playwright when available. Use for Wowhead and other anti-bot/rendered pages.",
                 "properties": {
                     "url": {"type": "string", "description": "HTTP/HTTPS URL."},
                     "proxy": {"type": "boolean", "description": "Use system proxy env if true; disable env proxy if false."},
@@ -2530,16 +2581,31 @@ class LlmReplyGenerator:
 
         tool_specs = {
             "list_skills": "args={} 列出 data/skills/ 下所有已注册技能的名称和摘要",
+            "read_skill": "args={\"name\":\"技能名\"} 读取 data/skills/<name>/SKILL.md 完整内容；谨慎修改前先读",
+            "read_memory": "args={\"name\":\"core|timeline|all\"} 读取当前长期记忆；谨慎改记忆前先读",
+            "recall_memory": "args={\"query\":\"<=80字\",\"limit\":1-10} 检索 core/timeline/人物印象中的相关片段",
+            "remember_fact": (
+                "args={\"scope\":\"core|timeline\",\"content\":\"短事实\",\"source\":\"可选来源\"} "
+                "追加一条长期记忆，不替换整个文件"
+            ),
             "write_memory": (
                 "args={\"name\":\"core|timeline\",\"content\":\"完整 markdown\"} "
-                "完整替换 data/memory/core.md 或 timeline.md"
+                "完整替换 data/memory/core.md 或 timeline.md；仅在明确需要重写整份记忆时使用"
+            ),
+            "update_skill": (
+                "args={\"name\":\"技能名\",\"note\":\"短规则/维护说明\",\"source\":\"可选来源\"} "
+                "追加维护 data/skills/<name>/SKILL.md，保留原内容"
             ),
             "write_skill": (
                 "args={\"name\":\"技能名\",\"content\":\"完整 SKILL.md\"} "
-                "写入 data/skills/<name>/SKILL.md"
+                "完整写入 data/skills/<name>/SKILL.md；仅在明确需要重写整份 skill 时使用"
             ),
             "delete_skill": "args={\"name\":\"技能名\"} 删除 data/skills/<name>",
             "read_impression": "args={\"name\":\"规范中文名\"} 读取 data/people/<name>.md 人物印象",
+            "update_impression": (
+                "args={\"name\":\"规范中文名\",\"note\":\"短观察\",\"source\":\"可选来源\"} "
+                "追加/合并人物印象，保留原内容"
+            ),
             "read_chat_history": (
                 "args={\"chat_title\":\"可选，不填为当前会话\",\"limit\":1-100} "
                 "读取最近聊天记录"
@@ -2551,15 +2617,15 @@ class LlmReplyGenerator:
             ),
             "write_impression": (
                 "args={\"name\":\"规范中文名\",\"content\":\"完整 markdown\"} "
-                "完整替换 data/people/<name>.md"
+                "完整替换 data/people/<name>.md；仅在明确需要重写整份人物印象时使用"
             ),
             "web_search": "args={\"query\":\"<=80字\"} 联网检索公开网页信息（provider 可配置）",
             "search_web": "args={\"query\":\"<=80字\"} Tavily 联网检索",
             "search_web_brave": "args={\"query\":\"<=80字\"} Brave 联网检索",
             "web_search_volc": "args={\"query\":\"<=80字\"} 联网检索（火山方舟内置搜索，单次可信模式）",
             "search_web_volc": "args={\"query\":\"<=80字\"} 联网检索（火山方舟内置搜索，单次可信模式）",
-            "fetch_url": "args={\"url\":\"http(s)://...\"} 抓取静态网页/文本内容",
-            "browse_url": "args={\"url\":\"http(s)://...\"} 读取渲染后页面文本，失败时可降级抓取",
+            "fetch_url": "args={\"url\":\"http(s)://...\"} 抓取静态网页/文本内容；Wowhead 不要用此工具",
+            "browse_url": "args={\"url\":\"http(s)://...\"} 读取渲染后页面文本；Wowhead 优先用此工具",
             "build_wow_character_url": (
                 "args={\"character\":\"角色名\",\"server\":\"服务器\"} 或 "
                 "{\"player\":\"玩家/别名\",\"class_name\":\"职业\"} 构建国服魔兽角色主页链接"
@@ -2587,7 +2653,7 @@ class LlmReplyGenerator:
             "如果接口没有工具调用能力，才严格输出一个 JSON 对象，不要输出 markdown、解释或前缀。"
             "JSON 中所有字符串值内的双引号必须转义为 \\\"，例如 content 字段中有中文引号时用 \\\"魔法少女\\\"。"
             "输出格式必须是："
-            '{"actions":[{"tool":"...","args":{},"reason":"<=40字"}],"reply_hint":"<=120字","send_reply":true|false,"task":{"status":"idle|running|blocked|waiting_user|done","goal":"<=120字","plan":"<=200字","next_step":"<=120字","blocked_reason":"<=120字","continue_on_heartbeat":true|false}}。'
+            '{"actions":[{"tool":"...","args":{},"reason":"<=40字"}],"reply_hint":"<=120字","task":{"status":"idle|running|blocked|waiting_user|done","goal":"<=120字","plan":"<=200字","next_step":"<=120字","blocked_reason":"<=120字","continue_on_heartbeat":true|false}}。'
             "如果不需要动作，actions 返回空数组。reply_hint 可空串。"
             "task 字段必须始终给出；若没有持续任务，status=idle。"
             "若输入中已包含工具观察结果，可继续规划下一步动作；"
@@ -2617,25 +2683,27 @@ class LlmReplyGenerator:
             + "4) reply_hint 必须是可直接发送给对方的中文短句；不能写策略说明、语气说明、风格说明，"
             + "不能写类似“顺着这个话题调侃”“用轻松语气回一句”“符合群聊氛围”这样的元提示。\n"
             + "5) reply_hint 不能索要红包/稿费/转账，不能以先给条件为前提拒绝回答。\n"
-            + "6) 如果已有检索结果仍不足，请换关键词继续检索，不要机械重复同一参数。\n"
-            + "7) 若选择 web_search_volc/search_web_volc，本轮只保留它一个检索动作，不要再同时规划 web_search/search_web。\n"
-            + "8) 若工具观察中已有网页检索结果（web_search/search_web/search_web_brave/web_search_volc/search_web_volc），默认直接信任该结果；"
+            + "6) 记忆、人物印象、技能维护优先使用 remember_fact、recall_memory、update_impression、read_skill、update_skill；不要为了追加一条信息就用 write_memory/write_impression/write_skill 完整替换。\n"
+            + "7) 如果已有检索结果仍不足，请换关键词继续检索，不要机械重复同一参数。\n"
+            + "8) 如果工具观察里出现 fetch_url 返回 403/Forbidden/CloudFront 拒绝访问，下一步必须对同一个 URL 改用 browse_url（Playwright 渲染），不要直接回复“访问不了”。\n"
+            + "9) 若选择 web_search_volc/search_web_volc，本轮只保留它一个检索动作，不要再同时规划 web_search/search_web。\n"
+            + "10) 若工具观察中已有网页检索结果（web_search/search_web/search_web_brave/web_search_volc/search_web_volc），默认直接信任该结果；"
             + "除非明确失败/无结果，否则不要再追加记忆写入动作。\n"
-            + "9) 当 web_search_volc 与其他来源冲突时，以 web_search_volc 为准，并优先结束动作规划（actions 为空）。\n"
-            + "10) send_reply=false 表示当前不要对用户发送最终回复；send_reply=true 表示本轮可发送最终回复。\n"
-            + "11) 当用户明确要求作图/海报/配图时可用 generate_image，prompt 要具体且可执行；"
+            + "11) 当 web_search_volc 与其他来源冲突时，以 web_search_volc 为准，并优先结束动作规划（actions 为空）。\n"
+            + "12) planner 不负责决定是否回复；只要本轮被外层规则触发，最终回复链路默认继续执行。\n"
+            + "13) 当用户明确要求作图/海报/配图时可用 generate_image，prompt 要具体且可执行；"
             + "若需求是纯文本答复，不要调用 generate_image。"
-            + "\n11b) 当用户要求改图、修图、换风格、增删画面内容时优先用 edit_image；"
+            + "\n13b) 当用户要求改图、修图、换风格、增删画面内容时优先用 edit_image；"
             + "如果当前消息或近期上下文已有图片，可省略 image_path。"
-            + "\n12) 遇到数学、统计、日期、单位换算、取模、幂运算等需要精确计算的问题，必须先调用 run_python；run_python 沙盒默认限制 import，已预置 math/statistics/datetime/date/timedelta/Decimal/Fraction/mean/median 可直接用；设 python_sandbox_restricted=false 可解除所有限制；"
+            + "\n14) 遇到数学、统计、日期、单位换算、取模、幂运算等需要精确计算的问题，必须先调用 run_python；run_python 沙盒默认限制 import，已预置 math/statistics/datetime/date/timedelta/Decimal/Fraction/mean/median 可直接用；设 python_sandbox_restricted=false 可解除所有限制；"
             + "没有 Python 工具观察结果时，不要直接给数值结论。"
-            + "\n13) 遇到最新信息、官网公告、新闻、版本改动、价格、规则等时效事实，必须优先调用 web_search_volc/search_web_volc 或 web_search/search_web；"
+            + "\n15) 遇到最新信息、官网公告、新闻、版本改动、价格、规则等时效事实，必须优先调用 web_search_volc/search_web_volc 或 web_search/search_web；"
             + "没有检索观察结果时，不要声称已经查过。"
-            + "\n14) task.status=running 表示任务未完成，后续还要继续；若希望空闲时后台续跑，设 continue_on_heartbeat=true。"
-            + "\n15) task.status=waiting_user 表示缺用户信息，continue_on_heartbeat 必须为 false。"
-            + "\n16) task.status=done 表示当前任务已完成；task.status=blocked 表示被外部条件卡住，需写 blocked_reason。"
-            + "\n17) 当用户要求你增加能力、沉淀流程、写 skill、以后按固定套路处理某类事时，优先使用 write_skill 写入 data/skills/<name>/SKILL.md；过时技能用 delete_skill。"
-            + "\n18) 若 [skills] 中的 skill 文件对某类任务有明确的查询流程/步骤规定，优先遵循 skill 规定，不受上述全局检索优先级约束。"
+            + "\n16) task.status=running 表示任务未完成，后续还要继续；若希望空闲时后台续跑，设 continue_on_heartbeat=true。"
+            + "\n17) task.status=waiting_user 表示缺用户信息，continue_on_heartbeat 必须为 false。"
+            + "\n18) task.status=done 表示当前任务已完成；task.status=blocked 表示被外部条件卡住，需写 blocked_reason。"
+            + "\n19) 当用户要求你增加能力、沉淀流程、写 skill、以后按固定套路处理某类事时，先 list_skills/read_skill 判断是否已有类似技能；已有则优先 update_skill 追加维护，新技能才用 write_skill；过时技能用 delete_skill。"
+            + "\n20) 若 [skills] 中的 skill 文件对某类任务有明确的查询流程/步骤规定，优先遵循 skill 规定，不受上述全局检索优先级约束。"
         )
         payload = {
             "model": self.cfg.model,
@@ -2647,7 +2715,7 @@ class LlmReplyGenerator:
         }
         planner_max_tokens = self._effective_text_max_tokens(self.cfg.max_tokens)
         if planner_max_tokens is not None:
-            if {"write_memory", "write_impression", "write_skill"} & tool_set:
+            if {"write_memory", "write_impression", "write_skill", "remember_fact", "update_impression", "update_skill"} & tool_set:
                 payload["max_tokens"] = planner_max_tokens
             else:
                 payload["max_tokens"] = max(120, min(520, planner_max_tokens))
@@ -2715,13 +2783,9 @@ class LlmReplyGenerator:
         reply_hint = re.sub(r"\s+", " ", str(parsed.get("reply_hint", "") or "")).strip()[:180]
         if self._is_payment_gate_text(reply_hint):
             reply_hint = ""
-        raw_send_reply = parsed.get("send_reply", True)
-        if isinstance(raw_send_reply, bool):
-            send_reply = raw_send_reply
-        elif isinstance(raw_send_reply, str):
-            send_reply = raw_send_reply.strip().lower() not in {"0", "false", "no", "off"}
-        else:
-            send_reply = bool(raw_send_reply)
+        # Reply gating belongs to the outer event/cooldown rules. Keep this key
+        # for caller compatibility, but ignore legacy planner send_reply=false.
+        send_reply = True
 
         task_obj = parsed.get("task")
         task: dict[str, object] = {}
@@ -2775,6 +2839,43 @@ class LlmReplyGenerator:
                 args: dict[str, str] = {}
                 if tool == "list_skills":
                     args = {}
+                elif tool == "read_skill":
+                    name = re.sub(
+                        r"\s+",
+                        "-",
+                        str(args_obj.get("name", "") or args_obj.get("skill", "")).strip(),
+                    )[:80]
+                    if not name:
+                        continue
+                    args = {"name": name}
+                elif tool == "read_memory":
+                    raw_name = str(args_obj.get("name", "") or args_obj.get("scope", "") or "all").strip().lower()
+                    name = raw_name if raw_name in {"core", "timeline", "all"} else "all"
+                    args = {"name": name}
+                elif tool == "recall_memory":
+                    query = re.sub(
+                        r"\s+",
+                        " ",
+                        str(args_obj.get("query", "") or args_obj.get("text", "")).strip(),
+                    )[:80]
+                    if not query:
+                        continue
+                    limit_raw = args_obj.get("limit", 6)
+                    try:
+                        limit = int(limit_raw)
+                    except Exception:
+                        limit = 6
+                    args = {"query": query, "limit": max(1, min(10, limit))}
+                elif tool == "remember_fact":
+                    raw_scope = str(args_obj.get("scope", "") or args_obj.get("name", "") or "core").strip().lower()
+                    scope = "timeline" if raw_scope in {"timeline", "time", "history", "events"} else "core"
+                    content = str(args_obj.get("content", "") or args_obj.get("fact", "") or args_obj.get("text", "")).strip()[:1200]
+                    source = str(args_obj.get("source", "") or "").strip()[:80]
+                    if not content:
+                        continue
+                    args = {"scope": scope, "content": content}
+                    if source:
+                        args["source"] = source
                 elif tool == "write_memory":
                     raw_name = str(args_obj.get("name", "core")).strip().lower()
                     name = "timeline" if raw_name in {"timeline", "time", "history", "events"} else "core"
@@ -2792,6 +2893,19 @@ class LlmReplyGenerator:
                     if (not name) or (not content):
                         continue
                     args = {"name": name, "content": content}
+                elif tool == "update_skill":
+                    name = re.sub(
+                        r"\s+",
+                        "-",
+                        str(args_obj.get("name", "") or args_obj.get("skill", "")).strip(),
+                    )[:80]
+                    note = str(args_obj.get("note", "") or args_obj.get("content", "") or args_obj.get("text", "")).strip()[:1800]
+                    source = str(args_obj.get("source", "") or "").strip()[:80]
+                    if (not name) or (not note):
+                        continue
+                    args = {"name": name, "note": note}
+                    if source:
+                        args["source"] = source
                 elif tool == "delete_skill":
                     name = re.sub(
                         r"\s+",
@@ -2810,6 +2924,19 @@ class LlmReplyGenerator:
                     if not name:
                         continue
                     args = {"name": name}
+                elif tool == "update_impression":
+                    name = re.sub(
+                        r"\s+",
+                        " ",
+                        str(args_obj.get("name", "") or args_obj.get("person", "")).strip(),
+                    )[:40]
+                    note = str(args_obj.get("note", "") or args_obj.get("content", "") or args_obj.get("text", "")).strip()[:1200]
+                    source = str(args_obj.get("source", "") or "").strip()[:80]
+                    if (not name) or (not note):
+                        continue
+                    args = {"name": name, "note": note}
+                    if source:
+                        args["source"] = source
                 elif tool == "read_chat_history":
                     chat_title = re.sub(
                         r"\s+",

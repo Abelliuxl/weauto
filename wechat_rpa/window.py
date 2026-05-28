@@ -41,8 +41,6 @@ def _cgimage_to_pil(cg_image) -> Image.Image:
     bytes_per_row = int(Quartz.CGImageGetBytesPerRow(cg_image))
     provider = Quartz.CGImageGetDataProvider(cg_image)
     data = Quartz.CGDataProviderCopyData(provider)
-    # CoreGraphics little-endian 32-bit buffers are typically BGRA.
-    # Use frombytes to detach PIL storage from CoreGraphics-owned buffers.
     raw = bytes(data)
     return Image.frombytes(
         "RGBA",

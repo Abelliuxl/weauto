@@ -120,6 +120,17 @@ class SkillStore:
     def write(self, name: str, content: str) -> None:
         self._get(name).write(content)
 
+    def backup(self, name: str) -> Path | None:
+        path = self._path(name)
+        if not path.is_file():
+            return None
+        backup_dir = path.parent / ".backup"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        backup_path = backup_dir / f"SKILL-{ts}.md"
+        backup_path.write_text(path.read_text(encoding="utf-8", errors="replace"), encoding="utf-8")
+        return backup_path
+
     def cleanup(self) -> None:
         if not self.base.is_dir():
             return
