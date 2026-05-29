@@ -267,6 +267,43 @@ class MessageHandler:
             bot._save_persistent_memory()
             return
 
+        bridge_handled, bridge_reply = bot._bridge_reply_text(
+            row,
+            reason=reason,
+            is_group=is_group,
+            is_admin=is_admin,
+            latest_message=latest_user_message,
+            chat_context=chat_context,
+            environment_context=environment_context,
+            session_context=session_context,
+            workspace_context=workspace_context,
+            memory_recall=memory_recall,
+        )
+        if bridge_handled:
+            if bridge_reply:
+                message = bot._reply(
+                    row,
+                    reason,
+                    focused_bounds=focused_bounds,
+                    chat_context=chat_context,
+                    environment_context=environment_context,
+                    session_context=session_context,
+                    workspace_context=workspace_context,
+                    memory_recall=memory_recall,
+                    latest_message=latest_user_message,
+                    force_message=bridge_reply,
+                )
+                sent_norm = bot._normalize_preview(message)
+                self._mark_event_done(row, now, sent_norm=sent_norm)
+                bot._remember_sent_for_row(row, sent_norm, now)
+                bot._append_session_item(row, "A", message)
+                if message and bot._is_normal_reply_event(row, reason):
+                    bot._last_normal_reply_at = now
+            else:
+                self._mark_event_done(row, now)
+            bot._save_persistent_memory()
+            return
+
         reply_budget = max(1, int(bot.cfg.agent_reply_max_messages_per_turn))
         sent_in_event = 0
         follow_reason = reason

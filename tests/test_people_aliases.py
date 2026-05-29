@@ -32,3 +32,22 @@ def test_person_alias_resolver_reload_on_change(tmp_path: Path) -> None:
 
     aliases.write_text("- 晨哥 -> Gromit\n- 张捷 -> 巴音布鲁克之王\n", encoding="utf-8")
     assert resolver.resolve("巴音布鲁克之王") == "张捷"
+
+
+def test_person_alias_resolver_reads_inline_mention(tmp_path: Path) -> None:
+    aliases = tmp_path / "PEOPLE_ALIASES.md"
+    aliases.write_text(
+        "\n".join(
+            [
+                "- 刘晓亮 -> real刘晓亮, 亮哥, 嘴甜心善体育生 -[@嘴甜心善体育生]",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    resolver = PersonAliasResolver(str(aliases))
+
+    assert resolver.resolve("real刘晓亮") == "刘晓亮"
+    assert resolver.aliases_for("刘晓亮") == ["亮哥", "嘴甜心善体育生"]
+    assert resolver.resolve("嘴甜心善体育生 -[@嘴甜心善体育生]") == ""
+    assert resolver.mention_for("real刘晓亮") == "嘴甜心善体育生"
+    assert resolver.mention_for("刘晓亮") == "嘴甜心善体育生"

@@ -82,6 +82,24 @@ class PersonAliasResolver:
         self._mapping: dict[str, str] = {}
         self._patterns: list[tuple[str, str, str]] = []
         self._reverse_aliases: dict[str, list[str]] = {}
+        self._mention_mapping: dict[str, str] = {}
+
+    @staticmethod
+    def _clean_mention_name(text: str) -> str:
+        clean = str(text or "").strip().lstrip("@").strip()
+        clean = re.sub(r"[\r\n\t]+", " ", clean)
+        clean = re.sub(r"\s+", " ", clean).strip()
+        return clean[:40]
+
+    @classmethod
+    def _extract_inline_mention(cls, text: str) -> tuple[str, str]:
+        raw = str(text or "")
+        matches = list(re.finditer(r"-?\s*\[@([^\]\r\n]+)\]\s*$", raw))
+        if not matches:
+            return raw, ""
+        match = matches[-1]
+        mention = cls._clean_mention_name(match.group(1))
+        return raw[: match.start()].rstrip(" ,，、；;|"), mention
 
     def _maybe_reload(self) -> None:
         if not self.enabled:
@@ -89,6 +107,7 @@ class PersonAliasResolver:
             self._mapping = {}
             self._patterns = []
             self._reverse_aliases = {}
+            self._mention_mapping = {}
             return
 
         path = Path(self.aliases_path).expanduser()
@@ -97,6 +116,7 @@ class PersonAliasResolver:
             self._mapping = {}
             self._patterns = []
             self._reverse_aliases = {}
+            self._mention_mapping = {}
             return
 
         try:
@@ -115,10 +135,13 @@ class PersonAliasResolver:
         mapping: dict[str, str] = {}
         patterns: list[tuple[str, str, str]] = []
         reverse_aliases: dict[str, list[str]] = {}
+        mention_mapping: dict[str, str] = {}
         seen_patterns: set[str] = set()
-
         for line in raw.splitlines():
             clean = line.strip()
+            lowered = clean.strip("# ").strip().lower()
+            if lowered in {"[aliases]", "aliases", "people aliases", "person aliases"}:
+                continue
             if not clean or clean.startswith("#"):
                 continue
             if clean.startswith("- "):
@@ -131,10 +154,14 @@ class PersonAliasResolver:
             if not sep:
                 continue
             left, right = [part.strip() for part in clean.split(sep, 1)]
+            right, inline_mention = self._extract_inline_mention(right)
+
             canonical = _normalize_name(left)
             if not canonical or _looks_like_placeholder_person(canonical):
                 continue
             reverse_aliases.setdefault(canonical, [])
+            if inline_mention:
+                mention_mapping[_norm(canonical)] = inline_mention
             for alias in [x.strip() for x in re.split(r"[，,、；;|]", right) if x.strip()]:
                 has_star = "*" in alias
                 starts_star = alias.startswith("*")
@@ -151,6 +178,8 @@ class PersonAliasResolver:
                     seen_patterns.add(pattern_key)
                     patterns.append((mode, token_norm, canonical))
                     reverse_aliases[canonical].append(alias)
+                    if inline_mention:
+                        mention_mapping[token_norm] = inline_mention
                     continue
 
                 clean_alias = _normalize_name(alias)
@@ -159,6 +188,8 @@ class PersonAliasResolver:
                 if _norm(clean_alias) == _norm(canonical):
                     continue
                 mapping[_norm(clean_alias)] = canonical
+                if inline_mention:
+                    mention_mapping[_norm(clean_alias)] = inline_mention
                 if clean_alias not in reverse_aliases[canonical]:
                     reverse_aliases[canonical].append(clean_alias)
             mapping[_norm(canonical)] = canonical
@@ -167,6 +198,7 @@ class PersonAliasResolver:
         self._mapping = mapping
         self._patterns = patterns
         self._reverse_aliases = reverse_aliases
+        self._mention_mapping = mention_mapping
 
     def resolve(self, name: str) -> str:
         self._maybe_reload()
@@ -202,6 +234,22 @@ class PersonAliasResolver:
             seen.add(clean)
             out.append(clean)
         return out[:12]
+
+    def mention_for(self, *names: str) -> str:
+        self._maybe_reload()
+        candidates: list[str] = []
+        for name in names:
+            clean = _normalize_name(name)
+            if clean:
+                candidates.append(clean)
+                resolved = self.resolve(clean)
+                if resolved and resolved not in candidates:
+                    candidates.append(resolved)
+        for candidate in candidates:
+            mention = self._mention_mapping.get(_norm(candidate), "")
+            if mention:
+                return mention
+        return ""
 
     def build_resolution(self, observed_name: str) -> PersonResolution:
         observed = _normalize_name(observed_name)

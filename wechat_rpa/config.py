@@ -181,6 +181,9 @@ class ImageEditingConfig:
 @dataclass
 class AppConfig:
     app_name: str = "WeChat"
+    # native: local planner/reply/memory pipeline.
+    # bridge: send normalized chat event to an external processor, then use local sender.
+    processing_mode: str = "native"
     # detached_windows: capture each detached chat window by macOS window id.
     # legacy_list: old whole-app left-list detector.
     receiver_mode: str = "detached_windows"
@@ -224,9 +227,32 @@ class AppConfig:
     memory_history_max_items: int = 0
     people_aliases_enabled: bool = True
     people_aliases_path: str = "data/config/PEOPLE_ALIASES.md"
+    mention_send_enabled: bool = False
+    mention_trigger_suffix: str = "A"
+    mention_after_paste_delay_sec: float = 0.40
+    mention_after_backspace_delay_sec: float = 0.70
+    mention_after_confirm_delay_sec: float = 0.45
+    mention_pause_scan_sec: float = 2.0
     admin_commands_enabled: bool = True
     admin_session_titles: list[str] = field(default_factory=lambda: ["example_admin"])
     admin_command_prefix: str = "/"
+    bridge_backend: str = "http"
+    bridge_url: str = ""
+    bridge_api_key: str = ""
+    bridge_api_key_env: str = "WEAUTO_BRIDGE_API_KEY"
+    bridge_timeout_sec: float = 120.0
+    bridge_fail_open: bool = True
+    bridge_openclaw_cli: str = "openclaw"
+    bridge_openclaw_gateway_url: str = ""
+    bridge_openclaw_gateway_url_env: str = "OPENCLAW_GATEWAY_URL"
+    bridge_openclaw_gateway_token: str = ""
+    bridge_openclaw_gateway_token_env: str = "OPENCLAW_GATEWAY_TOKEN"
+    bridge_openclaw_agent_id: str = "main"
+    bridge_openclaw_session_prefix: str = "agent:main:weauto"
+    bridge_openclaw_thinking: str = "off"
+    bridge_openclaw_deliver: bool = False
+    bridge_openclaw_expect_final: bool = True
+    bridge_openclaw_strip_proxy_env: bool = True
     agent_actions_enabled: bool = True
     agent_actions_max_per_turn: int = 2
     # Max reply messages planner can emit in one trigger cycle.
@@ -511,6 +537,8 @@ def load_config(path: str | Path | None) -> AppConfig:
     data = tomllib.loads(config_path.read_text(encoding="utf-8"))
 
     cfg.app_name = str(data.get("app_name", cfg.app_name))
+    processing_mode = str(data.get("processing_mode", cfg.processing_mode)).strip().lower()
+    cfg.processing_mode = processing_mode if processing_mode in {"native", "bridge"} else "native"
     receiver_mode = str(data.get("receiver_mode", cfg.receiver_mode)).strip().lower()
     cfg.receiver_mode = receiver_mode if receiver_mode in {"detached_windows", "legacy_list"} else "detached_windows"
     title_filter = data.get("detached_window_title_filter", cfg.detached_window_title_filter)
@@ -599,6 +627,24 @@ def load_config(path: str | Path | None) -> AppConfig:
         data.get("people_aliases_enabled", cfg.people_aliases_enabled)
     )
     cfg.people_aliases_path = str(data.get("people_aliases_path", cfg.people_aliases_path))
+    cfg.mention_send_enabled = bool(
+        data.get("mention_send_enabled", cfg.mention_send_enabled)
+    )
+    cfg.mention_trigger_suffix = str(
+        data.get("mention_trigger_suffix", cfg.mention_trigger_suffix)
+    )[:8] or "A"
+    cfg.mention_after_paste_delay_sec = float(
+        data.get("mention_after_paste_delay_sec", cfg.mention_after_paste_delay_sec)
+    )
+    cfg.mention_after_backspace_delay_sec = float(
+        data.get("mention_after_backspace_delay_sec", cfg.mention_after_backspace_delay_sec)
+    )
+    cfg.mention_after_confirm_delay_sec = float(
+        data.get("mention_after_confirm_delay_sec", cfg.mention_after_confirm_delay_sec)
+    )
+    cfg.mention_pause_scan_sec = float(
+        data.get("mention_pause_scan_sec", cfg.mention_pause_scan_sec)
+    )
     cfg.admin_commands_enabled = bool(
         data.get("admin_commands_enabled", cfg.admin_commands_enabled)
     )
@@ -606,6 +652,58 @@ def load_config(path: str | Path | None) -> AppConfig:
     if isinstance(admin_session_titles, list):
         cfg.admin_session_titles = [str(x) for x in admin_session_titles]
     cfg.admin_command_prefix = str(data.get("admin_command_prefix", cfg.admin_command_prefix))
+    bridge_backend = str(data.get("bridge_backend", cfg.bridge_backend)).strip().lower()
+    cfg.bridge_backend = bridge_backend if bridge_backend in {"http", "openclaw"} else "http"
+    cfg.bridge_url = str(data.get("bridge_url", cfg.bridge_url)).strip()
+    cfg.bridge_api_key = str(data.get("bridge_api_key", cfg.bridge_api_key))
+    cfg.bridge_api_key_env = str(data.get("bridge_api_key_env", cfg.bridge_api_key_env)).strip()
+    if (not cfg.bridge_api_key) and cfg.bridge_api_key_env:
+        cfg.bridge_api_key = str(os.getenv(cfg.bridge_api_key_env, "")).strip()
+    cfg.bridge_timeout_sec = float(data.get("bridge_timeout_sec", cfg.bridge_timeout_sec))
+    cfg.bridge_fail_open = bool(data.get("bridge_fail_open", cfg.bridge_fail_open))
+    if cfg.bridge_timeout_sec < 1.0:
+        cfg.bridge_timeout_sec = 1.0
+    cfg.bridge_openclaw_cli = str(
+        data.get("bridge_openclaw_cli", cfg.bridge_openclaw_cli)
+    ).strip() or "openclaw"
+    cfg.bridge_openclaw_gateway_url = str(
+        data.get("bridge_openclaw_gateway_url", cfg.bridge_openclaw_gateway_url)
+    ).strip()
+    cfg.bridge_openclaw_gateway_url_env = str(
+        data.get("bridge_openclaw_gateway_url_env", cfg.bridge_openclaw_gateway_url_env)
+    ).strip()
+    if (not cfg.bridge_openclaw_gateway_url) and cfg.bridge_openclaw_gateway_url_env:
+        cfg.bridge_openclaw_gateway_url = str(
+            os.getenv(cfg.bridge_openclaw_gateway_url_env, "")
+        ).strip()
+    cfg.bridge_openclaw_gateway_token = str(
+        data.get("bridge_openclaw_gateway_token", cfg.bridge_openclaw_gateway_token)
+    )
+    cfg.bridge_openclaw_gateway_token_env = str(
+        data.get("bridge_openclaw_gateway_token_env", cfg.bridge_openclaw_gateway_token_env)
+    ).strip()
+    if (not cfg.bridge_openclaw_gateway_token) and cfg.bridge_openclaw_gateway_token_env:
+        cfg.bridge_openclaw_gateway_token = str(
+            os.getenv(cfg.bridge_openclaw_gateway_token_env, "")
+        ).strip()
+    cfg.bridge_openclaw_agent_id = str(
+        data.get("bridge_openclaw_agent_id", cfg.bridge_openclaw_agent_id)
+    ).strip() or "main"
+    cfg.bridge_openclaw_session_prefix = str(
+        data.get("bridge_openclaw_session_prefix", cfg.bridge_openclaw_session_prefix)
+    ).strip() or "agent:main:weauto"
+    cfg.bridge_openclaw_thinking = str(
+        data.get("bridge_openclaw_thinking", cfg.bridge_openclaw_thinking)
+    ).strip()
+    cfg.bridge_openclaw_deliver = bool(
+        data.get("bridge_openclaw_deliver", cfg.bridge_openclaw_deliver)
+    )
+    cfg.bridge_openclaw_expect_final = bool(
+        data.get("bridge_openclaw_expect_final", cfg.bridge_openclaw_expect_final)
+    )
+    cfg.bridge_openclaw_strip_proxy_env = bool(
+        data.get("bridge_openclaw_strip_proxy_env", cfg.bridge_openclaw_strip_proxy_env)
+    )
     cfg.agent_actions_enabled = bool(
         data.get("agent_actions_enabled", cfg.agent_actions_enabled)
     )

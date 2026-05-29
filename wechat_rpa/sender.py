@@ -82,9 +82,56 @@ return "not_found"
     def send_delay_sec(self) -> float:
         return max(0.0, float(self.cfg.send_after_paste_delay_sec))
 
+    def mention_timing(self) -> tuple[float, float, float]:
+        return (
+            max(0.0, float(self.cfg.mention_after_paste_delay_sec)),
+            max(0.0, float(self.cfg.mention_after_backspace_delay_sec)),
+            max(0.0, float(self.cfg.mention_after_confirm_delay_sec)),
+        )
+
     @staticmethod
     def apple_quote(raw: str) -> str:
         return str(raw or "").replace("\\", "\\\\").replace('"', '\\"')
+
+    def click_chat_input_for_window(self, title: str) -> bool:
+        clean_title = str(title or "").strip()
+        if not clean_title:
+            return False
+        aliases = [x.strip() for x in self.cfg.app_name.split("|") if x.strip()]
+        if "WeChat" in aliases and "微信" not in aliases:
+            aliases.append("微信")
+        if not aliases:
+            aliases = ["WeChat", "微信"]
+
+        quoted_title = self.apple_quote(clean_title)
+        for app in aliases:
+            script = f'''
+tell application "{self.apple_quote(app)}" to activate
+tell application "System Events"
+  tell process "{self.apple_quote(app)}"
+    set frontmost to true
+    repeat with w in windows
+      try
+        if (name of w) contains "{quoted_title}" then
+          perform action "AXRaise" of w
+          set p to position of w
+          set s to size of w
+          set inputX to (item 1 of p) + ((item 1 of s) div 2)
+          set inputY to (item 2 of p) + (item 2 of s) - 52
+          click at {{inputX, inputY}}
+          return "ok"
+        end if
+      end try
+    end repeat
+  end tell
+end tell
+return "not_found"
+'''
+            proc = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+            if proc.returncode == 0 and proc.stdout.strip() == "ok":
+                time.sleep(max(0.05, self.cfg.activate_wait_sec))
+                return True
+        return False
 
     def paste_and_send(self, message: str) -> None:
         import pyautogui
@@ -119,9 +166,91 @@ return "not_found"
         time.sleep(delay_sec)
         pyautogui.press("enter")
 
+    def mention_and_send(self, mention_name: str, message: str) -> None:
+        import pyautogui
+        import pyperclip
+
+        mention = str(mention_name or "").strip().lstrip("@").strip()
+        body = str(message or "").strip()
+        if not mention or not body:
+            self.paste_and_send(body)
+            return
+
+        suffix = str(self.cfg.mention_trigger_suffix or "A")[:8] or "A"
+        after_paste, after_backspace, after_confirm = self.mention_timing()
+
+        pyperclip.copy(f"@{mention}{suffix}")
+        time.sleep(0.05)
+        trigger_script = 'tell application "System Events" to keystroke "v" using command down'
+        backspace_script = 'tell application "System Events" to key code 51'
+        enter_script = 'tell application "System Events" to key code 36'
+        proc = subprocess.run(
+            [
+                "osascript",
+                "-e",
+                trigger_script,
+                "-e",
+                f"delay {after_paste:.3f}",
+                "-e",
+                backspace_script,
+                "-e",
+                f"delay {after_backspace:.3f}",
+                "-e",
+                enter_script,
+                "-e",
+                f"delay {after_confirm:.3f}",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if proc.returncode != 0:
+            print(f"[warn] osascript mention trigger failed, fallback to pyautogui: {proc.stderr.strip()}")
+            pyautogui.keyDown("command")
+            pyautogui.press("v")
+            pyautogui.keyUp("command")
+            time.sleep(after_paste)
+            pyautogui.press("backspace")
+            time.sleep(after_backspace)
+            pyautogui.press("enter")
+            time.sleep(after_confirm)
+
+        pyperclip.copy(f" {body}")
+        time.sleep(0.05)
+        delay_sec = self.send_delay_sec()
+        paste_script = 'tell application "System Events" to keystroke "v" using command down'
+        send_proc = subprocess.run(
+            [
+                "osascript",
+                "-e",
+                paste_script,
+                "-e",
+                f"delay {delay_sec:.3f}",
+                "-e",
+                enter_script,
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if send_proc.returncode == 0:
+            return
+
+        print(f"[warn] osascript mention body send failed, fallback to pyautogui: {send_proc.stderr.strip()}")
+        pyautogui.keyDown("command")
+        pyautogui.press("v")
+        pyautogui.keyUp("command")
+        time.sleep(delay_sec)
+        pyautogui.press("enter")
+
     def paste_and_send_to_window(self, title: str, message: str) -> bool:
         raised = self.activate_chat_window(title)
         self.paste_and_send(message)
+        return raised
+
+    def mention_and_send_to_window(self, title: str, mention_name: str, message: str) -> bool:
+        raised = self.click_chat_input_for_window(title)
+        if not raised:
+            raised = self.activate_chat_window(title)
+        self.mention_and_send(mention_name, message)
         return raised
 
     def paste_file_and_send(self, file_path: Path) -> bool:

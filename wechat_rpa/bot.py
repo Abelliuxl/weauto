@@ -31,6 +31,7 @@ from PIL import Image
 
 from .action_processor import ActionProcessor
 from .agent_store import MemoryStore, PeopleStore, SkillStore
+from .bridge import BridgeClient
 from .config import AppConfig
 from .detector import ChatRowState, detect_chat_rows
 from .detached_window_receiver import capture_window_by_id, list_detached_wechat_windows, safe_window_name
@@ -188,6 +189,7 @@ class WeChatGuiRpaBot:
         self.llm = self.llm_reply
         self.image_generator = ImageGenerator(cfg.image_generation)
         self.image_editor = ImageEditor(cfg.image_editing)
+        self.bridge_client = BridgeClient(cfg)
         self.agent_memory = MemoryStore("data/memory")
         self.agent_skills = SkillStore("data/skills")
         self.agent_skills.cleanup()
@@ -206,6 +208,7 @@ class WeChatGuiRpaBot:
         self._detached_bootstrapped = False
         self._state_lock = threading.RLock()
         self._send_lock = threading.Lock()
+        self._visual_scan_paused_until = 0.0
         self._msg_executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=min(8, max(2, os.cpu_count() or 4)),
             thread_name_prefix="msg",
@@ -280,6 +283,21 @@ class WeChatGuiRpaBot:
                     if not q.empty():
                         return True
         return False
+
+    def _pause_visual_scan(self, seconds: float) -> None:
+        delay = max(0.0, float(seconds or 0.0))
+        if delay <= 0:
+            return
+        with self._state_lock:
+            self._visual_scan_paused_until = max(
+                self._visual_scan_paused_until,
+                time.time() + delay,
+            )
+
+    def _visual_scan_paused(self, now: float) -> bool:
+        with self._state_lock:
+            paused_until = self._visual_scan_paused_until
+        return self._send_lock.locked() or now < paused_until
 
     def _maybe_run_memory_maintenance(self, now: float) -> None:
         interval = float(getattr(self.cfg, "memory_gc_interval_sec", 0.0) or 0.0)
@@ -482,6 +500,175 @@ class WeChatGuiRpaBot:
         if not bool(self.cfg.people_aliases_enabled):
             return str(name or "").strip()[:40]
         return self.people_alias_resolver.resolve(str(name or ""))
+
+    def _resolve_mention_name(self, name: str) -> str:
+        if not bool(self.cfg.mention_send_enabled):
+            return ""
+        raw = str(name or "").strip()
+        canonical = self._resolve_person_name(raw)
+        return self.people_alias_resolver.mention_for(raw, canonical)
+
+    def _mention_mapping_source_text(self) -> str:
+        return f"{self.cfg.people_aliases_path}:inline -[@...]"
+
+    def _bridge_status_text(self) -> str:
+        if self.cfg.processing_mode != "bridge":
+            return "mode=native"
+        if self.cfg.bridge_backend == "openclaw":
+            target = self.cfg.bridge_openclaw_gateway_url.strip() or "-"
+            return (
+                f"mode=bridge backend=openclaw target={target} "
+                f"agent={self.cfg.bridge_openclaw_agent_id} "
+                f"timeout={self.cfg.bridge_timeout_sec:.1f}s "
+                f"fail_open={self.cfg.bridge_fail_open}"
+            )
+        url = self.cfg.bridge_url.strip() or "-"
+        return (
+            f"mode=bridge backend=http url={url} "
+            f"timeout={self.cfg.bridge_timeout_sec:.1f}s "
+            f"fail_open={self.cfg.bridge_fail_open}"
+        )
+
+    @staticmethod
+    def _bridge_clip(value: object, limit: int = 4000) -> str:
+        return str(value or "")[:limit]
+
+    @staticmethod
+    def _sender_from_prefixed_text(text: str) -> str:
+        raw = str(text or "").strip()
+        sep = "：" if "：" in raw else (":" if ":" in raw else "")
+        if not sep:
+            return ""
+        left, _ = raw.split(sep, 1)
+        sender = left.strip(" []【】()（）")
+        return sender if 1 <= len(sender) <= 24 else ""
+
+    def _bridge_event_payload(
+        self,
+        row: ChatRowState,
+        *,
+        reason: str,
+        is_group: bool,
+        is_admin: bool,
+        latest_message: str,
+        chat_context: str = "",
+        environment_context: str = "",
+        session_context: str = "",
+        workspace_context: str = "",
+        memory_recall: str = "",
+        source_message: dict | None = None,
+        mention_reply_to: str = "",
+    ) -> dict:
+        source = source_message if isinstance(source_message, dict) else {}
+        sender = str(source.get("sender") or mention_reply_to or "").strip()
+        sender_raw = str(source.get("sender_raw") or "").strip()
+        if not sender:
+            sender = self._sender_from_prefixed_text(row.preview or row.text)
+        content_type = str(source.get("content_type", "text") or "text").strip().lower()
+        text = str(source.get("text") or latest_message or row.preview or row.text or "").strip()
+        return {
+            "schema": "weauto_bridge_event_v1",
+            "app": self.cfg.app_name,
+            "receiver_mode": self.cfg.receiver_mode,
+            "event": {
+                "reason": reason,
+                "is_group": bool(is_group),
+                "is_admin": bool(is_admin),
+                "is_mention": reason == "mention",
+                "timestamp": int(time.time()),
+            },
+            "chat": {
+                "title": row.title,
+                "row_idx": row.row_idx,
+                "session_key": self._session_key_for_row(row),
+            },
+            "message": {
+                "role": "user",
+                "content_type": content_type,
+                "text": text[:2000],
+                "sender": sender[:40],
+                "sender_raw": sender_raw[:40],
+                "is_mention_me": reason == "mention",
+                "image_path": str(source.get("image_path") or "")[:1000],
+                "image_hash": str(source.get("image_hash") or "")[:120],
+            },
+            "context": {
+                "latest_message": self._bridge_clip(latest_message, 2000),
+                "chat_context": self._bridge_clip(chat_context),
+                "environment_context": self._bridge_clip(environment_context),
+                "session_context": self._bridge_clip(session_context, 1600),
+                "workspace_context": self._bridge_clip(workspace_context),
+                "memory_recall": self._bridge_clip(memory_recall),
+            },
+            "reply": {
+                "mention_reply_to": mention_reply_to,
+                "max_messages": max(1, int(self.cfg.agent_reply_max_messages_per_turn)),
+            },
+        }
+
+    def _bridge_reply_text(
+        self,
+        row: ChatRowState,
+        *,
+        reason: str,
+        is_group: bool,
+        is_admin: bool,
+        latest_message: str,
+        chat_context: str = "",
+        environment_context: str = "",
+        session_context: str = "",
+        workspace_context: str = "",
+        memory_recall: str = "",
+        source_message: dict | None = None,
+        mention_reply_to: str = "",
+    ) -> tuple[bool, str]:
+        if self.cfg.processing_mode != "bridge":
+            return False, ""
+        if not self.bridge_client.enabled():
+            print("[warn] bridge mode enabled but bridge target is empty")
+            if self.cfg.bridge_fail_open:
+                return False, ""
+            return True, ""
+        payload = self._bridge_event_payload(
+            row,
+            reason=reason,
+            is_group=is_group,
+            is_admin=is_admin,
+            latest_message=latest_message,
+            chat_context=chat_context,
+            environment_context=environment_context,
+            session_context=session_context,
+            workspace_context=workspace_context,
+            memory_recall=memory_recall,
+            source_message=source_message,
+            mention_reply_to=mention_reply_to,
+        )
+        try:
+            if self.cfg.log_verbose:
+                print(
+                    f"[bridge] request row={row.row_idx:>2} "
+                    f"reason={reason:<14} title={self._fit_col(row.title, 14)}"
+                )
+            result = self.bridge_client.request_reply(payload)
+        except Exception as exc:
+            print(f"[warn] bridge failed: {exc}")
+            if self.cfg.bridge_fail_open:
+                print("[bridge] fail-open: fallback to native pipeline")
+                return False, ""
+            print("[bridge] fail-closed: skip native reply")
+            return True, ""
+        if not result.send:
+            if self.cfg.log_verbose:
+                print(f"[bridge] send=false row={row.row_idx:>2}")
+            return True, ""
+        reply = (result.reply or "").strip()
+        if not reply:
+            if self.cfg.log_verbose:
+                print(f"[bridge] empty reply row={row.row_idx:>2}")
+            return True, ""
+        if self.cfg.log_verbose:
+            print(f"[bridge] reply row={row.row_idx:>2} len={len(reply)}")
+        return True, reply
 
     def _canonicalize_sender_pair(self, sender: str) -> tuple[str, str]:
         raw = str(sender or "").strip()
@@ -4893,9 +5080,28 @@ class WeChatGuiRpaBot:
             return message
 
         if self.cfg.receiver_mode == "detached_windows":
-            send_text = f"@{mention_reply_to} {message}" if mention_reply_to else message
+            mention_name = self._resolve_mention_name(mention_reply_to)
+            send_text = f"@{mention_name or mention_reply_to} {message}" if mention_reply_to else message
             with self._send_lock:
-                raised = self.sender.paste_and_send_to_window(row.title, send_text)
+                self._pause_visual_scan(self.cfg.mention_pause_scan_sec)
+                if mention_name:
+                    print(
+                        f"[mention-send] sender={mention_reply_to!r} "
+                        f"mention={mention_name!r} title={row.title!r}"
+                    )
+                    raised = self.sender.mention_and_send_to_window(
+                        row.title,
+                        mention_name,
+                        message,
+                    )
+                else:
+                    if mention_reply_to and self.cfg.mention_send_enabled:
+                        print(
+                            f"[mention-send] no mapping for sender={mention_reply_to!r}; "
+                            "fallback=text"
+                        )
+                    raised = self.sender.paste_and_send_to_window(row.title, send_text)
+                self._pause_visual_scan(self.cfg.mention_pause_scan_sec)
             if not raised:
                 print(f"[warn] detached send window raise not confirmed: {row.title!r}")
             msg_w = max(24, self._term_width() - 12)
@@ -4937,9 +5143,26 @@ class WeChatGuiRpaBot:
         self._safe_click(input_x, input_y)
         time.sleep(0.08)
 
-        self._paste_and_send(message)
+        mention_name = self._resolve_mention_name(mention_reply_to)
+        send_text = f"@{mention_name or mention_reply_to} {message}" if mention_reply_to else message
+        with self._send_lock:
+            self._pause_visual_scan(self.cfg.mention_pause_scan_sec)
+            if mention_name:
+                print(
+                    f"[mention-send] sender={mention_reply_to!r} "
+                    f"mention={mention_name!r} title={row.title!r}"
+                )
+                self.sender.mention_and_send(mention_name, message)
+            else:
+                if mention_reply_to and self.cfg.mention_send_enabled:
+                    print(
+                        f"[mention-send] no mapping for sender={mention_reply_to!r}; "
+                        "fallback=text"
+                    )
+                self._paste_and_send(send_text)
+            self._pause_visual_scan(self.cfg.mention_pause_scan_sec)
         msg_w = max(24, self._term_width() - 12)
-        print(f"[sent] msg={self._fit_col(message, msg_w)}")
+        print(f"[sent] msg={self._fit_col(send_text, msg_w)}")
         return message
 
     def _recover_countdown(self, seconds: int) -> None:
@@ -5231,6 +5454,46 @@ class WeChatGuiRpaBot:
             self._save_persistent_memory()
             return
 
+        mention_reply_to = (
+            (message.get("sender") or "").strip()
+            if reason == "mention" and is_group
+            else ""
+        )
+        bridge_handled, bridge_reply = self._bridge_reply_text(
+            row,
+            reason=reason,
+            is_group=is_group,
+            is_admin=is_admin,
+            latest_message=latest_text or row.preview,
+            chat_context=chat_context,
+            session_context=session_context,
+            workspace_context=workspace_context,
+            memory_recall=memory_recall,
+            source_message=message,
+            mention_reply_to=mention_reply_to,
+        )
+        if bridge_handled:
+            if bridge_reply:
+                reply_text = self._reply(
+                    row,
+                    reason,
+                    chat_context=chat_context,
+                    session_context=session_context,
+                    workspace_context=workspace_context,
+                    memory_recall=memory_recall,
+                    latest_message=latest_text or row.preview,
+                    force_message=bridge_reply,
+                    mention_reply_to=mention_reply_to,
+                )
+                if reply_text:
+                    sent_norm = self._normalize_preview(reply_text)
+                    self._remember_sent_for_row(row, sent_norm, now)
+                    self._append_session_item(row, "A", reply_text)
+                    if self._is_normal_reply_event(row, reason):
+                        self._last_normal_reply_at = now
+            self._save_persistent_memory()
+            return
+
         planner_hint = ""
         if self.cfg.agent_actions_enabled:
             tools = self._available_agent_tools(is_admin=is_admin)
@@ -5256,11 +5519,6 @@ class WeChatGuiRpaBot:
                         + memory_recall
                     )[:3600]
 
-        mention_reply_to = (
-            (message.get("sender") or "").strip()
-            if reason == "mention" and is_group
-            else ""
-        )
         reply_text = self._reply(
             row,
             reason,
@@ -5333,6 +5591,12 @@ class WeChatGuiRpaBot:
         print("[start] WeChat detached-window receiver started")
         print(f"[start] receiver=detached_windows poll={self.cfg.poll_interval_sec:.1f}s dry_run={self.cfg.dry_run}")
         print(f"[start] capture-backend={self.cfg.detached_window_capture_backend}")
+        print(
+            f"[start] mention-send: enabled={self.cfg.mention_send_enabled} "
+            f"source={self._mention_mapping_source_text()} "
+            f"backspace_wait={self.cfg.mention_after_backspace_delay_sec:.2f}s"
+        )
+        print(f"[start] processing: {self._bridge_status_text()}")
         print(f"[start] image-dir={image_root}")
         print(f"[start] image-gen: {self._image_generation_status_text()}")
         print(f"[start] image-edit: {self._image_editing_status_text()}")
@@ -5340,6 +5604,12 @@ class WeChatGuiRpaBot:
         while True:
             self._cycle += 1
             now = time.time()
+            if self._visual_scan_paused(now):
+                if self.cfg.log_verbose:
+                    print(f"[scan-paused] detached id={self._cycle}")
+                self._maybe_run_memory_maintenance(time.time())
+                time.sleep(0.2)
+                continue
             windows = self._detached_windows()
             if self.cfg.log_verbose:
                 names = ", ".join([w.title for w in windows]) or "-"
@@ -6007,6 +6277,12 @@ class WeChatGuiRpaBot:
             f"(immediate=private/@)"
         )
         print(
+            f"[start] mention-send: enabled={self.cfg.mention_send_enabled} "
+            f"source={self._mention_mapping_source_text()} "
+            f"backspace_wait={self.cfg.mention_after_backspace_delay_sec:.2f}s"
+        )
+        print(f"[start] processing: {self._bridge_status_text()}")
+        print(
             f"[start] reply-backend: {self.llm_reply.reply_backend_name()} "
             f"(vision={self.llm_reply.is_vision_enabled()} llm={self.llm_reply.is_enabled()})"
         )
@@ -6049,6 +6325,12 @@ class WeChatGuiRpaBot:
         while True:
             self._cycle += 1
             now = time.time()
+            if self._visual_scan_paused(now):
+                if self.cfg.log_verbose:
+                    print(f"[scan-paused] id={self._cycle}")
+                self._maybe_run_memory_maintenance(time.time())
+                time.sleep(0.2)
+                continue
             try:
                 bounds = get_front_window_bounds(self.cfg.app_name)
             except WindowNotFoundError as exc:

@@ -3,6 +3,7 @@
 # ============================================================
 # detached_windows: each chat is a detached WeChat window (recommended)
 # legacy_list: old whole-app list detector (requires calibration)
+processing_mode = "native"
 receiver_mode = "detached_windows"
 detached_window_title_filter = []
 detached_window_output_dir = "data/detached_window_images"
@@ -52,6 +53,12 @@ memory_history_max_items = 1000
 # ============================================================
 people_aliases_enabled = true
 people_aliases_path = "data/config/PEOPLE_ALIASES.md"
+mention_send_enabled = false
+mention_trigger_suffix = "A"
+mention_after_paste_delay_sec = 0.40
+mention_after_backspace_delay_sec = 0.70
+mention_after_confirm_delay_sec = 0.45
+mention_pause_scan_sec = 2.0
 
 # ============================================================
 # Admin Session
@@ -59,6 +66,32 @@ people_aliases_path = "data/config/PEOPLE_ALIASES.md"
 admin_commands_enabled = true
 admin_session_titles = ["example_admin"]
 admin_command_prefix = "/"
+
+# ============================================================
+# Bridge Mode
+# ============================================================
+# processing_mode = "bridge" keeps local receiving/sending rules, but sends
+# normalized chat events to an external processor for full reply generation.
+bridge_backend = "http" # http | openclaw
+bridge_url = "http://127.0.0.1:8766/weauto/reply"
+bridge_api_key = ""
+bridge_api_key_env = "WEAUTO_BRIDGE_API_KEY"
+bridge_timeout_sec = 120.0
+bridge_fail_open = true
+
+# Used when bridge_backend = "openclaw". OpenClaw generates the reply, while
+# weauto still owns WeChat receiving, mention handling, cooldown, and sending.
+bridge_openclaw_cli = "openclaw"
+bridge_openclaw_gateway_url = ""
+bridge_openclaw_gateway_url_env = "OPENCLAW_GATEWAY_URL"
+bridge_openclaw_gateway_token = ""
+bridge_openclaw_gateway_token_env = "OPENCLAW_GATEWAY_TOKEN"
+bridge_openclaw_agent_id = "main"
+bridge_openclaw_session_prefix = "agent:main:weauto"
+bridge_openclaw_thinking = "off"
+bridge_openclaw_deliver = false
+bridge_openclaw_expect_final = true
+bridge_openclaw_strip_proxy_env = true
 
 # ============================================================
 # Agent Actions
