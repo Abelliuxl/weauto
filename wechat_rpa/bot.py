@@ -4,7 +4,7 @@ from collections import defaultdict
 import concurrent.futures
 import gc
 import queue
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from difflib import SequenceMatcher
 import builtins
@@ -30,7 +30,7 @@ import pyautogui
 from PIL import Image
 
 from .action_processor import ActionProcessor
-from .agent_store import MemoryStore, PeopleStore, SkillStore
+from .agent_store import ChatHistoryStore, MemoryStore, PeopleStore, SkillStore
 from .bridge import BridgeClient
 from .config import AppConfig
 from .detector import ChatRowState, detect_chat_rows
@@ -175,6 +175,7 @@ class SessionState:
     muted: bool
     titles: set[str]
     loaded: bool = True
+    seen_content: set = field(default_factory=set)
 
 
 class WeChatGuiRpaBot:
@@ -195,6 +196,7 @@ class WeChatGuiRpaBot:
         self.agent_skills.cleanup()
         self.agent_people = PeopleStore("data/people")
         self.agent_people.cleanup()
+        self.chat_history = ChatHistoryStore("data/chat_history")
         self.people_alias_resolver = PersonAliasResolver(
             cfg.people_aliases_path,
             enabled=cfg.people_aliases_enabled,
@@ -225,7 +227,6 @@ class WeChatGuiRpaBot:
         self._summary_turn_counter: dict[str, int] = defaultdict(int)
         self._memory_dirty = False
         self._memory_path = Path(self.cfg.memory_store_path)
-        self._memory_session_dir = self._memory_path.parent / f"{self._memory_path.stem}.sessions"
         self._session_index: dict[str, dict] = {}
         self._last_normal_reply_at = 0.0
         self._workspace = None
@@ -729,33 +730,28 @@ class WeChatGuiRpaBot:
 
     def _load_session_payload(self, key: str, sess: SessionState) -> None:
         meta = self._session_index.get(key, {})
-        path = self._memory_session_path(key, str(meta.get("path", "")))
-        history_items: list[dict] = []
-        payload: dict = {}
-        if path.exists():
-            try:
-                payload = json.loads(path.read_text(encoding="utf-8"))
-            except Exception as exc:
-                print(f"[warn] session payload load failed: key={key} path={path} err={exc}")
-                payload = {}
-        if isinstance(payload, dict):
-            history_items = self._normalize_history_items(payload.get("history", []))
-            if not sess.short:
-                short = payload.get("short", [])
-                if isinstance(short, list):
-                    sess.short = [str(x) for x in short][-max(4, self.cfg.memory_short_max_items) :]
-            if not sess.summary:
-                sess.summary = str(payload.get("summary", ""))[: max(120, self.cfg.memory_summary_max_chars)]
-            if not sess.titles:
-                sess.titles = set(self._normalize_session_titles(payload.get("titles", [])))
-            if not sess.muted:
-                sess.muted = bool(payload.get("muted", False))
+        dir_name = str(meta.get("dir", key))
+        history_records = self.chat_history.load_all(dir_name)
+        history_items = self._normalize_history_items(history_records)
+        if not sess.short and isinstance(meta.get("short", []), list):
+            sess.short = [str(x) for x in meta["short"]][-max(4, self.cfg.memory_short_max_items) :]
+        if not sess.summary:
+            sess.summary = str(meta.get("summary", ""))[: max(120, self.cfg.memory_summary_max_chars)]
+        if not sess.titles:
+            sess.titles = set(self._normalize_session_titles(meta.get("titles", [])))
+        if not sess.muted:
+            sess.muted = bool(meta.get("muted", False))
         sess.history = (
             history_items[-max(0, self.cfg.memory_history_max_items) :]
             if self.cfg.memory_history_max_items > 0
             else history_items
         )
         sess.loaded = True
+        for item in history_items:
+            sender = str(item.get("sender", "")).strip()
+            text = str(item.get("text", "")).strip()
+            if text:
+                sess.seen_content.add((sender, re.sub(r"\s+", "", text)[:220]))
 
     def _get_or_create_session(self, key: str, *, load_history: bool = True) -> SessionState:
         with self._state_lock:
@@ -923,7 +919,7 @@ class WeChatGuiRpaBot:
         role = str(record.get("role", "unknown")).strip().lower()
         content_type = str(record.get("content_type", "unknown")).strip().lower()
         sender = self._normalize_preview(str(record.get("sender", "")))[:40]
-        text = self._normalize_preview(str(record.get("text", "")))[:140]
+        text = re.sub(r"\s+", "", self._normalize_preview(str(record.get("text", ""))))[:140]
         return f"{role}|{content_type}|{sender}|{text}"
 
     def _append_session_record(
@@ -967,11 +963,21 @@ class WeChatGuiRpaBot:
         }
         if sender_raw:
             record["sender_raw"] = sender_raw
+        dedup_text = re.sub(r"\s+", "", clean)[:220]
+        content_key = (sender_clean, dedup_text)
+        if content_key in sess.seen_content:
+            return
         record_key = self._session_record_key(record)
-        if sess.history and self._session_record_key(sess.history[-1]) == record_key:
+        tail = sess.history[-500:]
+        if any(self._session_record_key(x) == record_key for x in tail):
             return
 
+        sess.seen_content.add(content_key)
+        if len(sess.seen_content) > 50000:
+            sess.seen_content = set()
         sess.history.append(record)
+        if str(record.get("source", "")) != "tool":
+            self.chat_history.append(row.title, record)
         hist_limit = max(0, int(self.cfg.memory_history_max_items))
         if hist_limit > 0 and len(sess.history) > hist_limit:
             del sess.history[:-hist_limit]
@@ -1090,6 +1096,8 @@ class WeChatGuiRpaBot:
             if not sess.history:
                 self._set_record_observed_range(incoming, after=int(time.time()) - 1)
                 sess.history = list(incoming)
+                for rec in incoming:
+                    self.chat_history.append(row.title, rec)
             elif prepend_overlap > 0 and prepend_overlap >= append_overlap:
                 new_records = incoming[:-prepend_overlap]
                 if not new_records:
@@ -1099,6 +1107,8 @@ class WeChatGuiRpaBot:
                     first_ts = int(sess.history[-1].get("observed_at", 0) or int(time.time()))
                 self._set_record_observed_range(new_records, before=first_ts)
                 sess.history = list(new_records) + list(sess.history)
+                for rec in new_records:
+                    self.chat_history.append(row.title, rec)
             elif append_overlap > 0:
                 new_records = incoming[append_overlap:]
                 if not new_records:
@@ -1106,12 +1116,16 @@ class WeChatGuiRpaBot:
                 last_ts = int(sess.history[-1].get("observed_at", 0) or 0)
                 self._set_record_observed_range(new_records, after=last_ts)
                 sess.history.extend(new_records)
+                for rec in new_records:
+                    self.chat_history.append(row.title, rec)
             else:
                 first_ts = int(sess.history[0].get("observed_at", 0) or 0)
                 if first_ts <= 0:
                     first_ts = int(time.time())
                 self._set_record_observed_range(incoming, before=first_ts)
                 sess.history = list(incoming) + list(sess.history)
+                for rec in incoming:
+                    self.chat_history.append(row.title, rec)
                 if self.cfg.log_verbose:
                     print(
                         f"[recover-merge] no overlap | key={self._fit_col(key, 12)} | "
@@ -1126,7 +1140,7 @@ class WeChatGuiRpaBot:
             self._memory_dirty = True
             return
 
-        existing_keys = [self._session_record_key(x) for x in sess.history[-40:]]
+        existing_keys = [self._session_record_key(x) for x in sess.history[-500:]]
         incoming_keys = [self._session_record_key(x) for x in incoming]
         overlap = 0
         max_overlap = min(len(existing_keys), len(incoming_keys))
@@ -1229,6 +1243,21 @@ class WeChatGuiRpaBot:
             else:
                 lines.append(f"{prefix}:{text[:140]}")
         return " | ".join(lines)[:1600]
+
+    def _search_session_history(
+        self,
+        row: ChatRowState,
+        *,
+        query: str,
+        limit: int = 10,
+        context: int = 2,
+    ) -> str:
+        return self.chat_history.search(
+            row.title,
+            query,
+            limit=limit,
+            context=context,
+        )
 
     def _workspace_context_for_row(
         self,
@@ -1334,8 +1363,53 @@ class WeChatGuiRpaBot:
     def _load_persistent_memory(self) -> None:
         if not self.cfg.memory_enabled:
             return
-        if not self._memory_path.exists():
+        index = self.chat_history.load_index()
+        sessions = index.get("sessions", {})
+        aliases = index.get("aliases", {})
+
+        if not sessions and not aliases:
+            if self._memory_path.exists():
+                print(
+                    "[memory] Old format detected. Run scripts/migrate_to_date_files.py to migrate."
+                )
+                self._load_persistent_memory_legacy()
             return
+
+        for key, data in sessions.items():
+            if not isinstance(data, dict):
+                continue
+            key_str = str(key).strip()
+            if not key_str:
+                continue
+            meta = {
+                "dir": str(data.get("dir", "")),
+                "short": [str(x) for x in (data.get("short", []) or [])][-max(4, self.cfg.memory_short_max_items) :]
+                if isinstance(data.get("short", []), list)
+                else [],
+                "summary": str(data.get("summary", ""))[: max(120, self.cfg.memory_summary_max_chars)],
+                "muted": bool(data.get("muted", False)),
+                "titles": self._normalize_session_titles(data.get("titles", [])),
+                "message_count": int(data.get("message_count", 0) or 0),
+                "updated_at": int(data.get("updated_at", 0) or 0),
+            }
+            self._session_index[key_str] = meta
+            self._sessions[key_str] = self._session_state_from_index(key_str, meta)
+
+        if isinstance(aliases, dict):
+            for k, v in aliases.items():
+                k2 = str(k).strip()
+                v2 = str(v).strip()
+                if k2 and v2:
+                    self._session_aliases[self._title_key(k2) or k2] = self._title_key(v2) or v2
+
+        self._memory_dirty = False
+        self._coalesce_loaded_sessions()
+        print(
+            f"[memory] loaded sessions={len(self._sessions)} aliases={len(self._session_aliases)} "
+            f"path={self._memory_path}"
+        )
+
+    def _load_persistent_memory_legacy(self) -> None:
         try:
             raw = json.loads(self._memory_path.read_text(encoding="utf-8"))
         except Exception as exc:
@@ -1354,6 +1428,7 @@ class WeChatGuiRpaBot:
                 if version >= 3:
                     relpath = str(data.get("path", "")).strip() or self._memory_session_relpath(key_str)
                     meta = {
+                        "dir": key_str,
                         "path": relpath,
                         "short": [str(x) for x in (data.get("short", []) or [])][-max(4, self.cfg.memory_short_max_items) :]
                         if isinstance(data.get("short", []), list)
@@ -1405,7 +1480,7 @@ class WeChatGuiRpaBot:
                 )
                 self._sessions[key_str] = sess
                 self._session_index[key_str] = {
-                    "path": self._memory_session_relpath(key_str),
+                    "dir": key_str,
                     "short": list(sess.short),
                     "summary": sess.summary,
                     "muted": bool(sess.muted),
@@ -1424,7 +1499,7 @@ class WeChatGuiRpaBot:
         self._memory_dirty = False
         self._coalesce_loaded_sessions()
         print(
-            f"[memory] loaded sessions={len(self._sessions)} aliases={len(self._session_aliases)} "
+            f"[memory] loaded (legacy) sessions={len(self._sessions)} aliases={len(self._session_aliases)} "
             f"path={self._memory_path}"
         )
 
@@ -1434,56 +1509,38 @@ class WeChatGuiRpaBot:
         if not self._memory_dirty:
             return
         try:
-            self._memory_path.parent.mkdir(parents=True, exist_ok=True)
-            self._memory_session_dir.mkdir(parents=True, exist_ok=True)
             now_ts = int(time.time())
+            index_data = self.chat_history.load_index()
             sessions_payload: dict[str, dict] = {}
             all_keys = set(self._session_index.keys()) | set(self._sessions.keys())
             for key in sorted(all_keys):
                 sess = self._sessions.get(key)
+                meta = self._session_index.get(key)
                 if sess is None:
-                    meta = self._session_index.get(key)
                     if isinstance(meta, dict):
                         sessions_payload[key] = dict(meta)
                     continue
-
-                relpath = self._memory_session_relpath(key)
+                display_title = next(iter(sess.titles), "")
+                dir_name = self.chat_history._safe_name(
+                    display_title if display_title else key
+                )
                 sessions_payload[key] = {
-                    "path": relpath,
+                    "dir": dir_name,
                     "short": sess.short[-max(4, self.cfg.memory_short_max_items) :],
                     "summary": sess.summary[: max(120, self.cfg.memory_summary_max_chars)],
                     "muted": bool(sess.muted),
                     "titles": sorted(sess.titles),
-                    "history_count": len(sess.history),
+                    "message_count": len(sess.history),
                     "updated_at": now_ts,
                 }
                 self._session_index[key] = dict(sessions_payload[key])
-                if not sess.loaded:
-                    continue
-                session_payload = {
-                    "version": 1,
-                    "saved_at": now_ts,
-                    "key": key,
-                    "short": sess.short[-max(4, self.cfg.memory_short_max_items) :],
-                    "history": sess.history,
-                    "summary": sess.summary[: max(120, self.cfg.memory_summary_max_chars)],
-                    "muted": bool(sess.muted),
-                    "titles": sorted(sess.titles),
-                }
-                self._memory_session_path(key, relpath).write_text(
-                    json.dumps(session_payload, ensure_ascii=False, indent=2),
-                    encoding="utf-8",
-                )
-
-            payload = {
-                "version": 3,
-                "saved_at": now_ts,
-                "sessions": sessions_payload,
-                "aliases": self._session_aliases,
-            }
-            self._memory_path.write_text(
-                json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
-            )
+                if sess.loaded and sess.history:
+                    for rec in sess.history:
+                        self.chat_history.append(display_title or key, rec)
+            index_data["sessions"] = sessions_payload
+            index_data["aliases"] = self._session_aliases
+            index_data["version"] = index_data.get("version", 1)
+            self.chat_history.save_index(index_data)
             self._memory_dirty = False
         except Exception as exc:
             print(f"[warn] memory save failed: {exc}")
@@ -1988,6 +2045,7 @@ class WeChatGuiRpaBot:
             "update_impression",
             "write_impression",
             "read_chat_history",
+            "search_chat_history",
             "run_python",
         ]
         if self._has_image_generation_tool():
@@ -3526,6 +3584,7 @@ class WeChatGuiRpaBot:
             "read_impression",
             "update_impression",
             "read_chat_history",
+            "search_chat_history",
         ]
 
     def _heartbeat_identity_text(self) -> str:
@@ -3543,7 +3602,8 @@ class WeChatGuiRpaBot:
 
     def _heartbeat_recent_chat_activity(self, *, max_chats: int = 10, max_lines: int = 60) -> str:
         items: list[tuple[int, str, list[dict]]] = []
-        for key, sess in self._sessions.items():
+        for key in list(self._sessions.keys()):
+            sess = self._get_or_create_session(key)
             history = [x for x in sess.history if isinstance(x, dict)]
             if not history:
                 continue
@@ -3597,7 +3657,8 @@ class WeChatGuiRpaBot:
             "萨比",
             "sabi",
         }
-        for sess in self._sessions.values():
+        for key in list(self._sessions.keys()):
+            sess = self._get_or_create_session(key)
             history = [x for x in sess.history[-max(1, per_chat_records) :] if isinstance(x, dict)]
             for record in history:
                 if str(record.get("role", "")).strip().lower() != "user":
@@ -3684,8 +3745,12 @@ class WeChatGuiRpaBot:
             "- scope=core stores stable facts, user preferences, self-improvement rules, and durable knowledge\n"
             "- scope=timeline stores dated events and recent activity\n"
             "- Keep each fact short and evidence-based.\n\n"
+            "- If the same event/fact is already present with different wording or source time, return no action\n"
+            "- Do not write timeline entries for minor progress updates unless they change the user's durable understanding\n\n"
             "IMPORTANT update_impression rules:\n"
             "- Add only observations grounded in recent chat activity or provided context\n"
+            "- Add only stable preferences, repeated behavior, relationships, or facts likely to matter later\n"
+            "- If the existing impression already says the same thing with different wording, return no action\n"
             "- Do not invent relationships, private facts, or motives\n"
             "- Use canonical Chinese name (NOT a file path)\n"
             "Supported internal write-phase tools: remember_fact, update_impression. "
@@ -3709,6 +3774,8 @@ class WeChatGuiRpaBot:
             "and short-term recent chat is provided here. Your only job is to append durable memory if the read observations "
             "and recent chat contain a meaningful stable fact, rule, user preference, or dated event. Use remember_fact only. "
             "Before writing, compare against the read memory observations and avoid duplicate notes caused by repeated chat events. "
+            "If an existing memory already covers the same event/fact with different wording, return no actions. "
+            "Do not write minor repeated progress updates, temporary chatter, or source-time-only changes. "
             "Do not update person impressions in this phase. If nothing is worth remembering, return no actions."
         )[:12000]
 
@@ -3733,7 +3800,9 @@ class WeChatGuiRpaBot:
             "The code selected this person from short-term recent speakers. The previous read phase has already produced their existing impression. "
             "Your only job is to call update_impression for this exact person when recent chat contains a new, grounded, "
             "useful observation about them. Do not update any other person. "
-            "Do not repeat facts already present in the existing impression. If there is no meaningful new observation, return no actions."
+            "Do not repeat facts already present in the existing impression, even if the wording or source time differs. "
+            "Only write stable preferences, repeated behavior, relationships, or facts likely to matter later. "
+            "If there is no meaningful new observation, return no actions."
         )[:12000]
 
     def _run_heartbeat(self, now: float, rows: list[ChatRowState]) -> bool:
@@ -4871,21 +4940,21 @@ class WeChatGuiRpaBot:
 
         # Avoid overly long multi-paragraph output for chat reply.
         if candidate:
-            merged = candidate
+            result = candidate
         else:
-            merged = _clip_reply(merged)
-            if not merged:
+            result = "\n".join(lines).strip()
+            if not result:
                 return fallback
 
-        if self._is_no_reply_signal(merged):
+        if self._is_no_reply_signal(result):
             return "[NO_REPLY]"
-        if self._is_payment_gate_reply(merged):
+        if self._is_payment_gate_reply(result):
             return fallback
 
         # If no CJK and no punctuation, treat as low quality.
-        if not re.search(r"[\u4e00-\u9fff]", merged):
+        if not re.search(r"[\u4e00-\u9fff]", result):
             return fallback
-        return merged
+        return result
 
     def _activate_wechat(self) -> None:
         self.sender.activate()
@@ -5187,6 +5256,20 @@ class WeChatGuiRpaBot:
             return message
         sender_raw = str(message.get("sender", "") or "").strip()
         if not sender_raw:
+            # Fallback: try to extract sender from text beginning
+            text = str(message.get("text", "") or "").strip()
+            if text:
+                self.people_alias_resolver._maybe_reload()
+                for alias, canonical in self.people_alias_resolver._mapping.items():
+                    if text.startswith(alias + " ") or text.startswith(alias + "：") or text.startswith(alias + ":"):
+                        # Found a known person name at the beginning
+                        message["sender_raw"] = alias
+                        message["sender"] = canonical
+                        # Remove the name from text
+                        remainder = text[len(alias):].lstrip(" ：:")
+                        message["text"] = remainder
+                        return message
+            return message
             return message
         sender, raw = self._canonicalize_sender_pair(sender_raw)
         if not sender:

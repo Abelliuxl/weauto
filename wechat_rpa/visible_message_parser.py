@@ -146,6 +146,10 @@ class VisibleMessageParser:
             sender = "self"
             if block.side == "other":
                 sender = self._find_sender(block.bbox, full_lines, image_boxes, width)
+                if sender and text.startswith(sender):
+                    stripped = text[len(sender):].strip()
+                    if stripped:
+                        text = stripped
             mentions = re.findall(r"@[^\s@]+", text)
             messages.append(
                 VisibleMessage(
@@ -381,9 +385,8 @@ class VisibleMessageParser:
                 continue
             if any(_contains(box, x, y, pad=2) for box in image_boxes):
                 continue
-            if y1 - 55 <= y <= y1 - 6 and 80 <= x <= max(360, x2 + 160, window_width * 0.45):
-                if not _contains(bbox, x, y, pad=8):
-                    candidates.append(line)
+            if y1 - 55 <= y <= y1 + 15 and 80 <= x <= max(360, x2 + 160, window_width * 0.45):
+                candidates.append(line)
         if not candidates:
             return ""
         return str(sorted(candidates, key=lambda line: (abs(float(line["y"]) - y1), abs(float(line["x"]) - x1)))[0]["text"])

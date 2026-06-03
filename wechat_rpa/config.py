@@ -216,7 +216,7 @@ class AppConfig:
     memory_gc_interval_sec: float = 60.0
     memory_watchdog_max_rss_mb: int = 0
     memory_enabled: bool = True
-    memory_store_path: str = "data/session_memory.json"
+    memory_store_path: str = "data/chat_history/_index.json"
     memory_short_max_items: int = 12
     memory_short_context_items: int = 8
     memory_summary_update_every: int = 4
@@ -225,6 +225,8 @@ class AppConfig:
     memory_history_context_items: int = 24
     # 0 means unlimited.
     memory_history_max_items: int = 0
+    memory_append_max_items: int = 200
+    impression_append_max_items: int = 80
     people_aliases_enabled: bool = True
     people_aliases_path: str = "data/config/PEOPLE_ALIASES.md"
     mention_send_enabled: bool = False
@@ -622,6 +624,12 @@ def load_config(path: str | Path | None) -> AppConfig:
     )
     cfg.memory_history_max_items = int(
         data.get("memory_history_max_items", cfg.memory_history_max_items)
+    )
+    cfg.memory_append_max_items = int(
+        data.get("memory_append_max_items", cfg.memory_append_max_items)
+    )
+    cfg.impression_append_max_items = int(
+        data.get("impression_append_max_items", cfg.impression_append_max_items)
     )
     cfg.people_aliases_enabled = bool(
         data.get("people_aliases_enabled", cfg.people_aliases_enabled)
@@ -1133,5 +1141,9 @@ def load_config(path: str | Path | None) -> AppConfig:
         cfg.heartbeat_min_idle_sec = 0.0
     if cfg.heartbeat_max_actions < 0:
         cfg.heartbeat_max_actions = 0
+    if cfg.memory_append_max_items < 20:
+        cfg.memory_append_max_items = 20
+    if cfg.impression_append_max_items < 20:
+        cfg.impression_append_max_items = 20
 
     return cfg

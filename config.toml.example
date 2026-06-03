@@ -39,7 +39,7 @@ memory_watchdog_max_rss_mb = 8192
 # Session Memory
 # ============================================================
 memory_enabled = true
-memory_store_path = "data/session_memory.json"
+memory_store_path = "data/chat_history/_index.json"
 memory_short_max_items = 12
 memory_short_context_items = 8
 memory_summary_update_every = 4
@@ -47,6 +47,8 @@ memory_summary_recent_items = 10
 memory_summary_max_chars = 500
 memory_history_context_items = 24
 memory_history_max_items = 1000
+memory_append_max_items = 200
+impression_append_max_items = 80
 
 # ============================================================
 # Person Aliases

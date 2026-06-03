@@ -48,6 +48,8 @@
 | `memory_summary_max_chars` | `500` | 摘要最大长度 |
 | `memory_history_context_items` | `24` | 构造历史上下文使用条数 |
 | `memory_history_max_items` | `0` | history 持久化上限（0=不限） |
+| `memory_append_max_items` | `200` | core/timeline 追加区 bullet 保留上限 |
+| `impression_append_max_items` | `80` | 单个人物印象追加观察 bullet 保留上限 |
 | `people_aliases_enabled` | `true` | 人物别名硬映射开关 |
 | `people_aliases_path` | `data/config/PEOPLE_ALIASES.md` | 别名文件 |
 

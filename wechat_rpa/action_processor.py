@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from difflib import SequenceMatcher
 import re
 import shutil
 import time
@@ -23,19 +24,216 @@ def _compact_note(raw: object, *, limit: int = 1200) -> str:
     return re.sub(r"\s+", " ", str(raw or "")).strip()[:limit]
 
 
-def _append_unique_note(existing: str, *, heading: str, bullet: str) -> tuple[str, bool]:
+def _strip_note_noise(text: str) -> str:
+    clean = str(text or "").strip().lstrip("- ").strip()
+    clean = re.sub(r"[（(]\s*来源[:：].*?[）)]\s*$", "", clean)
+    clean = re.sub(r"^\d{4}-\d{2}-\d{2}\s*[:：]\s*", "", clean)
+    clean = re.sub(r"\b\d{4}-\d{2}-\d{2}\b", "", clean)
+    clean = re.sub(r"\b\d{1,2}:\d{2}(?::\d{2})?\b", "", clean)
+    clean = re.sub(r"\b\d{1,2}-\d{1,2}\s+\d{1,2}:\d{2}\b", "", clean)
+    clean = re.sub(r"\s+", "", clean).lower()
+    return re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", clean)
+
+
+def _cjk_bigrams(text: str) -> set[str]:
+    chars = re.findall(r"[0-9a-z\u4e00-\u9fff]", text.lower())
+    if len(chars) < 2:
+        return set(chars)
+    return {"".join(chars[idx : idx + 2]) for idx in range(len(chars) - 1)}
+
+
+def _notes_are_similar(left: str, right: str) -> bool:
+    a = _strip_note_noise(left)
+    b = _strip_note_noise(right)
+    if not a or not b:
+        return False
+    if a == b or a in b or b in a:
+        return True
+    if min(len(a), len(b)) < 16:
+        return False
+    ratio = SequenceMatcher(None, a, b).ratio()
+    if ratio >= 0.82:
+        return True
+    a2 = _cjk_bigrams(a)
+    b2 = _cjk_bigrams(b)
+    if not a2 or not b2:
+        return False
+    overlap = len(a2 & b2) / max(1, min(len(a2), len(b2)))
+    return ratio >= 0.68 and overlap >= 0.55
+
+
+def _iter_existing_bullets(existing: str) -> list[str]:
+    bullets: list[str] = []
+    for raw_line in (existing or "").splitlines():
+        line = raw_line.strip()
+        if line.startswith("- "):
+            bullets.append(line)
+    return bullets
+
+
+def _prefer_replacement(old_bullet: str, new_bullet: str) -> bool:
+    old_clean = _strip_note_noise(old_bullet)
+    new_clean = _strip_note_noise(new_bullet)
+    if not old_clean or not new_clean:
+        return False
+    if old_clean == new_clean:
+        return False
+    if old_clean in new_clean and len(new_clean) >= len(old_clean) + 6:
+        return True
+    return len(new_clean) >= int(len(old_clean) * 1.18) and len(new_clean) >= len(old_clean) + 8
+
+
+def _dedup_bullets_once(bullets: list[str]) -> list[str]:
+    out: list[str] = []
+    for bullet in bullets:
+        clean = bullet.strip()
+        if not clean:
+            continue
+        if not clean.startswith("- "):
+            clean = f"- {clean.lstrip('- ').strip()}"
+        replaced = False
+        for idx, existing in enumerate(out):
+            if not _notes_are_similar(clean, existing):
+                continue
+            if _prefer_replacement(existing, clean):
+                out[idx] = clean
+            replaced = True
+            break
+        if not replaced:
+            out.append(clean)
+    return out
+
+
+def _dedup_bullets(bullets: list[str]) -> list[str]:
+    current = list(bullets)
+    for _ in range(8):
+        deduped = _dedup_bullets_once(current)
+        if deduped == current:
+            return deduped
+        current = deduped
+    return current
+
+
+def _normalize_managed_heading(existing: str, *, heading: str, max_items: int = 0) -> str:
+    body = (existing or "").rstrip()
+    if not body:
+        return ""
+    lines = body.splitlines()
+    out: list[str] = []
+    collected: list[str] = []
+    insert_idx: int | None = None
+    idx = 0
+    while idx < len(lines):
+        line = lines[idx]
+        if line.strip() != heading:
+            out.append(line)
+            idx += 1
+            continue
+
+        if insert_idx is None:
+            if out and out[-1].strip():
+                out.append("")
+            out.append(heading)
+            insert_idx = len(out)
+        idx += 1
+        while idx < len(lines) and not lines[idx].startswith("## "):
+            clean = lines[idx].strip()
+            if clean.startswith("- "):
+                collected.append(clean)
+            idx += 1
+
+    if insert_idx is None:
+        return body + "\n"
+
+    bullets = _dedup_bullets(collected)
+    if max_items > 0 and len(bullets) > max_items:
+        bullets = bullets[-max_items:]
+    for offset, bullet in enumerate(bullets):
+        out.insert(insert_idx + offset, bullet)
+
+    normalized = "\n".join(out).rstrip()
+    return normalized + ("\n" if normalized else "")
+
+
+def _replace_similar_bullet(existing: str, *, heading: str, bullet: str, max_items: int = 0) -> tuple[str, bool, bool]:
+    normalized = _normalize_managed_heading(existing, heading=heading, max_items=max_items)
+    lines = normalized.rstrip().splitlines()
+    structurally_changed = normalized != (existing.rstrip() + ("\n" if existing.strip() else ""))
+    for idx, line in enumerate(lines):
+        if not line.strip().startswith("- "):
+            continue
+        if not _notes_are_similar(bullet, line):
+            continue
+        if _prefer_replacement(line, bullet):
+            lines[idx] = bullet
+            merged = "\n".join(lines).rstrip() + "\n"
+            merged = _normalize_managed_heading(merged, heading=heading, max_items=max_items)
+            return merged, True, True
+        return normalized, structurally_changed, False
+    return normalized, structurally_changed, True
+
+
+def _append_to_heading(existing: str, *, heading: str, bullet: str) -> str:
+    body = (existing or "").rstrip()
+    if not body:
+        return f"{heading}\n{bullet}\n"
+
+    lines = body.splitlines()
+    heading_idx = -1
+    for idx, line in enumerate(lines):
+        if line.strip() == heading:
+            heading_idx = idx
+            break
+    if heading_idx < 0:
+        return body + f"\n\n{heading}\n{bullet}\n"
+
+    insert_idx = len(lines)
+    for idx in range(heading_idx + 1, len(lines)):
+        if lines[idx].startswith("## "):
+            insert_idx = idx
+            break
+    while insert_idx > heading_idx + 1 and not lines[insert_idx - 1].strip():
+        insert_idx -= 1
+    lines.insert(insert_idx, bullet)
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _append_unique_note(existing: str, *, heading: str, bullet: str, max_items: int = 0) -> tuple[str, bool]:
     clean_bullet = bullet.strip()
     if not clean_bullet:
         return existing.rstrip() + ("\n" if existing.strip() else ""), False
-    normalized_existing = re.sub(r"\s+", " ", existing or "").strip()
-    normalized_note = re.sub(r"\s+", " ", clean_bullet.lstrip("- ").strip())
-    if normalized_note and normalized_note in normalized_existing:
-        return existing.rstrip() + ("\n" if existing.strip() else ""), False
-    body = (existing or "").rstrip()
-    if body:
-        body += "\n\n"
-    body += f"{heading}\n{clean_bullet}\n"
-    return body, True
+    if not clean_bullet.startswith("- "):
+        clean_bullet = f"- {clean_bullet.lstrip('- ').strip()}"
+    base, changed, should_append = _replace_similar_bullet(
+        existing,
+        heading=heading,
+        bullet=clean_bullet,
+        max_items=max(0, int(max_items or 0)),
+    )
+    if not should_append:
+        return base, changed
+    merged = _append_to_heading(base, heading=heading, bullet=clean_bullet)
+    merged = _normalize_managed_heading(
+        merged,
+        heading=heading,
+        max_items=max(0, int(max_items or 0)),
+    )
+    return merged, True
+
+
+def _format_memory_read(content: str, *, head_chars: int = 1000, tail_chars: int = 1800) -> str:
+    clean = (content or "").strip()
+    if not clean:
+        return "无"
+    head_chars = max(200, int(head_chars))
+    tail_chars = max(400, int(tail_chars))
+    if len(clean) <= head_chars + tail_chars + 200:
+        return clean
+    return (
+        clean[:head_chars].rstrip()
+        + "\n\n...（中间已省略，以下为最新尾部）...\n\n"
+        + clean[-tail_chars:].lstrip()
+    )
 
 
 def _memory_snippets(*, label: str, content: str, query_terms: list[str], limit: int) -> list[str]:
@@ -105,11 +303,19 @@ class ActionProcessor:
                     raw_name = str(args.get("name", "") or args.get("scope", "") or "all").strip().lower()
                     names = ["core", "timeline"] if raw_name in {"", "all", "*"} else [bot.agent_memory.normalize_name(raw_name)]
                     parts: list[str] = []
+                    multi_memory_read = len(names) > 1
                     for name in names:
                         content = bot.agent_memory.read(name).strip()
-                        parts.append(f"记忆[{name}]:\n{content[:2000] if content else '无'}")
+                        parts.append(
+                            f"记忆[{name}]:\n"
+                            + _format_memory_read(
+                                content,
+                                head_chars=650 if multi_memory_read else 1000,
+                                tail_chars=1300 if multi_memory_read else 1800,
+                            )
+                        )
                     status = "ok"
-                    obs = "\n\n".join(parts)[:2600]
+                    obs = "\n\n".join(parts)[:5000]
                     ok = True
                 elif tool == "recall_memory":
                     query = _compact_note(args.get("query", "") or args.get("text", ""), limit=80)
@@ -164,7 +370,12 @@ class ActionProcessor:
                             note = f"- {content}"
                         if source:
                             note += f"（来源：{source}）"
-                        merged, changed = _append_unique_note(existing, heading="## 追加记忆", bullet=note)
+                        merged, changed = _append_unique_note(
+                            existing,
+                            heading="## 追加记忆",
+                            bullet=note,
+                            max_items=int(getattr(bot.cfg, "memory_append_max_items", 200) or 200),
+                        )
                         if changed:
                             bot.agent_memory.write(name, merged)
                             status = "ok"
@@ -172,6 +383,22 @@ class ActionProcessor:
                         else:
                             status = "ok (duplicate)"
                             obs = f"记忆已存在 data/memory/{name}.md: {content[:120]}"
+                        ok = True
+                elif tool == "remember_session_fact":
+                    fact = _compact_note(args.get("fact", "") or args.get("content", "") or args.get("text", ""), limit=240)
+                    workspace = getattr(bot, "_workspace", None)
+                    if not fact:
+                        status = "skip (empty fact)"
+                    elif workspace is None or not hasattr(workspace, "remember_structured"):
+                        status = "skip (workspace unavailable)"
+                    else:
+                        workspace.remember_structured(
+                            session_key=key,
+                            title=row.title,
+                            facts=[fact],
+                        )
+                        status = "ok"
+                        obs = f"会话事实已记录: {fact}"
                         ok = True
                 elif tool == "write_memory":
                     name = bot.agent_memory.normalize_name(str(args.get("name", "core")))
@@ -291,7 +518,12 @@ class ActionProcessor:
                         if source:
                             bullet += f"（来源：{source}）"
                         base = existing or f"# {name}\n"
-                        merged, changed = _append_unique_note(base, heading="## 补充观察", bullet=bullet)
+                        merged, changed = _append_unique_note(
+                            base,
+                            heading="## 补充观察",
+                            bullet=bullet,
+                            max_items=int(getattr(bot.cfg, "impression_append_max_items", 80) or 80),
+                        )
                         if changed:
                             bot.agent_people.write(name, merged)
                             status = "ok"
@@ -342,7 +574,54 @@ class ActionProcessor:
                         max_items=max(1, min(100, limit)),
                     )
                     status = "ok" if history else "ok (empty)"
-                    obs = f"聊天记录[{chat_title or row.title}]:\n{history or '无'}"[:1800]
+                    obs = f"聊天记录[{chat_title or row.title}]:\n{history or '无'}"[:4000]
+                    ok = True
+                elif tool == "search_chat_history":
+                    query = re.sub(
+                        r"\s+",
+                        " ",
+                        str(args.get("query", "")).strip(),
+                    )[:120]
+                    if not query:
+                        status = "skip (empty query)"
+                    chat_title = re.sub(
+                        r"\s+",
+                        " ",
+                        str(args.get("chat_title", "") or args.get("title", "")).strip(),
+                    )[:80]
+                    limit_raw = args.get("limit", 10)
+                    context_raw = args.get("context", 2)
+                    try:
+                        limit = int(limit_raw)
+                    except Exception:
+                        limit = 10
+                    try:
+                        context = int(context_raw)
+                    except Exception:
+                        context = 2
+                    limit = max(1, min(30, limit))
+                    context = max(0, min(5, context))
+                    target_row = row
+                    if chat_title and bot._title_key(chat_title) != bot._title_key(row.title):
+                        target_row = type(row)(
+                            row_idx=row.row_idx,
+                            text=chat_title,
+                            title=chat_title,
+                            preview="",
+                            has_mention=False,
+                            has_unread_badge=False,
+                            fingerprint=f"history-{chat_title}",
+                            click_x_ratio=-1.0,
+                            click_y_ratio=-1.0,
+                        )
+                    result = bot._search_session_history(
+                        target_row,
+                        query=query,
+                        limit=limit,
+                        context=context,
+                    )
+                    obs = result[:4000]
+                    status = "ok"
                     ok = True
                 elif tool == "run_python":
                     code = str(args.get("code", "") or args.get("expression", "")).strip()
@@ -584,6 +863,10 @@ class ActionProcessor:
                 elif tool == "read_chat_history":
                     chat_title = re.sub(r"\s+", " ", str(args.get("chat_title", "")).strip())[:80]
                     obs = f"聊天记录读取[{chat_title or row.title}]失败: {err}"
+                elif tool == "search_chat_history":
+                    chat_title = re.sub(r"\s+", " ", str(args.get("chat_title", "")).strip())[:80]
+                    query = re.sub(r"\s+", " ", str(args.get("query", "")).strip())[:60]
+                    obs = f"聊天记录搜索[{query}][{chat_title or row.title}]失败: {err}"
                 elif tool == "run_python":
                     obs = f"Python执行失败: {err}"
                 elif tool == "build_wow_character_url":
@@ -625,9 +908,26 @@ class ActionProcessor:
                     "delete_skill",
                     "list_skills",
                     "read_chat_history",
+                    "search_chat_history",
                 }
             )
-            if ok and not heartbeat_internal_tool:
+            session_memory_tools = {
+                "read_memory",
+                "recall_memory",
+                "remember_fact",
+                "read_impression",
+                "update_impression",
+                "write_impression",
+                "write_memory",
+                "read_skill",
+                "update_skill",
+                "write_skill",
+                "delete_skill",
+                "list_skills",
+                "read_chat_history",
+                "search_chat_history",
+            }
+            if ok and tool not in session_memory_tools:
                 bot._append_session_record(
                     row,
                     role="assistant",
@@ -638,4 +938,4 @@ class ActionProcessor:
                     count_turn=False,
                 )
 
-        return "\n".join(traces)[:1500], "\n".join(observations)[:2200]
+        return "\n".join(traces)[:1500], "\n".join(observations)[:5000]

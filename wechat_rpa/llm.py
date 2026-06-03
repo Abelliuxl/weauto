@@ -2359,6 +2359,20 @@ class LlmReplyGenerator:
                     "limit": {"type": "integer", "minimum": 1, "maximum": 100},
                 },
             },
+            "search_chat_history": {
+                "description": (
+                    "Search ALL chat history by keywords (not just recent messages). "
+                    "Use this when asked 'who said X', 'has anyone mentioned Y', 'search history for Z'. "
+                    "Returns matching messages with surrounding context."
+                ),
+                "properties": {
+                    "query": {"type": "string", "description": "Keywords to search for (Chinese or English)."},
+                    "chat_title": {"type": "string", "description": "Exact chat title; optional. Defaults to current chat."},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 30, "description": "Max matching results to return."},
+                    "context": {"type": "integer", "minimum": 0, "maximum": 5, "description": "Number of surrounding messages to include per match."},
+                },
+                "required": ["query"],
+            },
             "run_python": {
                 "description": (
                     "Run short sandboxed Python for math, statistics, date arithmetic, unit conversion, "
@@ -2609,6 +2623,10 @@ class LlmReplyGenerator:
             "read_chat_history": (
                 "args={\"chat_title\":\"可选，不填为当前会话\",\"limit\":1-100} "
                 "读取最近聊天记录"
+            ),
+            "search_chat_history": (
+                "args={\"query\":\"关键词\",\"chat_title\":\"可选\",\"limit\":1-30,\"context\":0-5} "
+                "按关键词搜索全量聊天记录。用于\"谁提过X\"\"聊过Y\"\"查历史Z\"。返回匹配行+前后文"
             ),
             "run_python": (
                 "args={\"code\":\"短代码，需 print 输出\"} "
@@ -2949,6 +2967,35 @@ class LlmReplyGenerator:
                     except Exception:
                         limit = 50
                     args = {"chat_title": chat_title, "limit": max(1, min(100, limit))}
+                elif tool == "search_chat_history":
+                    query = re.sub(
+                        r"\s+",
+                        " ",
+                        str(args_obj.get("query", "")).strip(),
+                    )[:120]
+                    if not query:
+                        continue
+                    chat_title = re.sub(
+                        r"\s+",
+                        " ",
+                        str(args_obj.get("chat_title", "") or args_obj.get("title", "")).strip(),
+                    )[:80]
+                    limit_raw = args_obj.get("limit", 10)
+                    context_raw = args_obj.get("context", 2)
+                    try:
+                        limit = int(limit_raw)
+                    except Exception:
+                        limit = 10
+                    try:
+                        context = int(context_raw)
+                    except Exception:
+                        context = 2
+                    args = {
+                        "query": query,
+                        "chat_title": chat_title,
+                        "limit": max(1, min(30, limit)),
+                        "context": max(0, min(5, context)),
+                    }
                 elif tool == "run_python":
                     code = str(args_obj.get("code", "") or args_obj.get("expression", "")).strip()[:4000]
                     if not code:
