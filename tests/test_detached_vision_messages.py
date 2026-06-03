@@ -1,5 +1,7 @@
 from types import SimpleNamespace
 
+from PIL import Image
+
 from wechat_rpa.bot import WeChatGuiRpaBot
 from wechat_rpa.llm import LlmReplyGenerator
 from wechat_rpa.people_aliases import PersonAliasResolver
@@ -20,6 +22,18 @@ def test_vision_messages_to_visible_messages_preserves_order_and_self_sender():
     assert messages[2]["content_type"] == "image"
     assert messages[2]["vision_text"] == "显卡报错截图"
     assert messages[0]["fingerprint"] != messages[3]["fingerprint"]
+
+
+def test_detached_chat_body_hash_is_stable():
+    image = Image.new("RGB", (720, 1800), (247, 247, 247))
+    try:
+        first = WeChatGuiRpaBot._detached_chat_body_hash(image)
+        second = WeChatGuiRpaBot._detached_chat_body_hash(image)
+    finally:
+        image.close()
+
+    assert first
+    assert first == second
 
 
 def test_vision_sender_is_canonicalized_with_people_aliases(tmp_path):

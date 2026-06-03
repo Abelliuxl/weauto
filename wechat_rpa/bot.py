@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from difflib import SequenceMatcher
 import builtins
+import hashlib
 import html
 import importlib.util
 import json
