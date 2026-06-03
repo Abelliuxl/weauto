@@ -36,7 +36,7 @@
 
 1. `run.py` 加载配置并构造 `WeChatGuiRpaBot`
 2. `bot.run_forever()` 循环检测 detach 窗口
-3. `visible_message_parser` OCR 解析消息变化
+3. 默认由 `visible_message_parser` OCR 解析消息变化；启用 `detached_vision_parse_enabled` 时，窗口聊天区变化后先用 vision LLM 解析 messages JSON，失败再回退 OCR
 4. `message_handler.handle_event()` 处理事件
 5. `_reply()` 生成并发送回复
 

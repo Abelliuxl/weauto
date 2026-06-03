@@ -12,6 +12,7 @@ detached_window_capture_backend = "screencapture"
 detached_debug_save = false
 detached_reply_on_image = false
 detached_process_existing_on_start = false
+detached_vision_parse_enabled = false
 
 # ============================================================
 # Loop & Interaction Timing
@@ -288,11 +289,12 @@ api_key = ""
 api_key_env = "OPENAI_API_KEY"
 model = ""
 ollama_native = false
+openai_compat_think_mode = "on"
 timeout_sec = 12.0
 max_tokens = 512
 response_format_json_object = true
 fail_open = true
-reasoning_effort = "low"
+reasoning_effort = "minimal"
 debug_log_payload = false
 debug_log_response = false
 

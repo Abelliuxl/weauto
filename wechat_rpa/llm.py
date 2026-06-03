@@ -1666,6 +1666,127 @@ class LlmReplyGenerator:
             patched["response_format"] = {"type": "json_object"}
         return patched
 
+    @staticmethod
+    def _normalize_visible_message_items(data: object, *, limit: int = 24) -> list[dict]:
+        if isinstance(data, list):
+            raw_items = data
+        elif isinstance(data, dict):
+            if isinstance(data.get("messages"), list):
+                raw_items = data.get("messages") or []
+            elif isinstance(data.get("recent_messages"), list):
+                raw_items = data.get("recent_messages") or []
+            elif isinstance(data.get("chat_records"), list):
+                raw_items = data.get("chat_records") or []
+            else:
+                raw_items = []
+        else:
+            raw_items = []
+
+        messages: list[dict] = []
+        for item in raw_items:
+            if not isinstance(item, dict):
+                continue
+            sender = str(item.get("sender", "") or "").strip()
+            if not sender:
+                role = str(item.get("role", "") or "").strip().lower()
+                sender = "我" if role == "assistant" else ""
+            if not sender:
+                continue
+            raw_content = item.get("content", item.get("text", ""))
+            content = None if raw_content is None else str(raw_content).strip()
+            messages.append({"sender": sender[:40], "content": content})
+            if len(messages) >= limit:
+                break
+        return messages
+
+    def parse_visible_messages_from_image(
+        self,
+        image: Image.Image,
+        title: str,
+    ) -> dict:
+        if not self.is_vision_enabled():
+            raise RuntimeError("vision disabled")
+
+        data_url = self._image_to_data_url(image)
+        system_prompt = (
+            "你是一个微信聊天截图识别助手。只输出 JSON，不要输出解释、前言或 Markdown。"
+        )
+        user_text = (
+            f"会话标题: {title or '未知'}\n"
+            "任务：识别我提供的微信聊天记录截图，按截图中从上到下的顺序，"
+            "提取每一条聊天消息，并输出为固定 JSON 格式。\n"
+            "要求：\n"
+            "1. 只输出 JSON，不要输出解释、前言或 Markdown。\n"
+            "2. JSON 只包含 messages 字段。\n"
+            "3. 每条消息只包含 sender 和 content 两个字段。\n"
+            "4. sender 必须填写截图中实际显示的发送者昵称。\n"
+            "5. 如果是右侧绿色气泡，且截图中没有显示自己的昵称，sender 写 \"我\"。\n"
+            "6. 如果是左侧消息，sender 写该消息上方或头像旁显示的昵称。\n"
+            "7. 不要把 sender 固定写成 \"self\" 或 \"other\"，除非截图中发送者昵称本身就是这个词。\n"
+            "8. content 填写该条消息的原文内容，尽量保持原文，不要总结、改写或补充。\n"
+            "9. 如果消息是图片，content 格式为 \"[图片] 图片内容描述\"。\n"
+            "10. 如果消息是表情，content 格式为 \"[表情] 表情内容描述\"。\n"
+            "11. 如果消息是语音，content 格式为 \"[语音] 无法识别具体内容\"，除非截图中能看到语音转文字。\n"
+            "12. 如果消息是文件、视频、链接、转账等非纯文本内容，也在开头用方括号标明类型，例如 \"[文件]\"、\"[视频]\"、\"[链接]\"、\"[转账]\"。\n"
+            "13. 如果某条消息内容无法识别，content 写 null。\n"
+            "14. 不要输出任何总结、分析、判断、情绪理解或截图外的信息。\n"
+            "输出格式：{\"messages\":[{\"sender\":\"发送者昵称或我\",\"content\":\"消息原文或[图片] 图片描述\"}]}"
+        )
+        payload_body = {
+            "model": self.vision_cfg.model,
+            "temperature": 0.0,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": user_text},
+                        {"type": "image_url", "image_url": {"url": data_url}},
+                    ],
+                },
+            ],
+        }
+        base_max_tokens = self._effective_text_max_tokens(self.vision_cfg.max_tokens)
+        if base_max_tokens is not None:
+            payload_body["max_tokens"] = max(256, min(base_max_tokens, 1200))
+        payload = self._attach_vision_json_response_format(payload_body)
+        content = self._post_chat_vision(payload)
+        try:
+            parsed = self._extract_json_payload(content)
+        except Exception:
+            rescue_payload_body = {
+                "model": self.vision_cfg.model,
+                "temperature": 0.0,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": system_prompt + " 必须只返回一个 JSON 对象。",
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": (
+                                    "只输出 JSON：{\"messages\":[{\"sender\":\"我或昵称\",\"content\":\"原文或null\"}]}。"
+                                ),
+                            },
+                            {"type": "image_url", "image_url": {"url": data_url}},
+                        ],
+                    },
+                ],
+            }
+            if base_max_tokens is not None:
+                rescue_payload_body["max_tokens"] = max(256, min(base_max_tokens, 800))
+            rescue_payload = self._attach_vision_json_response_format(rescue_payload_body)
+            content = self._post_chat_vision(rescue_payload)
+            parsed = self._extract_json_payload(content)
+
+        messages = self._normalize_visible_message_items(parsed)
+        if not messages:
+            raise RuntimeError("vision messages JSON contains no messages")
+        return {"messages": messages}
+
     def parse_chat_from_image(
         self,
         image: Image.Image,

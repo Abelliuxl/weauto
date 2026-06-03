@@ -195,6 +195,9 @@ class AppConfig:
     detached_debug_save: bool = False
     detached_reply_on_image: bool = False
     detached_process_existing_on_start: bool = False
+    # When enabled, changed detached chat windows are parsed by the vision LLM
+    # into messages JSON. Local OCR remains the fallback.
+    detached_vision_parse_enabled: bool = False
     poll_interval_sec: float = 2.0
     action_cooldown_sec: float = 8.0
     normal_reply_interval_sec: float = 60.0
@@ -561,6 +564,9 @@ def load_config(path: str | Path | None) -> AppConfig:
     )
     cfg.detached_process_existing_on_start = bool(
         data.get("detached_process_existing_on_start", cfg.detached_process_existing_on_start)
+    )
+    cfg.detached_vision_parse_enabled = bool(
+        data.get("detached_vision_parse_enabled", cfg.detached_vision_parse_enabled)
     )
     cfg.poll_interval_sec = float(data.get("poll_interval_sec", cfg.poll_interval_sec))
     cfg.action_cooldown_sec = float(data.get("action_cooldown_sec", cfg.action_cooldown_sec))

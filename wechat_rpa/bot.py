@@ -42,7 +42,7 @@ from .message_handler import MessageHandler
 from .ocr import OcrEngine
 from .people_aliases import PersonAliasResolver
 from .sender import WeChatGuiSender
-from .visible_message_parser import VisibleMessageParser
+from .visible_message_parser import VisibleChatSnapshot, VisibleMessageParser
 from .visible_message_state import VisibleMessageStateStore
 from .window import WindowNotFoundError, get_front_window_bounds, screenshot_region
 
@@ -207,6 +207,7 @@ class WeChatGuiRpaBot:
         self.message_handler = MessageHandler(self)
         self.visible_message_parser = VisibleMessageParser(self.ocr_engine)
         self.visible_message_state = VisibleMessageStateStore()
+        self._detached_window_image_hashes: dict[int, str] = {}
         self._detached_bootstrapped = False
         self._state_lock = threading.RLock()
         self._send_lock = threading.Lock()
@@ -5284,13 +5285,122 @@ class WeChatGuiRpaBot:
     def _canonicalize_visible_messages(self, messages: list[dict]) -> list[dict]:
         return [self._canonicalize_visible_message(message) for message in messages]
 
+    @staticmethod
+    def _detached_chat_body_hash(image: Image.Image) -> str:
+        width, height = image.size
+        body_y1, body_y2 = VisibleMessageParser._chat_body_bounds(height)
+        body_y1 = max(0, min(height, body_y1))
+        body_y2 = max(body_y1, min(height, body_y2))
+        crop = image.crop((0, body_y1, width, body_y2))
+        try:
+            small = crop.convert("L").resize((96, 160))
+            try:
+                return hashlib.sha1(small.tobytes()).hexdigest()
+            finally:
+                small.close()
+        finally:
+            crop.close()
+
+    @staticmethod
+    def _vision_sender_is_self(sender: str) -> bool:
+        clean = re.sub(r"\s+", "", str(sender or "").strip()).lower()
+        return clean in {"我", "自己", "本人", "me", "self"}
+
+    @staticmethod
+    def _vision_content_type(content: str | None) -> str:
+        text = str(content or "").strip()
+        if text.startswith("[图片]") or text.startswith("[图片:"):
+            return "image"
+        if re.match(r"^\[(表情|语音|文件|视频|链接|转账|位置|小程序|名片)\]", text):
+            return "mixed"
+        return "unknown" if content is None else "text"
+
+    @staticmethod
+    def _vision_image_description(content: str) -> str:
+        text = str(content or "").strip()
+        text = re.sub(r"^\[图片\]\s*", "", text)
+        text = re.sub(r"^\[图片:[^\]]*\]\s*", "", text)
+        return text.strip()
+
+    @classmethod
+    def _vision_messages_to_visible_messages(cls, messages: list[dict]) -> list[dict]:
+        visible: list[dict] = []
+        occurrence_counts: dict[str, int] = {}
+        for idx, item in enumerate(messages):
+            if not isinstance(item, dict):
+                continue
+            sender_raw = str(item.get("sender", "") or "").strip()
+            if not sender_raw:
+                continue
+            raw_content = item.get("content", "")
+            content = None if raw_content is None else str(raw_content).strip()
+            text = "" if content is None else content
+            side = "self" if cls._vision_sender_is_self(sender_raw) else "other"
+            sender = "self" if side == "self" else sender_raw
+            content_type = cls._vision_content_type(content)
+            fingerprint_base = f"{side}|{content_type}|{sender_raw}|{text}"
+            occurrence = occurrence_counts.get(fingerprint_base, 0)
+            occurrence_counts[fingerprint_base] = occurrence + 1
+            message: dict = {
+                "side": side,
+                "sender": sender,
+                "content_type": content_type,
+                "text": text,
+                "bbox": [0, 0, 0, 0],
+                "fingerprint": f"vision|{fingerprint_base}|{occurrence}",
+                "source": "detached_window_vision_json",
+                "vision_index": idx,
+            }
+            if side == "other":
+                message["sender_raw"] = sender_raw[:40]
+            mentions = re.findall(r"@[^\s@]+", text)
+            if mentions:
+                message["mentions"] = mentions
+            if content_type == "image":
+                desc = cls._vision_image_description(text)
+                if desc:
+                    message["vision_text"] = desc[:800]
+            visible.append(message)
+        return visible
+
+    def _parse_detached_snapshot_with_vision(
+        self,
+        image: Image.Image,
+        *,
+        window_id: int,
+        title: str,
+    ) -> VisibleChatSnapshot:
+        parsed = self.llm.parse_visible_messages_from_image(image, title)
+        messages = self._vision_messages_to_visible_messages(parsed.get("messages") or [])
+        messages = self._canonicalize_visible_messages(messages)
+        width, height = image.size
+        return VisibleChatSnapshot(
+            schema="weauto_visible_messages_v1",
+            window_id=int(window_id),
+            title=str(title or ""),
+            captured_at=round(time.time(), 3),
+            source="detached_window_vision_json",
+            image_size={"width": int(width), "height": int(height)},
+            messages=messages,
+            latest_message=messages[-1] if messages else None,
+            debug=None,
+        )
+
     def _detached_message_record(self, message: dict, *, window_title: str = "") -> dict:
         side = str(message.get("side", "")).strip()
         content_type = str(message.get("content_type", "text")).strip().lower() or "text"
         text = re.sub(r"\s+", " ", str(message.get("text", "") or "")).strip()
         if content_type == "image":
             image_hash = str(message.get("image_hash", "")).strip()
-            text = f"[图片:{image_hash}]" if image_hash else "[图片]"
+            vision_text = re.sub(r"\s+", " ", str(message.get("vision_text", "") or "")).strip()
+            if image_hash:
+                text = f"[图片:{image_hash}]"
+                if vision_text:
+                    text = f"{text} {vision_text[:260]}"
+            elif text:
+                text = text[:320]
+            else:
+                text = "[图片]"
         sender = str(message.get("sender", "") or "").strip()[:40]
         if (not sender) and side == "other" and window_title:
             sender = window_title[:40]
@@ -5706,13 +5816,50 @@ class WeChatGuiRpaBot:
                         backend=self.cfg.detached_window_capture_backend,
                     )
                     title_slug = safe_window_name(window.title)
-                    snapshot = self.visible_message_parser.parse(
-                        image,
-                        window_id=window.window_id,
-                        title=window.title,
-                        image_output_dir=image_root / title_slug / "images",
-                        include_debug=self.cfg.detached_debug_save,
-                    )
+                    snapshot = None
+                    image_hash = ""
+                    if self.cfg.detached_vision_parse_enabled and self.llm.is_vision_enabled():
+                        image_hash = f"{window.title}|{self._detached_chat_body_hash(image)}"
+                        old_hash = self._detached_window_image_hashes.get(window.window_id, "")
+                        if old_hash and old_hash == image_hash:
+                            if image is not None:
+                                try:
+                                    image.close()
+                                except Exception:
+                                    pass
+                            continue
+                        try:
+                            snapshot = self._parse_detached_snapshot_with_vision(
+                                image,
+                                window_id=window.window_id,
+                                title=window.title,
+                            )
+                            self._detached_window_image_hashes[window.window_id] = image_hash
+                            if self.cfg.log_verbose:
+                                print(
+                                    f"[vision] detached title={self._fit_col(window.title, 14)} "
+                                    f"messages={len(snapshot.messages)}"
+                                )
+                        except Exception as exc:
+                            print(f"[warn] detached vision parse failed title={window.title!r}: {exc}")
+                            if not self.cfg.vision.fail_open:
+                                if image is not None:
+                                    try:
+                                        image.close()
+                                    except Exception:
+                                        pass
+                                continue
+                            print("[vision] fail-open: fallback to local OCR parser")
+                    if snapshot is None:
+                        snapshot = self.visible_message_parser.parse(
+                            image,
+                            window_id=window.window_id,
+                            title=window.title,
+                            image_output_dir=image_root / title_slug / "images",
+                            include_debug=self.cfg.detached_debug_save,
+                        )
+                        if image_hash:
+                            self._detached_window_image_hashes[window.window_id] = image_hash
                     for msg in snapshot.messages:
                         if (not msg.get("sender")) and msg.get("side") == "other" and window.title:
                             msg["sender"] = window.title[:40]

@@ -16,6 +16,7 @@
 | `detached_debug_save` | `false` | 保存窗口截图到 `data/detached_window_images/` |
 | `detached_reply_on_image` | `false` | 是否回复纯图片消息 |
 | `detached_process_existing_on_start` | `false` | 启动时是否处理窗口已有消息 |
+| `detached_vision_parse_enabled` | `false` | 窗口聊天区变化后先用 vision LLM 解析 messages JSON，失败按 `[vision].fail_open` 回退 OCR |
 
 ## 3. 主循环与交互
 
