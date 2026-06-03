@@ -26,9 +26,11 @@ data/config/*
 !data/memory/
 data/memory/*
 !data/memory/*.md
-!data/people/
-data/people/*
-!data/people/*.md
+data/memory/core.md
+data/memory/timeline.md
+# !data/people/           # people files are per-user generated — ignore all
+# data/people/*
+# !data/people/*.md
 !data/skills/
 data/skills/**
 !data/skills/**/
