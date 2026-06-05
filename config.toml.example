@@ -150,7 +150,9 @@ python_sandbox_restricted = true
 heartbeat_enabled = false
 heartbeat_interval_sec = 300.0
 heartbeat_min_idle_sec = 20.0
-heartbeat_max_actions = 8
+heartbeat_max_actions = 24
+heartbeat_max_people = 10
+heartbeat_people_history_records = 100
 
 # ============================================================
 # Reply Policy & Group Rules

@@ -5,6 +5,8 @@ description: Build Chinese WoW official armory character links from character/se
 
 # WoW Character Link
 
+- 触发词: 魔兽角色链接, WoW角色主页, 角色页面, 角色主页, 主页, 玩家职业角色, build_wow_character_url
+
 Use this skill to resolve a World of Warcraft CN character and build its official character URL.
 
 ## URL Rule

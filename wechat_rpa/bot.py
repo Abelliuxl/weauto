@@ -5,7 +5,7 @@ import concurrent.futures
 import gc
 import queue
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from difflib import SequenceMatcher
 import builtins
 import hashlib
@@ -229,6 +229,7 @@ class WeChatGuiRpaBot:
         self._summary_turn_counter: dict[str, int] = defaultdict(int)
         self._memory_dirty = False
         self._memory_path = Path(self.cfg.memory_store_path)
+        self._runtime_state_path = Path("data/runtime_state.json")
         self._session_index: dict[str, dict] = {}
         self._last_normal_reply_at = 0.0
         self._workspace = None
@@ -239,6 +240,7 @@ class WeChatGuiRpaBot:
         self._last_activity_at = 0.0
         self._last_memory_gc_at = 0.0
         self._memory_restart_pending = False
+        self._load_runtime_state()
         self._load_persistent_memory()
 
     def _to_np_rgb(self, pil_image) -> np.ndarray:
@@ -337,8 +339,83 @@ class WeChatGuiRpaBot:
                 f"[memory] rss={rss_mb}MB restart pending; "
                 "queues idle, saving state and restarting process"
             )
+            self._save_runtime_state()
             self._save_persistent_memory()
             os.execv(sys.executable, [sys.executable, "-u", *sys.argv])
+
+    @staticmethod
+    def _coerce_runtime_timestamp(value: object) -> float:
+        try:
+            ts = float(value)
+        except Exception:
+            return 0.0
+        if ts <= 0:
+            return 0.0
+        now = time.time()
+        # Ignore impossible future values caused by clock changes or corrupt files.
+        if ts > now + 300.0:
+            return 0.0
+        return ts
+
+    def _load_runtime_state(self) -> None:
+        path = getattr(self, "_runtime_state_path", Path("data/runtime_state.json"))
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return
+        except Exception as exc:
+            print(f"[warn] runtime state load failed: {exc}")
+            return
+        if not isinstance(raw, dict):
+            return
+        self._last_normal_reply_at = self._coerce_runtime_timestamp(raw.get("last_normal_reply_at"))
+        self._last_heartbeat_at = self._coerce_runtime_timestamp(raw.get("last_heartbeat_at"))
+        self._last_activity_at = self._coerce_runtime_timestamp(raw.get("last_activity_at"))
+        if self.cfg.log_verbose:
+            print(
+                "[runtime] loaded "
+                f"normal={self._last_normal_reply_at:.0f} "
+                f"heartbeat={self._last_heartbeat_at:.0f} "
+                f"activity={self._last_activity_at:.0f} "
+                f"path={path}"
+            )
+
+    def _save_runtime_state(self) -> None:
+        path = getattr(self, "_runtime_state_path", Path("data/runtime_state.json"))
+        payload = {
+            "version": 1,
+            "saved_at": time.time(),
+            "last_normal_reply_at": float(getattr(self, "_last_normal_reply_at", 0.0) or 0.0),
+            "last_heartbeat_at": float(getattr(self, "_last_heartbeat_at", 0.0) or 0.0),
+            "last_activity_at": float(getattr(self, "_last_activity_at", 0.0) or 0.0),
+        }
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+            tmp.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            os.replace(tmp, path)
+        except Exception as exc:
+            print(f"[warn] runtime state save failed: {exc}")
+
+    def _mark_normal_reply_at(self, now: float) -> None:
+        self._last_normal_reply_at = max(0.0, float(now or 0.0))
+        self._save_runtime_state()
+
+    def _mark_heartbeat_at(self, now: float) -> None:
+        self._last_heartbeat_at = max(0.0, float(now or 0.0))
+        self._save_runtime_state()
+
+    def _mark_activity_at(self, now: float, *, persist: bool = True) -> None:
+        self._last_activity_at = max(0.0, float(now or 0.0))
+        if persist:
+            self._save_runtime_state()
+
+    def _ensure_start_activity_at(self, now: float) -> None:
+        if self._last_activity_at <= 0:
+            self._mark_activity_at(now, persist=False)
 
     @staticmethod
     def _strip_markdown_formatting(text: str) -> str:
@@ -1239,12 +1316,129 @@ class WeChatGuiRpaBot:
             sender = re.sub(r"\s+", " ", str(item.get("sender", ""))).strip()[:24]
             if not text:
                 continue
+            ts = int(item.get("observed_at", 0) or 0)
+            ts_text = datetime.fromtimestamp(ts).strftime("%m-%d %H:%M") if ts > 0 else "--"
             prefix = "A" if role == "assistant" else ("U" if role == "user" else "?")
             if role == "user" and sender:
-                lines.append(f"{prefix}({sender}):{text[:128]}")
+                lines.append(f"{ts_text} {prefix}({sender}):{text[:128]}")
             else:
-                lines.append(f"{prefix}:{text[:140]}")
+                lines.append(f"{ts_text} {prefix}:{text[:140]}")
         return " | ".join(lines)[:1600]
+
+    @staticmethod
+    def _normalize_history_date(value: str) -> str:
+        clean = re.sub(r"\s+", "", str(value or "")).strip()
+        now = datetime.now()
+        if not clean or clean.lower() in {"today", "tod", "now"} or clean in {"今天", "今日", "当天"}:
+            return now.strftime("%Y-%m-%d")
+        if clean.lower() in {"yesterday", "yst"} or clean in {"昨天", "昨日"}:
+            return (now - timedelta(days=1)).strftime("%Y-%m-%d")
+        if re.fullmatch(r"\d{4}-\d{1,2}-\d{1,2}", clean):
+            try:
+                return datetime.strptime(clean, "%Y-%m-%d").strftime("%Y-%m-%d")
+            except ValueError:
+                return now.strftime("%Y-%m-%d")
+        if re.fullmatch(r"\d{1,2}-\d{1,2}", clean):
+            try:
+                return datetime.strptime(f"{now.year}-{clean}", "%Y-%m-%d").strftime("%Y-%m-%d")
+            except ValueError:
+                return now.strftime("%Y-%m-%d")
+        return now.strftime("%Y-%m-%d")
+
+    @staticmethod
+    def _format_history_records(
+        records: list[dict],
+        *,
+        include_date: bool = False,
+        max_items: int = 400,
+        max_chars: int = 12000,
+    ) -> str:
+        lines: list[str] = []
+        for item in records[-max(1, int(max_items)) :]:
+            role = str(item.get("role", "unknown"))
+            text = re.sub(r"\s+", " ", str(item.get("text", ""))).strip()
+            if not text:
+                continue
+            sender = re.sub(r"\s+", " ", str(item.get("sender", ""))).strip()[:24]
+            ts = int(item.get("observed_at", 0) or 0)
+            fmt = "%m-%d %H:%M" if include_date else "%H:%M"
+            ts_text = datetime.fromtimestamp(ts).strftime(fmt) if ts > 0 else "--"
+            prefix = "A" if role == "assistant" else ("U" if role == "user" else "?")
+            who = f"{prefix}({sender})" if role == "user" and sender else prefix
+            lines.append(f"{ts_text} {who}: {text[:260]}")
+        return "\n".join(lines)[: max(800, int(max_chars))]
+
+    def _read_chat_history_by_date_text(
+        self,
+        row: ChatRowState,
+        *,
+        date: str = "",
+        max_items: int = 400,
+        max_chars: int = 12000,
+    ) -> str:
+        date_str = self._normalize_history_date(date)
+        records = self.chat_history.read_date(row.title, date_str)
+        if not records:
+            return f"聊天记录[{row.title}][{date_str}]: 无"
+        body = self._format_history_records(
+            records,
+            max_items=max_items,
+            max_chars=max_chars,
+        )
+        return (
+            f"聊天记录[{row.title}][{date_str}] 总记录={len(records)} "
+            f"显示={min(len(records), max(1, int(max_items)))}:\n{body}"
+        )
+
+    def _summarize_chat_history_by_date_text(
+        self,
+        row: ChatRowState,
+        *,
+        date: str = "",
+        max_chars: int = 7200,
+    ) -> str:
+        date_str = self._normalize_history_date(date)
+        records = self.chat_history.read_date(row.title, date_str)
+        if not records:
+            return f"群聊摘要素材[{row.title}][{date_str}]: 无当天聊天记录"
+
+        sender_counts: dict[str, int] = defaultdict(int)
+        hourly: dict[str, list[str]] = defaultdict(list)
+        seen_lines: set[str] = set()
+        for item in records:
+            role = str(item.get("role", "unknown"))
+            text = re.sub(r"\s+", " ", str(item.get("text", ""))).strip()
+            if not text:
+                continue
+            sender = re.sub(r"\s+", " ", str(item.get("sender", ""))).strip()
+            who = sender if role == "user" and sender else ("萨比" if role == "assistant" else role)
+            sender_counts[who] += 1
+            ts = int(item.get("observed_at", 0) or 0)
+            hour = datetime.fromtimestamp(ts).strftime("%H:00") if ts > 0 else "--"
+            compact = re.sub(r"\s+", "", text)
+            key = f"{who}|{compact[:80]}"
+            if key in seen_lines:
+                continue
+            seen_lines.add(key)
+            hourly[hour].append(f"{datetime.fromtimestamp(ts).strftime('%H:%M') if ts > 0 else '--'} {who}: {text[:180]}")
+
+        top_senders = "、".join(
+            f"{name}({count})"
+            for name, count in sorted(sender_counts.items(), key=lambda kv: kv[1], reverse=True)[:8]
+        )
+        parts = [
+            f"群聊摘要素材[{row.title}][{date_str}]",
+            f"总记录={len(records)}；活跃发言人={top_senders or '无'}",
+            "按时间段摘录（请据此概括主题；不要说没有记录，除非这里为空）：",
+        ]
+        for hour in sorted(hourly):
+            entries = hourly[hour]
+            if len(entries) > 12:
+                indexes = sorted({round(i * (len(entries) - 1) / 11) for i in range(12)})
+                entries = [entries[i] for i in indexes]
+            samples = " | ".join(entries)
+            parts.append(f"[{hour}] {samples}")
+        return "\n".join(parts)[: max(1200, int(max_chars))]
 
     def _search_session_history(
         self,
@@ -2047,6 +2241,8 @@ class WeChatGuiRpaBot:
             "update_impression",
             "write_impression",
             "read_chat_history",
+            "read_chat_history_by_date",
+            "summarize_chat_history",
             "search_chat_history",
             "run_python",
         ]
@@ -3586,6 +3782,8 @@ class WeChatGuiRpaBot:
             "read_impression",
             "update_impression",
             "read_chat_history",
+            "read_chat_history_by_date",
+            "summarize_chat_history",
             "search_chat_history",
         ]
 
@@ -3634,7 +3832,9 @@ class WeChatGuiRpaBot:
                 lines.append(f"{ts_text} {who}: {text[:180]}")
         return "\n".join(lines)[:6000]
 
-    def _heartbeat_recent_people(self, *, max_people: int = 4, per_chat_records: int = 20) -> list[str]:
+    def _heartbeat_recent_people(self, *, max_people: int, per_chat_records: int) -> list[str]:
+        if max_people <= 0:
+            return []
         candidates: list[tuple[int, str]] = []
         skip_names = {
             "",
@@ -3825,14 +4025,14 @@ class WeChatGuiRpaBot:
         is_admin = bool(self.cfg.admin_commands_enabled)
         action_limit = int(self.cfg.heartbeat_max_actions)
         if action_limit <= 0:
-            action_limit = 4
-        action_limit = max(1, min(12, action_limit))
+            return False
 
         recent_chat = self._heartbeat_recent_chat_activity(max_chats=10, max_lines=80)
         total_actions = 0
         memory_actions = 0
         person_write_actions = 0
         person_read_actions = 0
+        processed_people: list[str] = []
 
         memory_read_trace, memory_read_observations = self._execute_agent_actions(
             row,
@@ -3840,6 +4040,7 @@ class WeChatGuiRpaBot:
             is_admin=is_admin,
             max_actions_override=1,
         )
+        total_actions += 1
         if memory_read_trace and self.cfg.log_verbose:
             for ln in memory_read_trace.split("\n"):
                 if ln.strip():
@@ -3852,44 +4053,59 @@ class WeChatGuiRpaBot:
             f"{recent_chat or '无'}"
         )[:6000]
 
-        _, _, memory_actions, _, _ = self._run_agent_planner_loop(
-            planner=self.llm_heartbeat,
-            row=row,
-            reason="heartbeat",
-            is_group=False,
-            is_admin=is_admin,
-            latest_message="Heartbeat memory phase. Read current memory and short-term chat, then append durable memory if needed.",
-            chat_context=recent_chat,
-            environment_context=self._heartbeat_memory_prompt_text(
-                now,
-                recent_chat=recent_chat,
-            ),
-            session_context="",
-            workspace_context="",
-            memory_recall=memory_read_context,
-            tools=["remember_fact"],
-            per_round_max_actions=min(2, action_limit),
-            max_rounds_override=1,
-            max_total_actions_override=min(2, action_limit),
-        )
-        total_actions += 1 + memory_actions
+        memory_write_budget = min(2, max(0, action_limit - total_actions))
+        if memory_write_budget > 0:
+            _, _, memory_actions, _, _ = self._run_agent_planner_loop(
+                planner=self.llm_heartbeat,
+                row=row,
+                reason="heartbeat",
+                is_group=False,
+                is_admin=is_admin,
+                latest_message="Heartbeat memory phase. Read current memory and short-term chat, then append durable memory if needed.",
+                chat_context=recent_chat,
+                environment_context=self._heartbeat_memory_prompt_text(
+                    now,
+                    recent_chat=recent_chat,
+                ),
+                session_context="",
+                workspace_context="",
+                memory_recall=memory_read_context,
+                tools=["remember_fact"],
+                per_round_max_actions=memory_write_budget,
+                max_rounds_override=1,
+                max_total_actions_override=memory_write_budget,
+            )
+            total_actions += memory_actions
 
-        target_people = self._heartbeat_recent_people(max_people=4)
+        people_limit = max(0, int(self.cfg.heartbeat_max_people))
+        people_history_records = max(
+            1,
+            int(self.cfg.heartbeat_people_history_records),
+        )
+        target_people = self._heartbeat_recent_people(
+            max_people=people_limit,
+            per_chat_records=people_history_records,
+        )
         if target_people and self.cfg.log_verbose:
             print(f"[heartbeat] selected people={', '.join(target_people)}")
-        for person in target_people[:4]:
+        for person in target_people:
+            if total_actions >= action_limit:
+                break
             read_trace, read_observations = self._execute_agent_actions(
                 row,
                 [{"tool": "read_impression", "args": {"name": person}, "reason": "人物印象流程化读档"}],
                 is_admin=is_admin,
                 max_actions_override=1,
             )
+            processed_people.append(person)
             person_read_actions += 1
             total_actions += 1
             if read_trace and self.cfg.log_verbose:
                 for ln in read_trace.split("\n"):
                     if ln.strip():
                         print(f"        {ln}")
+            if total_actions >= action_limit:
+                continue
 
             _, _, update_count, _, _ = self._run_agent_planner_loop(
                 planner=self.llm_heartbeat,
@@ -3929,7 +4145,7 @@ class WeChatGuiRpaBot:
             f"[heartbeat] ran actions={total_actions:>2} "
             f"title={self._fit_col(row.title, 14)} "
             f"memory_writes={memory_actions} person_reads={person_read_actions} "
-            f"person_writes={person_write_actions} people={','.join(target_people)}"
+            f"person_writes={person_write_actions} people={','.join(processed_people)}"
         )
         self._memory_dirty = True
         return True
@@ -3945,7 +4161,7 @@ class WeChatGuiRpaBot:
         min_idle = float(self.cfg.heartbeat_min_idle_sec)
         if min_idle > 0 and self._last_activity_at > 0 and now - self._last_activity_at < min_idle:
             return False
-        self._last_heartbeat_at = now
+        self._mark_heartbeat_at(now)
         return self._run_heartbeat(now, rows)
 
     def _is_ignored_title(self, row: ChatRowState) -> bool:
@@ -5684,7 +5900,7 @@ class WeChatGuiRpaBot:
                     self._remember_sent_for_row(row, sent_norm, now)
                     self._append_session_item(row, "A", reply_text)
                     if self._is_normal_reply_event(row, reason):
-                        self._last_normal_reply_at = now
+                        self._mark_normal_reply_at(now)
             self._save_persistent_memory()
             return
 
@@ -5728,7 +5944,7 @@ class WeChatGuiRpaBot:
             self._remember_sent_for_row(row, sent_norm, now)
             self._append_session_item(row, "A", reply_text)
             if self._is_normal_reply_event(row, reason):
-                self._last_normal_reply_at = now
+                self._mark_normal_reply_at(now)
         self._save_persistent_memory()
 
     def _process_session_queue(self, window_id: int) -> None:
@@ -5779,8 +5995,7 @@ class WeChatGuiRpaBot:
         )
 
     def run_detached_window_forever(self) -> None:
-        self._last_activity_at = time.time()
-        self._last_heartbeat_at = 0.0
+        self._ensure_start_activity_at(time.time())
         image_root = Path(self.cfg.detached_window_output_dir).expanduser()
         print("[start] WeChat detached-window receiver started")
         print(f"[start] receiver=detached_windows poll={self.cfg.poll_interval_sec:.1f}s dry_run={self.cfg.dry_run}")
@@ -5954,7 +6169,7 @@ class WeChatGuiRpaBot:
                 self._detached_bootstrapped = True
                 print(f"[init] detached baseline windows={len(windows)}")
             if any_new:
-                self._last_activity_at = now
+                self._mark_activity_at(now)
             else:
                 self._maybe_run_heartbeat(now, [])
             self._save_persistent_memory()
@@ -6393,8 +6608,7 @@ class WeChatGuiRpaBot:
         return moved
 
     def run_recover_mode(self, *, countdown_sec: int = 3) -> None:
-        self._last_activity_at = time.time()
-        self._last_heartbeat_at = 0.0
+        self._ensure_start_activity_at(time.time())
         page = 0
         forced_is_group = self._prompt_recover_chat_type(mode_tag="recover")
         fixed_title = self._prompt_recover_title(
@@ -6438,8 +6652,7 @@ class WeChatGuiRpaBot:
             print(f"[recover] stopped | pages={page}")
 
     def run_recover_auto_mode(self, *, countdown_sec: int = 3) -> None:
-        self._last_activity_at = time.time()
-        self._last_heartbeat_at = 0.0
+        self._ensure_start_activity_at(time.time())
         page = 0
         forced_is_group = self._prompt_recover_chat_type(mode_tag="recover-auto")
         fixed_title = self._prompt_recover_title(
@@ -6489,8 +6702,7 @@ class WeChatGuiRpaBot:
             self.run_detached_window_forever()
             return
 
-        self._last_activity_at = time.time()
-        self._last_heartbeat_at = 0.0
+        self._ensure_start_activity_at(time.time())
         print("[start] WeChat GUI RPA started")
         print("[start] perms: Accessibility + Screen Recording")
         print(
@@ -6545,7 +6757,9 @@ class WeChatGuiRpaBot:
             f"[start] heartbeat: enabled={self.cfg.heartbeat_enabled} "
             f"interval={self.cfg.heartbeat_interval_sec:.1f}s "
             f"idle_min={self.cfg.heartbeat_min_idle_sec:.1f}s "
-            f"max_actions={self.cfg.heartbeat_max_actions}"
+            f"max_actions={self.cfg.heartbeat_max_actions} "
+            f"max_people={self.cfg.heartbeat_max_people} "
+            f"people_history={self.cfg.heartbeat_people_history_records}"
         )
         print(f"[start] web-search: {self._web_search_status_text()}")
         print(f"[start] image-gen: {self._image_generation_status_text()}")
@@ -6592,7 +6806,7 @@ class WeChatGuiRpaBot:
             event = self._pick_event(detected.rows, now)
             if event:
                 self._idle_streak = 0
-                self._last_activity_at = now
+                self._mark_activity_at(now)
                 row, reason = event
                 self.message_handler.handle_event(
                     rows=detected.rows,

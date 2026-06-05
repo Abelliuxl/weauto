@@ -302,7 +302,9 @@ class AppConfig:
     heartbeat_enabled: bool = False
     heartbeat_interval_sec: float = 300.0
     heartbeat_min_idle_sec: float = 20.0
-    heartbeat_max_actions: int = 8
+    heartbeat_max_actions: int = 24
+    heartbeat_max_people: int = 10
+    heartbeat_people_history_records: int = 100
     heartbeat_prompt: str = (
         "Scheduled self-reflection heartbeat. Maintain data/memory/core.md, "
         "data/memory/timeline.md, and data/people/*.md only when recent chat "
@@ -822,6 +824,15 @@ def load_config(path: str | Path | None) -> AppConfig:
     cfg.heartbeat_max_actions = int(
         data.get("heartbeat_max_actions", cfg.heartbeat_max_actions)
     )
+    cfg.heartbeat_max_people = int(
+        data.get("heartbeat_max_people", cfg.heartbeat_max_people)
+    )
+    cfg.heartbeat_people_history_records = int(
+        data.get(
+            "heartbeat_people_history_records",
+            cfg.heartbeat_people_history_records,
+        )
+    )
     cfg.heartbeat_prompt = str(data.get("heartbeat_prompt", cfg.heartbeat_prompt))
     cfg.reply_on_new_message = str(
         data.get("reply_on_new_message", cfg.reply_on_new_message)
@@ -1147,6 +1158,10 @@ def load_config(path: str | Path | None) -> AppConfig:
         cfg.heartbeat_min_idle_sec = 0.0
     if cfg.heartbeat_max_actions < 0:
         cfg.heartbeat_max_actions = 0
+    if cfg.heartbeat_max_people < 0:
+        cfg.heartbeat_max_people = 0
+    if cfg.heartbeat_people_history_records < 1:
+        cfg.heartbeat_people_history_records = 1
     if cfg.memory_append_max_items < 20:
         cfg.memory_append_max_items = 20
     if cfg.impression_append_max_items < 20:

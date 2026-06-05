@@ -576,6 +576,76 @@ class ActionProcessor:
                     status = "ok" if history else "ok (empty)"
                     obs = f"聊天记录[{chat_title or row.title}]:\n{history or '无'}"[:4000]
                     ok = True
+                elif tool == "read_chat_history_by_date":
+                    chat_title = re.sub(
+                        r"\s+",
+                        " ",
+                        str(args.get("chat_title", "") or args.get("title", "")).strip(),
+                    )[:80]
+                    date_value = str(args.get("date", "") or args.get("day", "")).strip()[:20]
+                    max_items_raw = args.get("max_items", args.get("limit", 400))
+                    max_chars_raw = args.get("max_chars", 12000)
+                    try:
+                        max_items = int(max_items_raw)
+                    except Exception:
+                        max_items = 400
+                    try:
+                        max_chars = int(max_chars_raw)
+                    except Exception:
+                        max_chars = 12000
+                    target_row = row
+                    if chat_title and bot._title_key(chat_title) != bot._title_key(row.title):
+                        target_row = type(row)(
+                            row_idx=row.row_idx,
+                            text=chat_title,
+                            title=chat_title,
+                            preview="",
+                            has_mention=False,
+                            has_unread_badge=False,
+                            fingerprint=f"history-date-{chat_title}",
+                            click_x_ratio=-1.0,
+                            click_y_ratio=-1.0,
+                        )
+                    obs = bot._read_chat_history_by_date_text(
+                        target_row,
+                        date=date_value,
+                        max_items=max(1, min(800, max_items)),
+                        max_chars=max(1200, min(20000, max_chars)),
+                    )
+                    status = "ok" if "]: 无" not in obs else "ok (empty)"
+                    ok = True
+                elif tool == "summarize_chat_history":
+                    chat_title = re.sub(
+                        r"\s+",
+                        " ",
+                        str(args.get("chat_title", "") or args.get("title", "")).strip(),
+                    )[:80]
+                    date_value = str(args.get("date", "") or args.get("day", "")).strip()[:20]
+                    max_chars_raw = args.get("max_chars", 7200)
+                    try:
+                        max_chars = int(max_chars_raw)
+                    except Exception:
+                        max_chars = 7200
+                    target_row = row
+                    if chat_title and bot._title_key(chat_title) != bot._title_key(row.title):
+                        target_row = type(row)(
+                            row_idx=row.row_idx,
+                            text=chat_title,
+                            title=chat_title,
+                            preview="",
+                            has_mention=False,
+                            has_unread_badge=False,
+                            fingerprint=f"history-summary-{chat_title}",
+                            click_x_ratio=-1.0,
+                            click_y_ratio=-1.0,
+                        )
+                    obs = bot._summarize_chat_history_by_date_text(
+                        target_row,
+                        date=date_value,
+                        max_chars=max(1200, min(8000, max_chars)),
+                    )
+                    status = "ok" if "无当天聊天记录" not in obs else "ok (empty)"
+                    ok = True
                 elif tool == "search_chat_history":
                     query = re.sub(
                         r"\s+",
@@ -863,6 +933,14 @@ class ActionProcessor:
                 elif tool == "read_chat_history":
                     chat_title = re.sub(r"\s+", " ", str(args.get("chat_title", "")).strip())[:80]
                     obs = f"聊天记录读取[{chat_title or row.title}]失败: {err}"
+                elif tool == "read_chat_history_by_date":
+                    chat_title = re.sub(r"\s+", " ", str(args.get("chat_title", "")).strip())[:80]
+                    date_value = str(args.get("date", "") or args.get("day", "")).strip()[:20]
+                    obs = f"按日聊天记录读取[{chat_title or row.title}][{date_value or 'today'}]失败: {err}"
+                elif tool == "summarize_chat_history":
+                    chat_title = re.sub(r"\s+", " ", str(args.get("chat_title", "")).strip())[:80]
+                    date_value = str(args.get("date", "") or args.get("day", "")).strip()[:20]
+                    obs = f"群聊摘要读取[{chat_title or row.title}][{date_value or 'today'}]失败: {err}"
                 elif tool == "search_chat_history":
                     chat_title = re.sub(r"\s+", " ", str(args.get("chat_title", "")).strip())[:80]
                     query = re.sub(r"\s+", " ", str(args.get("query", "")).strip())[:60]
@@ -908,6 +986,8 @@ class ActionProcessor:
                     "delete_skill",
                     "list_skills",
                     "read_chat_history",
+                    "read_chat_history_by_date",
+                    "summarize_chat_history",
                     "search_chat_history",
                 }
             )
@@ -925,6 +1005,8 @@ class ActionProcessor:
                 "delete_skill",
                 "list_skills",
                 "read_chat_history",
+                "read_chat_history_by_date",
+                "summarize_chat_history",
                 "search_chat_history",
             }
             if ok and tool not in session_memory_tools:

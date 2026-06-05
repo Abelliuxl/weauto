@@ -2474,16 +2474,43 @@ class LlmReplyGenerator:
                 "required": ["name"],
             },
             "read_chat_history": {
-                "description": "Read recent chat history. Defaults to current chat when chat_title is omitted.",
+                "description": "Read recent chat history with timestamps. Defaults to current chat when chat_title is omitted.",
                 "properties": {
                     "chat_title": {"type": "string", "description": "Exact chat title; optional."},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 100},
                 },
             },
+            "read_chat_history_by_date": {
+                "description": (
+                    "Read many timestamped messages from one chat on a specific local date. "
+                    "Use for detailed requests like '今天某群聊了什么', '昨天某群记录', or 'show me that day's chat'."
+                ),
+                "properties": {
+                    "chat_title": {"type": "string", "description": "Exact chat title, e.g. 群-临沧."},
+                    "date": {"type": "string", "description": "YYYY-MM-DD, MM-DD, today/今天, or yesterday/昨天. Defaults to today."},
+                    "max_items": {"type": "integer", "minimum": 1, "maximum": 800},
+                    "max_chars": {"type": "integer", "minimum": 1200, "maximum": 20000},
+                },
+                "required": ["chat_title"],
+            },
+            "summarize_chat_history": {
+                "description": (
+                    "Return compact timestamped summary material for one chat on one local date. "
+                    "Use FIRST when asked '今天/刚才/昨天某群聊了什么' or to summarize a day's group chat. "
+                    "Do not search the group name as a keyword before using this."
+                ),
+                "properties": {
+                    "chat_title": {"type": "string", "description": "Exact chat title, e.g. 群-临沧."},
+                    "date": {"type": "string", "description": "YYYY-MM-DD, MM-DD, today/今天, or yesterday/昨天. Defaults to today."},
+                    "max_chars": {"type": "integer", "minimum": 1200, "maximum": 8000},
+                },
+                "required": ["chat_title"],
+            },
             "search_chat_history": {
                 "description": (
                     "Search ALL chat history by keywords (not just recent messages). "
                     "Use this when asked 'who said X', 'has anyone mentioned Y', 'search history for Z'. "
+                    "Do NOT use it just to summarize what a named group chatted today; use summarize_chat_history/read_chat_history_by_date instead. "
                     "Returns matching messages with surrounding context."
                 ),
                 "properties": {
@@ -2743,11 +2770,19 @@ class LlmReplyGenerator:
             ),
             "read_chat_history": (
                 "args={\"chat_title\":\"可选，不填为当前会话\",\"limit\":1-100} "
-                "读取最近聊天记录"
+                "读取带时间戳的最近聊天记录"
+            ),
+            "read_chat_history_by_date": (
+                "args={\"chat_title\":\"群名\",\"date\":\"YYYY-MM-DD/today/今天/昨天\",\"max_items\":1-800,\"max_chars\":1200-20000} "
+                "按本地日期读取某会话大量带时间戳记录；适合需要细看当天聊天明细"
+            ),
+            "summarize_chat_history": (
+                "args={\"chat_title\":\"群名\",\"date\":\"YYYY-MM-DD/today/今天/昨天\",\"max_chars\":1200-8000} "
+                "读取某会话某天的紧凑摘要素材。遇到“今天/刚才/昨天某群聊了什么”“总结某群今天内容”必须优先用它，不要先搜索群名"
             ),
             "search_chat_history": (
                 "args={\"query\":\"关键词\",\"chat_title\":\"可选\",\"limit\":1-30,\"context\":0-5} "
-                "按关键词搜索全量聊天记录。用于\"谁提过X\"\"聊过Y\"\"查历史Z\"。返回匹配行+前后文"
+                "按关键词搜索全量聊天记录。用于\"谁提过X\"\"聊过Y\"\"查历史Z\"。返回匹配行+前后文；不要用于按群名总结当天聊天"
             ),
             "run_python": (
                 "args={\"code\":\"短代码，需 print 输出\"} "
@@ -3088,6 +3123,50 @@ class LlmReplyGenerator:
                     except Exception:
                         limit = 50
                     args = {"chat_title": chat_title, "limit": max(1, min(100, limit))}
+                elif tool == "read_chat_history_by_date":
+                    chat_title = re.sub(
+                        r"\s+",
+                        " ",
+                        str(args_obj.get("chat_title", "") or args_obj.get("title", "")).strip(),
+                    )[:80]
+                    if not chat_title:
+                        continue
+                    date_value = str(args_obj.get("date", "") or args_obj.get("day", "")).strip()[:20]
+                    max_items_raw = args_obj.get("max_items", args_obj.get("limit", 400))
+                    max_chars_raw = args_obj.get("max_chars", 12000)
+                    try:
+                        max_items = int(max_items_raw)
+                    except Exception:
+                        max_items = 400
+                    try:
+                        max_chars = int(max_chars_raw)
+                    except Exception:
+                        max_chars = 12000
+                    args = {
+                        "chat_title": chat_title,
+                        "date": date_value,
+                        "max_items": max(1, min(800, max_items)),
+                        "max_chars": max(1200, min(20000, max_chars)),
+                    }
+                elif tool == "summarize_chat_history":
+                    chat_title = re.sub(
+                        r"\s+",
+                        " ",
+                        str(args_obj.get("chat_title", "") or args_obj.get("title", "")).strip(),
+                    )[:80]
+                    if not chat_title:
+                        continue
+                    date_value = str(args_obj.get("date", "") or args_obj.get("day", "")).strip()[:20]
+                    max_chars_raw = args_obj.get("max_chars", 7200)
+                    try:
+                        max_chars = int(max_chars_raw)
+                    except Exception:
+                        max_chars = 7200
+                    args = {
+                        "chat_title": chat_title,
+                        "date": date_value,
+                        "max_chars": max(1200, min(8000, max_chars)),
+                    }
                 elif tool == "search_chat_history":
                     query = re.sub(
                         r"\s+",

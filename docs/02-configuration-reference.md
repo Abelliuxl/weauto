@@ -108,7 +108,9 @@
 | `heartbeat_enabled` | `false` | 心跳开关 |
 | `heartbeat_interval_sec` | `300.0` | 间隔 |
 | `heartbeat_min_idle_sec` | `20.0` | 最小空闲时间 |
-| `heartbeat_max_actions` | `4` | 单次最多内部动作数 |
+| `heartbeat_max_actions` | `24` | 单次最多内部动作数；读记忆、读人物印象、写入都计入预算 |
+| `heartbeat_max_people` | `10` | 单次心跳最多维护多少个最近发言人 |
+| `heartbeat_people_history_records` | `100` | 每个会话用于筛选最近发言人的历史记录条数 |
 | `heartbeat_fail_open` | `true` | 心跳失败不中断主循环 |
 
 可用工具：`read_impression`、`write_impression`、`write_memory`

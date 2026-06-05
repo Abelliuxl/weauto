@@ -298,7 +298,7 @@ class MessageHandler:
                 bot._remember_sent_for_row(row, sent_norm, now)
                 bot._append_session_item(row, "A", message)
                 if message and bot._is_normal_reply_event(row, reason):
-                    bot._last_normal_reply_at = now
+                    bot._mark_normal_reply_at(now)
             else:
                 self._mark_event_done(row, now)
             bot._save_persistent_memory()
@@ -369,7 +369,7 @@ class MessageHandler:
             if had_memory:
                 bot._remember_sent_for_row(row, sent_norm, now)
             if had_memory and message and bot._is_normal_reply_event(row, reason):
-                bot._last_normal_reply_at = now
+                bot._mark_normal_reply_at(now)
             bot._append_session_item(row, "A", message)
             bot._save_persistent_memory()
             sent_in_event += 1

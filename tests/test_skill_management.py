@@ -25,11 +25,19 @@ def test_skill_store_writes_to_data_skills_shape():
 
 
 def test_prompt_context_loads_skills():
-    context = build_prompt_context(include_long_term=False)
+    context = build_prompt_context(include_long_term=False, skill_query="吴工战士号主页发我")
 
     assert "[skills (" in context
     assert "wow-character-link" in context
     assert "build_wow_character_url" in context
+
+
+def test_prompt_context_loads_group_chat_digest_skill():
+    context = build_prompt_context(include_long_term=False, skill_query="今天群-临沧聊了什么")
+
+    assert "[skills (" in context
+    assert "group-chat-digest" in context
+    assert "summarize_chat_history" in context
 
 
 def test_wow_character_link_skill_builder_is_callable():
