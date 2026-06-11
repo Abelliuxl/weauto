@@ -670,6 +670,7 @@ class LlmReplyGenerator:
         exclude: bool,
         effort: str,
         think_mode: str,
+        reasoning_budget: int = 0,
     ) -> tuple[dict, bool]:
         # OpenAI-compatible provider-specific reasoning/think controls.
         # We inject a conservative superset and rely on fallback retry if provider rejects fields.
@@ -685,6 +686,35 @@ class LlmReplyGenerator:
 
         updated = dict(payload)
         controlled = False
+
+        if "integrate.api.nvidia.com" in provider:
+            # NVIDIA NIM uses chat-template controls rather than generic
+            # reasoning_effort/reasoning fields.
+            if normalized_mode in ("on", "off"):
+                template_kwargs = dict(updated.get("chat_template_kwargs") or {})
+                template_kwargs["enable_thinking"] = normalized_mode == "on"
+                updated["chat_template_kwargs"] = template_kwargs
+                if normalized_mode == "on" and reasoning_budget > 0:
+                    updated["reasoning_budget"] = max(
+                        1,
+                        min(32768, int(reasoning_budget)),
+                    )
+                else:
+                    updated.pop("reasoning_budget", None)
+                controlled = True
+            return updated, controlled
+
+        if "xiaomimimo.com" in provider:
+            # MiMo uses a provider-specific binary thinking switch:
+            # {"thinking": {"type": "enabled"|"disabled"}}.
+            # Do not send generic reasoning_effort to MiMo; it is not an effort-scale API.
+            if normalized_mode == "on":
+                updated["thinking"] = {"type": "enabled"}
+                controlled = True
+            elif normalized_mode == "off":
+                updated["thinking"] = {"type": "disabled"}
+                controlled = True
+            return updated, controlled
 
         reasoning_obj: dict[str, object] = {}
         if normalized_effort in ("minimal", "low", "medium", "high"):
@@ -1116,6 +1146,7 @@ class LlmReplyGenerator:
             exclude=self.cfg.reasoning_exclude,
             effort=self.cfg.reasoning_effort,
             think_mode=self.cfg.openai_compat_think_mode,
+            reasoning_budget=self.cfg.reasoning_budget,
         )
         self._log_transport_debug(
             label="llm",
@@ -1234,6 +1265,7 @@ class LlmReplyGenerator:
             exclude=self.cfg.reasoning_exclude,
             effort=self.cfg.reasoning_effort,
             think_mode=self.cfg.openai_compat_think_mode,
+            reasoning_budget=self.cfg.reasoning_budget,
         )
         self._log_transport_debug(
             label="llm",
@@ -1593,6 +1625,7 @@ class LlmReplyGenerator:
             exclude=self.vision_cfg.reasoning_exclude,
             effort=self.vision_cfg.reasoning_effort,
             think_mode=self.vision_cfg.openai_compat_think_mode,
+            reasoning_budget=self.vision_cfg.reasoning_budget,
         )
         self._log_transport_debug(
             label="vision",
@@ -2611,6 +2644,19 @@ class LlmReplyGenerator:
                     "class_name": {"type": "string", "description": "Class/job under the player, e.g. 战士."},
                 },
             },
+            "query_weather": {
+                "description": (
+                    "Query current weather and daily forecast for a city/location with QWeather. "
+                    "Choose location, mode, days, date, or day_offset from the user's request."
+                ),
+                "properties": {
+                    "location": {"type": "string", "description": "City/location name, e.g. 临沧, 北京, 上海浦东."},
+                    "days": {"type": "integer", "minimum": 1, "maximum": 30, "description": "Forecast days to request, up to 30."},
+                    "date": {"type": "string", "description": "Optional target date in YYYY-MM-DD; use when the user asks a specific day."},
+                    "day_offset": {"type": "integer", "minimum": 0, "maximum": 29, "description": "Optional offset from today: today=0, tomorrow=1."},
+                    "mode": {"type": "string", "enum": ["now", "forecast", "both"], "description": "Weather data scope."},
+                },
+            },
             "generate_image": {
                 "description": "Generate an image and send the local file.",
                 "properties": {
@@ -2803,6 +2849,11 @@ class LlmReplyGenerator:
             "build_wow_character_url": (
                 "args={\"character\":\"角色名\",\"server\":\"服务器\"} 或 "
                 "{\"player\":\"玩家/别名\",\"class_name\":\"职业\"} 构建国服魔兽角色主页链接"
+            ),
+            "query_weather": (
+                "args={\"location\":\"城市/地点\",\"days\":1-30,\"date\":\"YYYY-MM-DD可选\","
+                "\"day_offset\":\"今天0明天1可选\",\"mode\":\"now|forecast|both\"} "
+                "查询实时天气/每日预报；地点、目标日期和天数由你根据用户问题自行填写"
             ),
             "generate_image": (
                 "args={\"prompt\":\"<=280字\",\"size\":\"可选，如1024x1024\"} "
@@ -3257,6 +3308,43 @@ class LlmReplyGenerator:
                             args[dst] = value
                     if not any(args.get(k) for k in ("character", "server", "player", "class_name")):
                         continue
+                elif tool == "query_weather":
+                    location = re.sub(
+                        r"\s+",
+                        " ",
+                        str(
+                            args_obj.get("location", "")
+                            or args_obj.get("city", "")
+                            or args_obj.get("place", "")
+                        ).strip(),
+                    )[:80]
+                    args = {}
+                    if location:
+                        args["location"] = location
+                    days_raw = args_obj.get("days", args_obj.get("forecast_days", 3))
+                    try:
+                        days = int(days_raw)
+                    except Exception:
+                        days = 3
+                    args["days"] = max(1, min(30, days))
+                    date_value = re.sub(
+                        r"\s+",
+                        "",
+                        str(args_obj.get("date", "") or args_obj.get("target_date", "")).strip(),
+                    )[:20]
+                    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_value):
+                        args["date"] = date_value
+                    if "day_offset" in args_obj:
+                        try:
+                            offset = int(args_obj.get("day_offset"))
+                        except Exception:
+                            offset = -1
+                        if 0 <= offset <= 29:
+                            args["day_offset"] = offset
+                    mode = str(args_obj.get("mode", "") or "").strip().lower()
+                    if mode not in {"now", "forecast", "both"}:
+                        mode = "both"
+                    args["mode"] = mode
                 elif tool == "generate_image":
                     prompt = re.sub(
                         r"\s+",

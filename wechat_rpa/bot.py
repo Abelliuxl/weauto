@@ -42,6 +42,7 @@ from .llm import LlmReplyGenerator, prepare_terminal_for_log_line
 from .message_handler import MessageHandler
 from .ocr import OcrEngine
 from .people_aliases import PersonAliasResolver
+from .qweather import QWeatherClient
 from .sender import WeChatGuiSender
 from .visible_message_parser import VisibleChatSnapshot, VisibleMessageParser
 from .visible_message_state import VisibleMessageStateStore
@@ -191,6 +192,7 @@ class WeChatGuiRpaBot:
         self.llm = self.llm_reply
         self.image_generator = ImageGenerator(cfg.image_generation)
         self.image_editor = ImageEditor(cfg.image_editing)
+        self.qweather = self._make_qweather_client()
         self.bridge_client = BridgeClient(cfg)
         self.agent_memory = MemoryStore("data/memory")
         self.agent_skills = SkillStore("data/skills")
@@ -210,6 +212,7 @@ class WeChatGuiRpaBot:
         self.visible_message_state = VisibleMessageStateStore()
         self._detached_window_image_hashes: dict[int, str] = {}
         self._detached_bootstrapped = False
+        self._detached_watchdog_resume_window_ids: set[int] = set()
         self._state_lock = threading.RLock()
         self._send_lock = threading.Lock()
         self._visual_scan_paused_until = 0.0
@@ -339,7 +342,7 @@ class WeChatGuiRpaBot:
                 f"[memory] rss={rss_mb}MB restart pending; "
                 "queues idle, saving state and restarting process"
             )
-            self._save_runtime_state()
+            self._save_runtime_state(detached_watchdog_resume=True)
             self._save_persistent_memory()
             os.execv(sys.executable, [sys.executable, "-u", *sys.argv])
 
@@ -371,6 +374,7 @@ class WeChatGuiRpaBot:
         self._last_normal_reply_at = self._coerce_runtime_timestamp(raw.get("last_normal_reply_at"))
         self._last_heartbeat_at = self._coerce_runtime_timestamp(raw.get("last_heartbeat_at"))
         self._last_activity_at = self._coerce_runtime_timestamp(raw.get("last_activity_at"))
+        restored_detached = self._restore_detached_watchdog_resume(raw)
         if self.cfg.log_verbose:
             print(
                 "[runtime] loaded "
@@ -379,8 +383,60 @@ class WeChatGuiRpaBot:
                 f"activity={self._last_activity_at:.0f} "
                 f"path={path}"
             )
+        if restored_detached:
+            self._save_runtime_state()
 
-    def _save_runtime_state(self) -> None:
+    def _restore_detached_watchdog_resume(self, payload: dict) -> bool:
+        if getattr(self.cfg, "receiver_mode", "detached_windows") != "detached_windows":
+            return False
+        resume = payload.get("detached_watchdog_resume")
+        if not isinstance(resume, dict):
+            return False
+        saved_at = self._coerce_runtime_timestamp(resume.get("saved_at"))
+        if saved_at <= 0 or time.time() - saved_at > 600.0:
+            return False
+        state = resume.get("visible_message_state")
+        if not isinstance(state, dict) or not hasattr(self, "visible_message_state"):
+            return False
+        try:
+            self.visible_message_state.load_state(state)
+        except Exception as exc:
+            print(f"[warn] detached watchdog resume load failed: {exc}")
+            return False
+        windows_raw = state.get("windows")
+        if not isinstance(windows_raw, dict):
+            return False
+        restored_ids: set[int] = set()
+        for key, item in windows_raw.items():
+            try:
+                window_id = int(key)
+            except Exception:
+                continue
+            if isinstance(item, dict) and item.get("order"):
+                restored_ids.add(window_id)
+        if not restored_ids:
+            return False
+        self._detached_watchdog_resume_window_ids = restored_ids
+        self._detached_bootstrapped = True
+        if getattr(self.cfg, "log_verbose", False):
+            print(f"[runtime] detached watchdog resume windows={len(restored_ids)}")
+        return True
+
+    def _detached_watchdog_resume_payload(self) -> dict:
+        state_store = getattr(self, "visible_message_state", None)
+        if state_store is None or not hasattr(state_store, "export_state"):
+            return {}
+        state = state_store.export_state()
+        windows = state.get("windows") if isinstance(state, dict) else None
+        if not isinstance(windows, dict) or not windows:
+            return {}
+        return {
+            "version": 1,
+            "saved_at": time.time(),
+            "visible_message_state": state,
+        }
+
+    def _save_runtime_state(self, *, detached_watchdog_resume: bool = False) -> None:
         path = getattr(self, "_runtime_state_path", Path("data/runtime_state.json"))
         payload = {
             "version": 1,
@@ -389,6 +445,10 @@ class WeChatGuiRpaBot:
             "last_heartbeat_at": float(getattr(self, "_last_heartbeat_at", 0.0) or 0.0),
             "last_activity_at": float(getattr(self, "_last_activity_at", 0.0) or 0.0),
         }
+        if detached_watchdog_resume:
+            resume = self._detached_watchdog_resume_payload()
+            if resume:
+                payload["detached_watchdog_resume"] = resume
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
@@ -2252,6 +2312,8 @@ class WeChatGuiRpaBot:
             tools.append("edit_image")
         if self._has_wow_character_url_tool():
             tools.append("build_wow_character_url")
+        if self._has_weather_tool():
+            tools.append("query_weather")
         tools.append("fetch_url")
         tools.append("browse_url")
         # Keep planner whitelist aligned with runtime capability checks:
@@ -2387,6 +2449,67 @@ class WeChatGuiRpaBot:
             f"config.volc_ark_api_key or env {env_name}"
             if env_name
             else "config.volc_ark_api_key"
+        )
+
+    def _resolve_qweather_api_key(self) -> str:
+        if self.cfg.qweather_api_key:
+            return self.cfg.qweather_api_key
+        env_name = (self.cfg.qweather_api_key_env or "").strip()
+        return os.getenv(env_name, "").strip() if env_name else ""
+
+    def _make_qweather_client(self) -> QWeatherClient:
+        return QWeatherClient(
+            api_host=self.cfg.qweather_api_host,
+            auth_type=self.cfg.qweather_auth_type,
+            api_key=self._resolve_qweather_api_key(),
+            jwt_key_id=self.cfg.qweather_jwt_key_id,
+            jwt_project_id=self.cfg.qweather_jwt_project_id,
+            jwt_private_key_path=self.cfg.qweather_jwt_private_key_path,
+            jwt_ttl_sec=self.cfg.qweather_jwt_ttl_sec,
+            timeout_sec=self.cfg.qweather_timeout_sec,
+        )
+
+    def _has_weather_tool(self) -> bool:
+        if not bool(self.cfg.weather_enabled):
+            return False
+        if str(self.cfg.weather_provider or "").strip().lower() != "qweather":
+            return False
+        return self.qweather.is_configured()
+
+    def _weather_status_text(self) -> str:
+        if not bool(self.cfg.weather_enabled):
+            return "disabled (tool=query_weather weather_enabled=false)"
+        if str(self.cfg.weather_provider or "").strip().lower() != "qweather":
+            return f"blocked (tool=query_weather unsupported provider={self.cfg.weather_provider})"
+        return self.qweather.status_text()
+
+    def _query_weather(self, args: dict) -> str:
+        location = re.sub(
+            r"\s+",
+            " ",
+            str(args.get("location", "") or args.get("city", "") or "").strip(),
+        )[:80]
+        if not location:
+            location = str(self.cfg.weather_default_location or "").strip()
+        days_raw = args.get("days", self.cfg.weather_forecast_days)
+        try:
+            days = int(days_raw)
+        except Exception:
+            days = int(self.cfg.weather_forecast_days)
+        mode = str(args.get("mode", "") or "both").strip().lower()
+        date_value = re.sub(r"\s+", "", str(args.get("date", "") or args.get("target_date", "")).strip())[:20]
+        day_offset = None
+        if "day_offset" in args:
+            try:
+                day_offset = int(args.get("day_offset"))
+            except Exception:
+                day_offset = None
+        return self.qweather.query(
+            location=location,
+            days=days,
+            mode=mode,
+            date=date_value,
+            day_offset=day_offset,
         )
 
     def _has_volc_web_search_tool(self) -> bool:
@@ -5603,6 +5726,59 @@ class WeChatGuiRpaBot:
             debug=None,
         )
 
+    @staticmethod
+    def _detached_resume_text_key(message: dict) -> str:
+        content_type = str(message.get("content_type", "text") or "text").strip().lower()
+        text = str(message.get("text", "") or "").strip()
+        if content_type == "image":
+            text = " ".join(
+                part
+                for part in [
+                    text,
+                    str(message.get("vision_text", "") or "").strip(),
+                    str(message.get("image_hash", "") or "").strip(),
+                ]
+                if part
+            )
+        return re.sub(r"\s+", " ", text).strip()
+
+    def _detached_snapshot_from_restored_state(self, *, window_id: int, title: str) -> VisibleChatSnapshot | None:
+        messages = self.visible_message_state.messages_for_window(window_id)
+        if not messages:
+            return None
+        messages = self._canonicalize_visible_messages(messages)
+        return VisibleChatSnapshot(
+            schema="weauto_visible_messages_v1",
+            window_id=int(window_id),
+            title=str(title or ""),
+            captured_at=round(time.time(), 3),
+            source="detached_window_watchdog_resume",
+            image_size={"width": 0, "height": 0},
+            messages=messages,
+            latest_message=messages[-1] if messages else None,
+            debug=None,
+        )
+
+    def _detached_local_snapshot_has_unseen_content(
+        self,
+        *,
+        local_messages: list[dict],
+        restored_messages: list[dict],
+    ) -> bool:
+        restored_keys = {
+            key
+            for key in (self._detached_resume_text_key(message) for message in restored_messages)
+            if key
+        }
+        local_keys = [
+            key
+            for key in (self._detached_resume_text_key(message) for message in local_messages)
+            if key
+        ]
+        if len(local_keys) > len(restored_keys) and any(key not in restored_keys for key in local_keys):
+            return True
+        return any(key not in restored_keys for key in local_keys[-3:])
+
     def _detached_message_record(self, message: dict, *, window_title: str = "") -> dict:
         side = str(message.get("side", "")).strip()
         content_type = str(message.get("content_type", "text")).strip().lower() or "text"
@@ -6027,45 +6203,94 @@ class WeChatGuiRpaBot:
             for window in windows:
                 image = None
                 try:
+                    title_slug = safe_window_name(window.title)
+                    snapshot = None
+                    resume_snapshot = None
+                    if int(window.window_id) in self._detached_watchdog_resume_window_ids:
+                        resume_snapshot = self._detached_snapshot_from_restored_state(
+                            window_id=window.window_id,
+                            title=window.title,
+                        )
                     image = capture_window_by_id(
                         window.window_id,
                         backend=self.cfg.detached_window_capture_backend,
                     )
-                    title_slug = safe_window_name(window.title)
-                    snapshot = None
                     image_hash = ""
-                    if self.cfg.detached_vision_parse_enabled and self.llm.is_vision_enabled():
-                        image_hash = f"{window.title}|{self._detached_chat_body_hash(image)}"
-                        old_hash = self._detached_window_image_hashes.get(window.window_id, "")
-                        if old_hash and old_hash == image_hash:
-                            if image is not None:
-                                try:
-                                    image.close()
-                                except Exception:
-                                    pass
-                            continue
+                    if resume_snapshot is not None:
                         try:
-                            snapshot = self._parse_detached_snapshot_with_vision(
+                            image_hash = f"{window.title}|{self._detached_chat_body_hash(image)}"
+                            self._detached_window_image_hashes[window.window_id] = image_hash
+                        except Exception:
+                            image_hash = ""
+                        try:
+                            local_snapshot = self.visible_message_parser.parse(
                                 image,
                                 window_id=window.window_id,
                                 title=window.title,
+                                image_output_dir=image_root / title_slug / "images",
+                                include_debug=False,
                             )
-                            self._detached_window_image_hashes[window.window_id] = image_hash
+                            local_snapshot.messages = self._canonicalize_visible_messages(
+                                local_snapshot.messages
+                            )
+                            if self._detached_local_snapshot_has_unseen_content(
+                                local_messages=local_snapshot.messages,
+                                restored_messages=resume_snapshot.messages,
+                            ):
+                                if self.cfg.log_verbose:
+                                    print(
+                                        f"[resume] detached title={self._fit_col(window.title, 14)} "
+                                        "local change detected; vision deferred"
+                                    )
+                            else:
+                                if self.cfg.log_verbose:
+                                    print(
+                                        f"[resume] detached title={self._fit_col(window.title, 14)} "
+                                        f"messages={len(resume_snapshot.messages)}"
+                                    )
+                        except Exception as exc:
+                            snapshot = resume_snapshot
                             if self.cfg.log_verbose:
                                 print(
-                                    f"[vision] detached title={self._fit_col(window.title, 14)} "
-                                    f"messages={len(snapshot.messages)}"
+                                    f"[resume] detached title={self._fit_col(window.title, 14)} "
+                                    f"using restored state after local precheck failed: {exc}"
                                 )
-                        except Exception as exc:
-                            print(f"[warn] detached vision parse failed title={window.title!r}: {exc}")
-                            if not self.cfg.vision.fail_open:
+                        snapshot = resume_snapshot
+                        self._detached_watchdog_resume_window_ids.discard(int(window.window_id))
+                    if self.cfg.detached_vision_parse_enabled and self.llm.is_vision_enabled():
+                        if snapshot is None:
+                            image_hash = f"{window.title}|{self._detached_chat_body_hash(image)}"
+                            old_hash = self._detached_window_image_hashes.get(window.window_id, "")
+                            if old_hash and old_hash == image_hash:
                                 if image is not None:
                                     try:
                                         image.close()
                                     except Exception:
                                         pass
                                 continue
-                            print("[vision] fail-open: fallback to local OCR parser")
+                            try:
+                                snapshot = self._parse_detached_snapshot_with_vision(
+                                    image,
+                                    window_id=window.window_id,
+                                    title=window.title,
+                                )
+                                self._detached_window_image_hashes[window.window_id] = image_hash
+                                self._detached_watchdog_resume_window_ids.discard(int(window.window_id))
+                                if self.cfg.log_verbose:
+                                    print(
+                                        f"[vision] detached title={self._fit_col(window.title, 14)} "
+                                        f"messages={len(snapshot.messages)}"
+                                    )
+                            except Exception as exc:
+                                print(f"[warn] detached vision parse failed title={window.title!r}: {exc}")
+                                if not self.cfg.vision.fail_open:
+                                    if image is not None:
+                                        try:
+                                            image.close()
+                                        except Exception:
+                                            pass
+                                    continue
+                                print("[vision] fail-open: fallback to local OCR parser")
                     if snapshot is None:
                         snapshot = self.visible_message_parser.parse(
                             image,
@@ -6090,7 +6315,7 @@ class WeChatGuiRpaBot:
                             pass
                     continue
 
-                if self.cfg.detached_debug_save:
+                if self.cfg.detached_debug_save and image is not None:
                     debug_dir = image_root / title_slug / "debug"
                     debug_dir.mkdir(parents=True, exist_ok=True)
                     image.save(debug_dir / "latest_window.png")

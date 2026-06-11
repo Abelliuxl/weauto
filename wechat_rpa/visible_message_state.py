@@ -15,6 +15,56 @@ class VisibleMessageStateStore:
     def __init__(self) -> None:
         self._windows: dict[int, WindowMessageState] = {}
 
+    def export_state(self) -> dict[str, Any]:
+        windows: dict[str, dict[str, Any]] = {}
+        for window_id, state in self._windows.items():
+            ordered_seen = {
+                str(fingerprint): dict(state.seen[fingerprint])
+                for fingerprint in state.order
+                if fingerprint in state.seen
+            }
+            windows[str(int(window_id))] = {
+                "seen": ordered_seen,
+                "order": [str(key) for key in state.order if str(key) in ordered_seen],
+            }
+        return {"version": 1, "windows": windows}
+
+    def load_state(self, payload: dict[str, Any]) -> None:
+        if not isinstance(payload, dict):
+            return
+        windows_raw = payload.get("windows")
+        if not isinstance(windows_raw, dict):
+            return
+        restored: dict[int, WindowMessageState] = {}
+        for key, state_raw in windows_raw.items():
+            try:
+                window_id = int(key)
+            except Exception:
+                continue
+            if not isinstance(state_raw, dict):
+                continue
+            seen_raw = state_raw.get("seen")
+            order_raw = state_raw.get("order")
+            if not isinstance(seen_raw, dict) or not isinstance(order_raw, list):
+                continue
+            seen = {
+                str(fingerprint): dict(message)
+                for fingerprint, message in seen_raw.items()
+                if isinstance(message, dict)
+            }
+            order = [str(fingerprint) for fingerprint in order_raw if str(fingerprint) in seen]
+            restored[window_id] = WindowMessageState(seen=seen, order=order)
+        self._windows = restored
+
+    def messages_for_window(self, window_id: int) -> list[dict[str, Any]]:
+        state = self._windows.get(int(window_id))
+        if state is None:
+            return []
+        return [dict(state.seen[fingerprint]) for fingerprint in state.order if fingerprint in state.seen]
+
+    def has_window(self, window_id: int) -> bool:
+        return int(window_id) in self._windows
+
     def update(self, *, window_id: int, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         state = self._windows.setdefault(int(window_id), WindowMessageState())
         now = time.time()

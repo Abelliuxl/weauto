@@ -147,6 +147,21 @@ Profiles（继承 `[llm]`）：
 - `[llm_summary]` — 会话摘要
 - `[llm_heartbeat]` — 心跳规划
 
+NVIDIA Nemotron 3 Nano Omni 托管接口示例：
+
+```toml
+[llm]
+base_url_env = "NVIDIA_BASE_URL"
+api_key_env = "NVIDIA_API_KEY"
+model = "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning"
+openai_compat_think_mode = "on"
+reasoning_budget = 4096
+```
+
+`NVIDIA_BASE_URL` 使用 `https://integrate.api.nvidia.com/v1`。该 provider 开启思考时会发送
+`chat_template_kwargs.enable_thinking=true` 和 `reasoning_budget`，关闭时只发送
+`enable_thinking=false`。
+
 ## 10. `[vision]` 配置
 
 | Key | 默认值 | 说明 |
@@ -168,6 +183,7 @@ Profiles（继承 `[llm]`）：
 
 ## 12. 常用环境变量
 
+- `NVIDIA_API_KEY`、`NVIDIA_BASE_URL`
 - `OPENAI_API_KEY`、`OPENAI_BASE_URL`
 - `DASHSCOPE_API_KEY`、`DASHSCOPE_BASE_URL`
 - `TAVILY_API_KEY`、`BRAVE_SEARCH_API_KEY`、`ARK_API_KEY`

@@ -110,6 +110,8 @@ class LlmConfig:
     anti_repeat_retry: int = 1
     reasoning_exclude: bool = True
     reasoning_effort: str = "low"
+    # Provider-specific maximum internal reasoning tokens. <=0 uses provider default.
+    reasoning_budget: int = 0
     debug_log_payload: bool = False
     debug_log_response: bool = False
 
@@ -136,6 +138,7 @@ class VisionConfig:
     fail_open: bool = True
     reasoning_exclude: bool = True
     reasoning_effort: str = "low"
+    reasoning_budget: int = 0
     debug_log_payload: bool = False
     debug_log_response: bool = False
     system_prompt: str = (
@@ -290,6 +293,19 @@ class AppConfig:
     volc_ark_limit: int = 8
     volc_ark_max_keyword: int = 3
     volc_ark_timeout_sec: float = 20.0
+    weather_enabled: bool = False
+    weather_provider: str = "qweather"
+    weather_default_location: str = "临沧"
+    weather_forecast_days: int = 3
+    qweather_api_host: str = ""
+    qweather_auth_type: str = "jwt"
+    qweather_api_key: str = ""
+    qweather_api_key_env: str = "QWEATHER_API_KEY"
+    qweather_jwt_key_id: str = ""
+    qweather_jwt_project_id: str = ""
+    qweather_jwt_private_key_path: str = "data/secrets/qweather-ed25519-private.pem"
+    qweather_jwt_ttl_sec: int = 900
+    qweather_timeout_sec: float = 8.0
     # When True, run_python sandbox blocks imports and limits builtins for safety.
     # Set False on trusted machines to allow full Python (import, file I/O, etc).
     python_sandbox_restricted: bool = True
@@ -447,6 +463,22 @@ def _load_web_search_provider(raw: object, default: str = "tavily") -> str:
     return _load_web_search_provider(default, "tavily") if value != default else "tavily"
 
 
+def _load_weather_provider(raw: object, default: str = "qweather") -> str:
+    value = str(raw if raw is not None else default).strip().lower()
+    if value in ("qweather", "heweather", "hefeng", "和风天气"):
+        return "qweather"
+    return _load_weather_provider(default, "qweather") if value != default else "qweather"
+
+
+def _load_qweather_auth_type(raw: object, default: str = "jwt") -> str:
+    value = str(raw if raw is not None else default).strip().lower()
+    if value in ("jwt", "json_web_token", "json-web-token"):
+        return "jwt"
+    if value in ("api_key", "apikey", "key"):
+        return "api_key"
+    return _load_qweather_auth_type(default, "jwt") if value != default else "jwt"
+
+
 def _load_api_format(raw: object, default: str = "openai") -> str:
     value = str(raw if raw is not None else default).strip().lower()
     if value in ("openai", "openai_compat", "openai-compatible", "chat_completions"):
@@ -527,6 +559,7 @@ def _load_llm_config(raw_obj: object, default: LlmConfig) -> LlmConfig:
         anti_repeat_retry=int(raw.get("anti_repeat_retry", default.anti_repeat_retry)),
         reasoning_exclude=bool(raw.get("reasoning_exclude", default.reasoning_exclude)),
         reasoning_effort=str(raw.get("reasoning_effort", default.reasoning_effort)),
+        reasoning_budget=int(raw.get("reasoning_budget", default.reasoning_budget)),
         debug_log_payload=bool(raw.get("debug_log_payload", default.debug_log_payload)),
         debug_log_response=bool(raw.get("debug_log_response", default.debug_log_response)),
     )
@@ -793,6 +826,41 @@ def load_config(path: str | Path | None) -> AppConfig:
     cfg.volc_ark_timeout_sec = float(
         data.get("volc_ark_timeout_sec", cfg.volc_ark_timeout_sec)
     )
+    cfg.weather_enabled = bool(data.get("weather_enabled", cfg.weather_enabled))
+    cfg.weather_provider = _load_weather_provider(
+        data.get("weather_provider", cfg.weather_provider),
+        cfg.weather_provider,
+    )
+    cfg.weather_default_location = str(
+        data.get("weather_default_location", cfg.weather_default_location)
+    ).strip()
+    cfg.weather_forecast_days = int(
+        data.get("weather_forecast_days", cfg.weather_forecast_days)
+    )
+    cfg.qweather_api_host = str(data.get("qweather_api_host", cfg.qweather_api_host)).strip().rstrip("/")
+    cfg.qweather_auth_type = _load_qweather_auth_type(
+        data.get("qweather_auth_type", cfg.qweather_auth_type),
+        cfg.qweather_auth_type,
+    )
+    cfg.qweather_api_key = str(data.get("qweather_api_key", cfg.qweather_api_key))
+    cfg.qweather_api_key_env = str(
+        data.get("qweather_api_key_env", cfg.qweather_api_key_env)
+    ).strip()
+    cfg.qweather_jwt_key_id = str(
+        data.get("qweather_jwt_key_id", cfg.qweather_jwt_key_id)
+    ).strip()
+    cfg.qweather_jwt_project_id = str(
+        data.get("qweather_jwt_project_id", cfg.qweather_jwt_project_id)
+    ).strip()
+    cfg.qweather_jwt_private_key_path = str(
+        data.get("qweather_jwt_private_key_path", cfg.qweather_jwt_private_key_path)
+    ).strip()
+    cfg.qweather_jwt_ttl_sec = int(
+        data.get("qweather_jwt_ttl_sec", cfg.qweather_jwt_ttl_sec)
+    )
+    cfg.qweather_timeout_sec = float(
+        data.get("qweather_timeout_sec", cfg.qweather_timeout_sec)
+    )
     cfg.python_sandbox_restricted = bool(data.get("python_sandbox_restricted", cfg.python_sandbox_restricted))
     cfg.agent_reach_enabled = bool(data.get("agent_reach_enabled", cfg.agent_reach_enabled))
     cfg.agent_reach_mcporter_cmd = str(
@@ -814,6 +882,16 @@ def load_config(path: str | Path | None) -> AppConfig:
         cfg.volc_ark_max_keyword = 50
     if cfg.volc_ark_timeout_sec < 1.0:
         cfg.volc_ark_timeout_sec = 1.0
+    if cfg.weather_forecast_days < 1:
+        cfg.weather_forecast_days = 1
+    if cfg.weather_forecast_days > 30:
+        cfg.weather_forecast_days = 30
+    if cfg.qweather_jwt_ttl_sec < 60:
+        cfg.qweather_jwt_ttl_sec = 60
+    if cfg.qweather_jwt_ttl_sec > 86400:
+        cfg.qweather_jwt_ttl_sec = 86400
+    if cfg.qweather_timeout_sec < 1.0:
+        cfg.qweather_timeout_sec = 1.0
     cfg.heartbeat_enabled = bool(data.get("heartbeat_enabled", cfg.heartbeat_enabled))
     cfg.heartbeat_interval_sec = float(
         data.get("heartbeat_interval_sec", cfg.heartbeat_interval_sec)
@@ -1014,6 +1092,9 @@ def load_config(path: str | Path | None) -> AppConfig:
             vision_raw.get("reasoning_exclude", cfg.vision.reasoning_exclude)
         ),
         reasoning_effort=str(vision_raw.get("reasoning_effort", cfg.vision.reasoning_effort)),
+        reasoning_budget=int(
+            vision_raw.get("reasoning_budget", cfg.vision.reasoning_budget)
+        ),
         debug_log_payload=bool(
             vision_raw.get("debug_log_payload", cfg.vision.debug_log_payload)
         ),

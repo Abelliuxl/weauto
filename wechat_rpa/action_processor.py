@@ -802,6 +802,16 @@ class ActionProcessor:
                     status = "ok" if result.get("ok") else "error"
                     obs = f"魔兽角色链接:\n{bot._format_wow_character_result(result)}"[:1800]
                     ok = bool(result.get("ok"))
+                elif tool == "query_weather":
+                    location = re.sub(
+                        r"\s+",
+                        " ",
+                        str(args.get("location", "") or args.get("city", "")).strip(),
+                    )[:80]
+                    result = bot._query_weather(args)
+                    status = "ok"
+                    obs = f"天气查询[{location or bot.cfg.weather_default_location}]:\n{result}"[:1800]
+                    ok = True
                 elif tool == "generate_image":
                     prompt = bot._clean_image_prompt(args.get("prompt", ""), limit=280)
                     if not prompt:
@@ -949,6 +959,13 @@ class ActionProcessor:
                     obs = f"Python执行失败: {err}"
                 elif tool == "build_wow_character_url":
                     obs = f"魔兽角色链接构建失败: {err}"
+                elif tool == "query_weather":
+                    location = re.sub(
+                        r"\s+",
+                        " ",
+                        str(args.get("location", "") or args.get("city", "")).strip(),
+                    )[:80]
+                    obs = f"天气查询[{location or bot.cfg.weather_default_location}]失败: {err}"
                 elif tool == "generate_image":
                     prompt = bot._clean_image_prompt(args.get("prompt", ""), limit=60)
                     obs = f"图片生成[{prompt}]失败: {err}"

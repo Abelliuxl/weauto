@@ -134,6 +134,25 @@ volc_ark_limit = 8
 volc_ark_max_keyword = 3
 volc_ark_timeout_sec = 20.0
 
+# ============================================================
+# Weather
+# ============================================================
+weather_enabled = false
+weather_provider = "qweather"
+weather_default_location = "临沧"
+weather_forecast_days = 3
+
+# QWeather JWT is recommended for long-term use.
+# After uploading data/secrets/qweather-ed25519-public.pem in QWeather Console,
+# fill your dedicated API Host, Credential ID, and Project ID here.
+qweather_api_host = ""
+qweather_auth_type = "jwt"
+qweather_jwt_key_id = ""
+qweather_jwt_project_id = ""
+qweather_jwt_private_key_path = "data/secrets/qweather-ed25519-private.pem"
+qweather_jwt_ttl_sec = 900
+qweather_timeout_sec = 8.0
+
 agent_reach_enabled = false
 agent_reach_mcporter_cmd = "mcporter"
 agent_reach_max_results = 5
@@ -228,17 +247,19 @@ ab_compare_max_text_len = 120
 [llm]
 enabled = true
 base_url = ""
-base_url_env = "OPENAI_BASE_URL"
+base_url_env = "NVIDIA_BASE_URL"
 api_key = ""
-api_key_env = "OPENAI_API_KEY"
-model = "deepseek-v4-flash"
+api_key_env = "NVIDIA_API_KEY"
+model = "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning"
 api_format = "openai"
 ollama_native = false
-temperature = 0.8
-max_tokens = 4096
-timeout_sec = 8.0
+openai_compat_think_mode = "on"
+temperature = 0.6
+max_tokens = 16384
+timeout_sec = 120.0
 sarcasm_level = "medium"
-reasoning_effort = "low"
+reasoning_effort = ""
+reasoning_budget = 4096
 debug_log_payload = false
 debug_log_response = false
 
@@ -257,27 +278,37 @@ anti_repeat_retry = 1
 
 [llm_reply]
 enabled = true
-reasoning_effort = "minimal"
-timeout_sec = 20.0
+openai_compat_think_mode = "on"
+reasoning_effort = ""
+reasoning_budget = 4096
+timeout_sec = 120.0
 
 [llm_decision]
 enabled = true
-reasoning_effort = "minimal"
+openai_compat_think_mode = "off"
+reasoning_effort = ""
+reasoning_budget = 0
 timeout_sec = 20.0
 
 [llm_planner]
 enabled = true
-reasoning_effort = "minimal"
+openai_compat_think_mode = "on"
+reasoning_effort = ""
+reasoning_budget = 8192
 timeout_sec = 120.0
 
 [llm_summary]
 enabled = true
-reasoning_effort = "minimal"
+openai_compat_think_mode = "off"
+reasoning_effort = ""
+reasoning_budget = 0
 timeout_sec = 20.0
 
 [llm_heartbeat]
 enabled = true
-reasoning_effort = "minimal"
+openai_compat_think_mode = "on"
+reasoning_effort = ""
+reasoning_budget = 4096
 timeout_sec = 60.0
 
 # ============================================================
