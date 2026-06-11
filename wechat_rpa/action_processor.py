@@ -705,54 +705,26 @@ class ActionProcessor:
                         status = "ok" if result.ok else "error"
                         obs = f"Python结果:\n{result.to_tool_text()}"[:1800]
                         ok = result.ok
-                elif tool in {"web_search", "search_web", "search_web_brave"}:
-                    query = re.sub(r"\s+", " ", str(args.get("query", "")).strip())[:80]
-                    provider = (
-                        "tavily"
-                        if tool == "search_web"
-                        else ("brave" if tool == "search_web_brave" else bot._active_web_search_provider())
-                    )
-                    if not query:
-                        status = "skip (empty query)"
-                    elif not bot._web_search_enabled(provider):
-                        status = f"skip ({provider} disabled)"
-                    elif (provider in ("tavily", "brave")) and (
-                        not bot._resolve_web_search_api_key(provider)
-                    ):
-                        status = f"skip (missing {provider} api key)"
-                    elif provider == "agent_reach" and (
-                        not str(bot.cfg.agent_reach_mcporter_cmd or "").strip()
-                        or not shutil.which(str(bot.cfg.agent_reach_mcporter_cmd or "").strip())
-                    ):
-                        cmd = str(bot.cfg.agent_reach_mcporter_cmd or "").strip()
-                        status = f"skip (missing command: {cmd or 'mcporter'})"
-                    else:
-                        active_provider, search_text = bot._web_search_with_provider(provider, query)
-                        if search_text:
-                            status = "ok"
-                            obs = f"网页检索[{query}]({active_provider}): {search_text}"[:1800]
-                        else:
-                            status = "ok (no-hit)"
-                            obs = f"网页检索[{query}]({active_provider})无命中"
-                        ok = True
-                elif tool in {"web_search_volc", "search_web_volc"}:
+                elif tool in {
+                    "web_search",
+                    "search_web",
+                    "search_web_brave",
+                    "web_search_volc",
+                    "search_web_volc",
+                }:
                     query = re.sub(r"\s+", " ", str(args.get("query", "")).strip())[:80]
                     if not query:
                         status = "skip (empty query)"
-                    elif not bool(bot.cfg.volc_ark_enabled):
-                        status = "skip (volc_ark disabled)"
-                    elif not str(bot.cfg.volc_ark_model or "").strip():
-                        status = "skip (missing volc_ark_model)"
-                    elif not bot._resolve_volc_ark_api_key():
-                        status = "skip (missing volc_ark api key)"
+                    elif not bot._has_web_search_tool():
+                        status = "skip (all search providers unavailable)"
                     else:
-                        search_text = bot._volc_web_search(query)
+                        search_text = bot._aggregate_web_search(query)
                         if search_text:
                             status = "ok"
-                            obs = f"网页检索[{query}](volc_ark): {search_text}"
+                            obs = f"网页检索[{query}](tavily+brave+volc_ark):\n{search_text}"[:5000]
                         else:
                             status = "ok (no-hit)"
-                            obs = f"网页检索[{query}](volc_ark)无命中"
+                            obs = f"网页检索[{query}](tavily+brave+volc_ark)无命中"
                         ok = True
                 elif tool == "fetch_url":
                     url = re.sub(r"\s+", "", str(args.get("url", "")).strip())[:1000]

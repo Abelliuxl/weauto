@@ -2317,16 +2317,11 @@ class WeChatGuiRpaBot:
         tools.append("fetch_url")
         tools.append("browse_url")
         # Keep planner whitelist aligned with runtime capability checks:
-        # expose each search tool independently when it is actually usable.
-        if self._has_volc_web_search_tool():
-            tools.append("web_search_volc")
-            tools.append("search_web_volc")
+        # Expose one aggregate search tool. Provider-specific names remain
+        # accepted by the executor for compatibility, but the planner should
+        # not choose between providers.
         if self._has_web_search_tool():
             tools.append("web_search")
-        if self._has_tavily_search_tool():
-            tools.append("search_web")
-        if self._has_brave_search_tool():
-            tools.append("search_web_brave")
         if is_admin:
             tools.extend(
                 [
@@ -2424,15 +2419,13 @@ class WeChatGuiRpaBot:
         )
 
     def _has_web_search_tool(self) -> bool:
-        provider = self._active_web_search_provider()
-        if provider == "volc_ark":
-            return False
-        if not self._web_search_enabled(provider):
-            return False
-        if provider == "agent_reach":
-            cmd = str(self.cfg.agent_reach_mcporter_cmd or "").strip()
-            return bool(cmd and shutil.which(cmd))
-        return bool(self._resolve_web_search_api_key(provider))
+        return any(
+            (
+                self._has_tavily_search_tool(),
+                self._has_brave_search_tool(),
+                self._has_volc_web_search_tool(),
+            )
+        )
 
     def _has_tavily_search_tool(self) -> bool:
         return bool(self.cfg.tavily_enabled and self._resolve_tavily_api_key())
@@ -2562,37 +2555,18 @@ class WeChatGuiRpaBot:
         return f"blocked (tool=web_search_volc missing api key: {self._volc_web_search_key_hint()})"
 
     def _web_search_status_text(self) -> str:
-        provider = self._active_web_search_provider()
-        mode = self._active_search_mode()
-        base_status = ""
-        if provider == "volc_ark":
-            base_status = "disabled (tool=web_search switched_to=web_search_volc)"
-        elif not self._web_search_enabled(provider):
-            base_status = f"disabled (tool=web_search provider={provider} {provider}_enabled=false)"
-        elif provider == "agent_reach":
-            cmd = str(self.cfg.agent_reach_mcporter_cmd or "").strip()
-            if cmd and shutil.which(cmd):
-                base_status = (
-                    f"available (tool=web_search provider={provider} "
-                    f"mcporter={cmd} max_results={self._web_search_max_results(provider)})"
-                )
-            else:
-                base_status = (
-                    f"blocked (tool=web_search missing command: {cmd or 'mcporter'}; "
-                    f"{self._web_search_key_hint(provider)})"
-                )
-        elif self._resolve_web_search_api_key(provider):
-            base_status = (
-                f"available (tool=web_search provider={provider} "
-                f"max_results={self._web_search_max_results(provider)})"
-            )
-        else:
-            base_status = (
-                f"blocked (tool=web_search missing api key: {self._web_search_key_hint(provider)})"
-            )
+        states = {
+            "tavily": self._has_tavily_search_tool(),
+            "brave": self._has_brave_search_tool(),
+            "volc_ark": self._has_volc_web_search_tool(),
+        }
+        enabled = [name for name, available in states.items() if available]
+        disabled = [name for name, available in states.items() if not available]
+        status = "available" if enabled else "blocked"
         return (
-            f"mode={mode} provider={provider}; "
-            f"{base_status}; {self._volc_web_search_status_text()}"
+            f"{status} (tool=web_search mode=aggregate "
+            f"enabled={','.join(enabled) or 'none'} "
+            f"unavailable={','.join(disabled) or 'none'})"
         )
 
     @staticmethod
@@ -3233,6 +3207,46 @@ class WeChatGuiRpaBot:
             return clean_provider, self._brave_search(query)
         return "tavily", self._tavily_search(query)
 
+    def _aggregate_web_search(self, query: str) -> str:
+        clean_query = self._clean_web_query(query)
+        if not clean_query:
+            return ""
+
+        searches: list[tuple[str, object]] = [
+            ("tavily", self._tavily_search),
+            ("brave", self._brave_search),
+            ("volc_ark", self._volc_web_search),
+        ]
+        available = {
+            "tavily": self._has_tavily_search_tool(),
+            "brave": self._has_brave_search_tool(),
+            "volc_ark": self._has_volc_web_search_tool(),
+        }
+        results = {name: "" for name, _ in searches}
+
+        runnable = [(name, search) for name, search in searches if available[name]]
+        if runnable:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(runnable)) as pool:
+                futures = {
+                    pool.submit(search, clean_query): name
+                    for name, search in runnable
+                }
+                for future in concurrent.futures.as_completed(futures):
+                    name = futures[future]
+                    try:
+                        results[name] = str(future.result() or "").strip()
+                    except Exception as exc:
+                        print(
+                            f"[warn] aggregate web search provider={name} failed: "
+                            f"{self._compact_web_text(exc, limit=240)}"
+                        )
+
+        sections = []
+        for name, _ in searches:
+            text = results[name]
+            sections.append(f"[{name}]\n{text}" if text else f"[{name}]\n")
+        return "\n\n".join(sections)
+
     def _format_web_search_text(
         self,
         *,
@@ -3299,7 +3313,7 @@ class WeChatGuiRpaBot:
             return self.llm_reply.describe_image(image.convert("RGB"), prompt=prompt)
 
     def _web_search(self, query: str) -> tuple[str, str]:
-        return self._web_search_with_provider(self._active_web_search_provider(), query)
+        return "tavily+brave+volc_ark", self._aggregate_web_search(query)
 
     @staticmethod
     def _extract_json_from_text(raw: str) -> object | None:

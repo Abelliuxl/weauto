@@ -704,6 +704,17 @@ class LlmReplyGenerator:
                 controlled = True
             return updated, controlled
 
+        if "siliconflow.cn" in provider:
+            # SiliconFlow exposes Qwen thinking through top-level controls.
+            if normalized_mode in ("on", "off"):
+                updated["enable_thinking"] = normalized_mode == "on"
+                if normalized_mode == "on" and reasoning_budget > 0:
+                    updated["thinking_budget"] = max(1, int(reasoning_budget))
+                else:
+                    updated.pop("thinking_budget", None)
+                controlled = True
+            return updated, controlled
+
         if "xiaomimimo.com" in provider:
             # MiMo uses a provider-specific binary thinking switch:
             # {"thinking": {"type": "enabled"|"disabled"}}.
@@ -2585,7 +2596,11 @@ class LlmReplyGenerator:
                 "required": ["name", "note"],
             },
             "web_search": {
-                "description": "Search public web pages with the configured provider.",
+                "description": (
+                    "Search public web pages through Tavily, Brave, and Volcengine Ark in parallel. "
+                    "Returns a separately labeled section for each provider; unavailable or failed "
+                    "providers return an empty section."
+                ),
                 "properties": {"query": {"type": "string", "description": "Search query, <=80 chars."}},
                 "required": ["query"],
             },
@@ -2839,7 +2854,10 @@ class LlmReplyGenerator:
                 "args={\"name\":\"规范中文名\",\"content\":\"完整 markdown\"} "
                 "完整替换 data/people/<name>.md；仅在明确需要重写整份人物印象时使用"
             ),
-            "web_search": "args={\"query\":\"<=80字\"} 联网检索公开网页信息（provider 可配置）",
+            "web_search": (
+                "args={\"query\":\"<=80字\"} 并行调用 Tavily、Brave、火山方舟，"
+                "返回三个独立分区；单路失败时该分区为空"
+            ),
             "search_web": "args={\"query\":\"<=80字\"} Tavily 联网检索",
             "search_web_brave": "args={\"query\":\"<=80字\"} Brave 联网检索",
             "web_search_volc": "args={\"query\":\"<=80字\"} 联网检索（火山方舟内置搜索，单次可信模式）",
@@ -2883,8 +2901,8 @@ class LlmReplyGenerator:
             "task 字段必须始终给出；若没有持续任务，status=idle。"
             "若输入中已包含工具观察结果，可继续规划下一步动作；"
             "但禁止重复输出同一个 tool+args。"
-            "检索证据优先级默认是：web_search_volc > web_search。"
-            "若不同来源冲突，优先采用更高优先级来源，不要回退到低优先级覆盖高优先级结论。"
+            "web_search 已聚合 Tavily、Brave 和火山方舟；"
+            "应综合比较各来源，不预设任何 provider 优先级。"
         )
         user_prompt = (
             f"会话类型: {'群聊' if is_group else '私聊'}\n"
@@ -2911,10 +2929,10 @@ class LlmReplyGenerator:
             + "6) 记忆、人物印象、技能维护优先使用 remember_fact、recall_memory、update_impression、read_skill、update_skill；不要为了追加一条信息就用 write_memory/write_impression/write_skill 完整替换。\n"
             + "7) 如果已有检索结果仍不足，请换关键词继续检索，不要机械重复同一参数。\n"
             + "8) 如果工具观察里出现 fetch_url 返回 403/Forbidden/CloudFront 拒绝访问，下一步必须对同一个 URL 改用 browse_url（Playwright 渲染），不要直接回复“访问不了”。\n"
-            + "9) 若选择 web_search_volc/search_web_volc，本轮只保留它一个检索动作，不要再同时规划 web_search/search_web。\n"
-            + "10) 若工具观察中已有网页检索结果（web_search/search_web/search_web_brave/web_search_volc/search_web_volc），默认直接信任该结果；"
+            + "9) 联网检索统一使用 web_search；它会并行返回 Tavily、Brave、火山方舟三个分区，不要自行选择 provider。\n"
+            + "10) 若工具观察中已有网页检索结果，默认基于三个分区综合判断；"
             + "除非明确失败/无结果，否则不要再追加记忆写入动作。\n"
-            + "11) 当 web_search_volc 与其他来源冲突时，以 web_search_volc 为准，并优先结束动作规划（actions 为空）。\n"
+            + "11) 三个搜索来源冲突时，不预设优先级；比较时效、来源权威性和相互印证情况，并在最终回复中说明不确定性。\n"
             + "12) planner 不负责决定是否回复；只要本轮被外层规则触发，最终回复链路默认继续执行。\n"
             + "13) 当用户明确要求作图/海报/配图时可用 generate_image，prompt 要具体且可执行；"
             + "若需求是纯文本答复，不要调用 generate_image。"
@@ -2922,7 +2940,7 @@ class LlmReplyGenerator:
             + "如果当前消息或近期上下文已有图片，可省略 image_path。"
             + "\n14) 遇到数学、统计、日期、单位换算、取模、幂运算等需要精确计算的问题，必须先调用 run_python；run_python 沙盒默认限制 import，已预置 math/statistics/datetime/date/timedelta/Decimal/Fraction/mean/median 可直接用；设 python_sandbox_restricted=false 可解除所有限制；"
             + "没有 Python 工具观察结果时，不要直接给数值结论。"
-            + "\n15) 遇到最新信息、官网公告、新闻、版本改动、价格、规则等时效事实，必须优先调用 web_search_volc/search_web_volc 或 web_search/search_web；"
+            + "\n15) 遇到最新信息、官网公告、新闻、版本改动、价格、规则等时效事实，必须调用 web_search；"
             + "没有检索观察结果时，不要声称已经查过。"
             + "\n16) task.status=running 表示任务未完成，后续还要继续；若希望空闲时后台续跑，设 continue_on_heartbeat=true。"
             + "\n17) task.status=waiting_user 表示缺用户信息，continue_on_heartbeat 必须为 false。"

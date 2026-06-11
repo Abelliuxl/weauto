@@ -61,7 +61,7 @@
 - `write_skill` / `delete_skill` — 管理 `data/skills/` 技能
 - `read_chat_history` — 读取当前/指定会话历史
 - `run_python` — 安全沙盒 Python 计算
-- `web_search` / `web_search_volc` / `search_web` / `search_web_brave` — 联网检索
+- `web_search` — 并行聚合 Tavily、Brave、Volc Ark 的联网检索
 - `fetch_url` / `browse_url` — 网页内容抓取
 - `generate_image` / `edit_image` — 图片生成与编辑
 - `mute_session` / `unmute_session` — 会话静音控制

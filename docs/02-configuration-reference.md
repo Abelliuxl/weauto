@@ -76,7 +76,7 @@
 - **记忆类：** `write_memory`（core/timeline）、`read_impression`、`write_impression`、`read_chat_history`
 - **技能类：** `write_skill`、`delete_skill`
 - **计算类：** `run_python`
-- **联网：** `web_search`、`web_search_volc`、`search_web`、`search_web_brave`、`fetch_url`、`browse_url`
+- **联网：** `web_search`（并行聚合 Tavily、Brave、Volc Ark）、`fetch_url`、`browse_url`
 - **图像：** `generate_image`、`edit_image`
 - **会话管理：** `mute_session`、`unmute_session`（管理员）
 - **其他：** `build_wow_character_url`
@@ -90,16 +90,18 @@
 - `/reset 会话名`
 - `/merge 源 -> 目标`
 
-## 6. Web Search provider
+## 6. Web Search providers
 
 | Key | 默认值 | 说明 |
 |---|---|---|
-| `web_search_provider` | `tavily` | `tavily` / `brave` / `agent_reach` / `volc_ark` |
+| `web_search_provider` | `tavily` | 兼容旧配置；当前 `web_search` 固定聚合 Tavily、Brave、Volc Ark |
 | `tavily_enabled` / `brave_enabled` / `volc_ark_enabled` / `agent_reach_enabled` | `false` | 各 provider 开关 |
 | `*_api_key` / `*_api_key_env` | `""` | 密钥与环境变量 |
 | `*_base_url` | 各 provider 默认 | API 地址 |
 | `*_max_results` | 3~8 | 返回条数上限 |
 | `*_timeout_sec` | 8~20 | 超时 |
+
+规划器只看到一个 `web_search` 工具。调用时三个 provider 并行执行，单路失败或无结果时对应分区为空，不影响其他分区。`fetch_url` 和 `browse_url` 仍用于访问指定 URL。
 
 ## 7. Heartbeat
 

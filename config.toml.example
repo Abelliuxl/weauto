@@ -112,6 +112,7 @@ agent_plan_observation_max_chars = 5200
 # ============================================================
 # Web Search
 # ============================================================
+# Legacy compatibility field. web_search aggregates Tavily, Brave, and Volc Ark.
 web_search_provider = "tavily"
 
 tavily_enabled = false
