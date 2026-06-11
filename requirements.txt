@@ -14,3 +14,4 @@ pyperclip>=1.8.2
 tomli>=2.0.1; python_version < "3.11"
 certifi>=2024.8.30
 playwright>=1.60.0
+websockets>=15.0,<17

@@ -261,6 +261,17 @@ class AppConfig:
     bridge_openclaw_deliver: bool = False
     bridge_openclaw_expect_final: bool = True
     bridge_openclaw_strip_proxy_env: bool = True
+    long_bridge_url: str = ""
+    long_bridge_url_env: str = "WEAUTO_LONG_BRIDGE_URL"
+    long_bridge_token: str = ""
+    long_bridge_token_env: str = "WEAUTO_LONG_BRIDGE_TOKEN"
+    long_bridge_account_id: str = "default"
+    long_bridge_timeout_sec: float = 180.0
+    long_bridge_reconnect_min_sec: float = 1.0
+    long_bridge_reconnect_max_sec: float = 30.0
+    long_bridge_heartbeat_sec: float = 20.0
+    long_bridge_attachment_max_mb: int = 20
+    long_bridge_fail_open: bool = True
     agent_actions_enabled: bool = True
     agent_actions_max_per_turn: int = 2
     # Max reply messages planner can emit in one trigger cycle.
@@ -578,7 +589,11 @@ def load_config(path: str | Path | None) -> AppConfig:
 
     cfg.app_name = str(data.get("app_name", cfg.app_name))
     processing_mode = str(data.get("processing_mode", cfg.processing_mode)).strip().lower()
-    cfg.processing_mode = processing_mode if processing_mode in {"native", "bridge"} else "native"
+    cfg.processing_mode = (
+        processing_mode
+        if processing_mode in {"native", "bridge", "long_bridge"}
+        else "native"
+    )
     receiver_mode = str(data.get("receiver_mode", cfg.receiver_mode)).strip().lower()
     cfg.receiver_mode = receiver_mode if receiver_mode in {"detached_windows", "legacy_list"} else "detached_windows"
     title_filter = data.get("detached_window_title_filter", cfg.detached_window_title_filter)
@@ -752,6 +767,65 @@ def load_config(path: str | Path | None) -> AppConfig:
     )
     cfg.bridge_openclaw_strip_proxy_env = bool(
         data.get("bridge_openclaw_strip_proxy_env", cfg.bridge_openclaw_strip_proxy_env)
+    )
+    cfg.long_bridge_url = str(
+        data.get("long_bridge_url", cfg.long_bridge_url)
+    ).strip()
+    cfg.long_bridge_url_env = str(
+        data.get("long_bridge_url_env", cfg.long_bridge_url_env)
+    ).strip()
+    if (not cfg.long_bridge_url) and cfg.long_bridge_url_env:
+        cfg.long_bridge_url = str(os.getenv(cfg.long_bridge_url_env, "")).strip()
+    cfg.long_bridge_token = str(
+        data.get("long_bridge_token", cfg.long_bridge_token)
+    )
+    cfg.long_bridge_token_env = str(
+        data.get("long_bridge_token_env", cfg.long_bridge_token_env)
+    ).strip()
+    if (not cfg.long_bridge_token) and cfg.long_bridge_token_env:
+        cfg.long_bridge_token = str(
+            os.getenv(cfg.long_bridge_token_env, "")
+        ).strip()
+    cfg.long_bridge_account_id = str(
+        data.get("long_bridge_account_id", cfg.long_bridge_account_id)
+    ).strip() or "default"
+    cfg.long_bridge_timeout_sec = max(
+        5.0,
+        float(data.get("long_bridge_timeout_sec", cfg.long_bridge_timeout_sec)),
+    )
+    cfg.long_bridge_reconnect_min_sec = max(
+        0.2,
+        float(
+            data.get(
+                "long_bridge_reconnect_min_sec",
+                cfg.long_bridge_reconnect_min_sec,
+            )
+        ),
+    )
+    cfg.long_bridge_reconnect_max_sec = max(
+        cfg.long_bridge_reconnect_min_sec,
+        float(
+            data.get(
+                "long_bridge_reconnect_max_sec",
+                cfg.long_bridge_reconnect_max_sec,
+            )
+        ),
+    )
+    cfg.long_bridge_heartbeat_sec = max(
+        5.0,
+        float(data.get("long_bridge_heartbeat_sec", cfg.long_bridge_heartbeat_sec)),
+    )
+    cfg.long_bridge_attachment_max_mb = max(
+        1,
+        int(
+            data.get(
+                "long_bridge_attachment_max_mb",
+                cfg.long_bridge_attachment_max_mb,
+            )
+        ),
+    )
+    cfg.long_bridge_fail_open = bool(
+        data.get("long_bridge_fail_open", cfg.long_bridge_fail_open)
     )
     cfg.agent_actions_enabled = bool(
         data.get("agent_actions_enabled", cfg.agent_actions_enabled)

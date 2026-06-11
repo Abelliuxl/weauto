@@ -10,6 +10,7 @@ logs/
 !.env.example
 
 .venv312/
+node_modules/
 
 # Runtime workspace/memory artifacts (legacy — archived)
 agent_workspace/
@@ -38,4 +39,3 @@ data/skills/**
 !data/skills/**/builder.py
 !data/skills/**/*.tsv
 !data/skills/**/*.json
-

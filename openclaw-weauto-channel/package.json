@@ -1,0 +1,23 @@
+{
+  "name": "@weauto/openclaw-channel",
+  "version": "0.1.0",
+  "description": "Persistent WebSocket channel bridge between weauto and OpenClaw.",
+  "type": "module",
+  "dependencies": {
+    "ws": "^8.18.3"
+  },
+  "openclaw": {
+    "extensions": [
+      "./index.js"
+    ],
+    "channel": {
+      "id": "weauto",
+      "label": "weauto",
+      "selectionLabel": "weauto (persistent WebSocket)",
+      "docsPath": "/channels/weauto",
+      "docsLabel": "weauto",
+      "blurb": "Remote persistent channel for a weauto WeChat RPA client.",
+      "order": 80
+    }
+  }
+}

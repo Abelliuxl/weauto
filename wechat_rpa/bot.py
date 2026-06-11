@@ -39,6 +39,7 @@ from .detached_window_receiver import capture_window_by_id, list_detached_wechat
 from .image_editing import ImageEditingError, ImageEditor
 from .image_generation import ImageGenerationError, ImageGenerator
 from .llm import LlmReplyGenerator, prepare_terminal_for_log_line
+from .long_bridge import LongBridgeClient, LongBridgeOutbound, LongBridgeResult
 from .message_handler import MessageHandler
 from .ocr import OcrEngine
 from .people_aliases import PersonAliasResolver
@@ -194,6 +195,7 @@ class WeChatGuiRpaBot:
         self.image_editor = ImageEditor(cfg.image_editing)
         self.qweather = self._make_qweather_client()
         self.bridge_client = BridgeClient(cfg)
+        self.long_bridge_client = LongBridgeClient(cfg)
         self.agent_memory = MemoryStore("data/memory")
         self.agent_skills = SkillStore("data/skills")
         self.agent_skills.cleanup()
@@ -245,6 +247,10 @@ class WeChatGuiRpaBot:
         self._memory_restart_pending = False
         self._load_runtime_state()
         self._load_persistent_memory()
+        self.long_bridge_client.set_outbound_handler(
+            self._handle_long_bridge_outbound
+        )
+        self.long_bridge_client.start()
 
     def _to_np_rgb(self, pil_image) -> np.ndarray:
         rgb_image = None
@@ -652,6 +658,15 @@ class WeChatGuiRpaBot:
         return f"{self.cfg.people_aliases_path}:inline -[@...]"
 
     def _bridge_status_text(self) -> str:
+        if self.cfg.processing_mode == "long_bridge":
+            target = self.cfg.long_bridge_url.strip() or "-"
+            return (
+                f"mode=long_bridge target={target} "
+                f"account={self.cfg.long_bridge_account_id} "
+                f"status={self.long_bridge_client.status_text()} "
+                f"timeout={self.cfg.long_bridge_timeout_sec:.1f}s "
+                f"fail_open={self.cfg.long_bridge_fail_open}"
+            )
         if self.cfg.processing_mode != "bridge":
             return "mode=native"
         if self.cfg.bridge_backend == "openclaw":
@@ -809,6 +824,164 @@ class WeChatGuiRpaBot:
         if self.cfg.log_verbose:
             print(f"[bridge] reply row={row.row_idx:>2} len={len(reply)}")
         return True, reply
+
+    def _long_bridge_event_payload(
+        self,
+        row: ChatRowState,
+        *,
+        reason: str,
+        is_group: bool,
+        is_admin: bool,
+        latest_message: str,
+        source_message: dict | None = None,
+        mention_reply_to: str = "",
+    ) -> dict:
+        source = source_message if isinstance(source_message, dict) else {}
+        sender = str(source.get("sender") or mention_reply_to or "").strip()
+        if not sender:
+            sender = self._sender_from_prefixed_text(row.preview or row.text)
+        sender = sender or row.title
+        content_type = str(source.get("content_type") or "text").strip().lower()
+        text = str(source.get("text") or latest_message or row.preview or row.text or "").strip()
+        attachments: list[dict] = []
+        image_path = str(source.get("image_path") or "").strip()
+        if image_path:
+            attachment = self.long_bridge_client.build_attachment(image_path)
+            if attachment:
+                attachments.append(attachment)
+
+        session_key = self._session_key_for_row(row)
+        fingerprint = str(source.get("fingerprint") or "").strip()
+        event_seed = (
+            f"{session_key}|{fingerprint}|{reason}|{time.time_ns()}|"
+            f"{text[:400]}"
+        )
+        event_id = hashlib.sha256(event_seed.encode("utf-8")).hexdigest()[:32]
+        return {
+            "event_id": event_id,
+            "message": {
+                "conversation": {
+                    "id": session_key,
+                    "kind": "group" if is_group else "direct",
+                    "title": row.title,
+                },
+                "sender": {
+                    "id": sender,
+                    "name": sender,
+                },
+                "text": text[:8000],
+                "content_type": content_type,
+                "mentioned_bot": reason == "mention",
+                "timestamp_ms": int(time.time() * 1000),
+                "attachments": attachments,
+                "metadata": {
+                    "reason": reason,
+                    "is_admin": bool(is_admin),
+                    "receiver_mode": self.cfg.receiver_mode,
+                },
+            },
+        }
+
+    def _long_bridge_reply(
+        self,
+        row: ChatRowState,
+        *,
+        reason: str,
+        is_group: bool,
+        is_admin: bool,
+        latest_message: str,
+        source_message: dict | None = None,
+        mention_reply_to: str = "",
+    ) -> tuple[bool, LongBridgeResult | None]:
+        if self.cfg.processing_mode != "long_bridge":
+            return False, None
+        if not self.long_bridge_client.enabled():
+            print("[warn] long bridge mode enabled but URL or token is empty")
+            if self.cfg.long_bridge_fail_open:
+                return False, None
+            return True, None
+        try:
+            payload = self._long_bridge_event_payload(
+                row,
+                reason=reason,
+                is_group=is_group,
+                is_admin=is_admin,
+                latest_message=latest_message,
+                source_message=source_message,
+                mention_reply_to=mention_reply_to,
+            )
+            if self.cfg.log_verbose:
+                print(
+                    f"[long-bridge] request row={row.row_idx:>2} "
+                    f"reason={reason:<14} title={self._fit_col(row.title, 14)}"
+                )
+            result = self.long_bridge_client.request_reply(payload)
+        except Exception as exc:
+            print(f"[warn] long bridge failed: {exc}")
+            if self.cfg.long_bridge_fail_open:
+                print("[long-bridge] fail-open: fallback to native pipeline")
+                return False, None
+            print("[long-bridge] fail-closed: skip native reply")
+            return True, None
+        if self.cfg.log_verbose:
+            print(
+                f"[long-bridge] reply row={row.row_idx:>2} "
+                f"text={len(result.reply)} files={len(result.attachments)} "
+                f"send={result.send}"
+            )
+        return True, result
+
+    def _send_long_bridge_attachments(
+        self,
+        row: ChatRowState,
+        attachments: list[Path],
+        *,
+        focused_bounds=None,
+    ) -> None:
+        for file_path in attachments:
+            with self._send_lock:
+                self._pause_visual_scan(self.cfg.mention_pause_scan_sec)
+                self._send_generated_file(
+                    row,
+                    file_path,
+                    focused_bounds=focused_bounds,
+                )
+
+    def _handle_long_bridge_outbound(self, outbound: LongBridgeOutbound) -> None:
+        title = outbound.conversation_title.strip()
+        if not title:
+            print(
+                "[warn] long bridge proactive message has no conversation title; "
+                f"id={outbound.conversation_id!r}"
+            )
+            return
+        if self.cfg.dry_run:
+            if outbound.result.reply:
+                print(f"[dry-run] proactive to={title!r} msg={outbound.result.reply!r}")
+            for file_path in outbound.result.attachments:
+                print(f"[dry-run] proactive to={title!r} file={file_path}")
+            return
+        with self._send_lock:
+            self._pause_visual_scan(self.cfg.mention_pause_scan_sec)
+            if outbound.result.reply:
+                message = self._strip_markdown_formatting(outbound.result.reply)
+                sent = self.sender.paste_and_send_to_window(title, message)
+                if not sent:
+                    print(
+                        f"[warn] proactive long bridge send window not confirmed: "
+                        f"{title!r}"
+                    )
+            for file_path in outbound.result.attachments:
+                sent = self.sender.paste_file_and_send_to_window(title, file_path)
+                if not sent:
+                    print(
+                        f"[warn] proactive long bridge file send not confirmed: "
+                        f"{title!r} {file_path}"
+                    )
+
+    def close(self) -> None:
+        self.long_bridge_client.close()
+        self._msg_executor.shutdown(wait=False, cancel_futures=True)
 
     def _canonicalize_sender_pair(self, sender: str) -> tuple[str, str]:
         raw = str(sender or "").strip()
@@ -6040,15 +6213,23 @@ class WeChatGuiRpaBot:
                 self._save_persistent_memory()
                 return
 
-        should_reply = True if self._is_immediate_reply_event(row, reason) else self._llm_should_reply_with_context(
-            row,
-            reason,
-            is_group,
-            chat_context,
-            "",
-            session_context,
-            workspace_context,
-            memory_recall,
+        should_reply = (
+            True
+            if self.cfg.processing_mode == "long_bridge"
+            else (
+                True
+                if self._is_immediate_reply_event(row, reason)
+                else self._llm_should_reply_with_context(
+                    row,
+                    reason,
+                    is_group,
+                    chat_context,
+                    "",
+                    session_context,
+                    workspace_context,
+                    memory_recall,
+                )
+            )
         )
         if not should_reply:
             self._save_persistent_memory()
@@ -6059,6 +6240,39 @@ class WeChatGuiRpaBot:
             if reason == "mention" and is_group
             else ""
         )
+        long_bridge_handled, long_bridge_result = self._long_bridge_reply(
+            row,
+            reason=reason,
+            is_group=is_group,
+            is_admin=is_admin,
+            latest_message=latest_text or row.preview,
+            source_message=message,
+            mention_reply_to=mention_reply_to,
+        )
+        if long_bridge_handled:
+            sent_text = ""
+            if long_bridge_result and long_bridge_result.send:
+                if long_bridge_result.reply:
+                    sent_text = self._reply(
+                        row,
+                        reason,
+                        latest_message=latest_text or row.preview,
+                        force_message=long_bridge_result.reply,
+                        mention_reply_to=mention_reply_to,
+                    )
+                self._send_long_bridge_attachments(
+                    row,
+                    long_bridge_result.attachments,
+                )
+            if sent_text:
+                sent_norm = self._normalize_preview(sent_text)
+                self._remember_sent_for_row(row, sent_norm, now)
+                self._append_session_item(row, "A", sent_text)
+                if self._is_normal_reply_event(row, reason):
+                    self._mark_normal_reply_at(now)
+            self._save_persistent_memory()
+            return
+
         bridge_handled, bridge_reply = self._bridge_reply_text(
             row,
             reason=reason,

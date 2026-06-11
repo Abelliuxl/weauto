@@ -56,13 +56,16 @@ def main() -> None:
     args = parse_args()
     cfg = load_config(args.config)
     bot = WeChatGuiRpaBot(cfg)
-    if args.command == "recover":
-        bot.run_recover_mode(countdown_sec=max(0, int(args.recover_countdown)))
-        return
-    if args.command in {"recover-auto", "recoverauto"}:
-        bot.run_recover_auto_mode(countdown_sec=max(0, int(args.recover_countdown)))
-        return
-    bot.run_forever()
+    try:
+        if args.command == "recover":
+            bot.run_recover_mode(countdown_sec=max(0, int(args.recover_countdown)))
+            return
+        if args.command in {"recover-auto", "recoverauto"}:
+            bot.run_recover_auto_mode(countdown_sec=max(0, int(args.recover_countdown)))
+            return
+        bot.run_forever()
+    finally:
+        bot.close()
 
 
 if __name__ == "__main__":

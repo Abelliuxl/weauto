@@ -248,7 +248,9 @@ class MessageHandler:
             bot._update_long_summary(row)
             session_context = bot._build_session_context(row)
 
-        if bot._is_immediate_reply_event(row, reason):
+        if bot.cfg.processing_mode == "long_bridge":
+            should_reply = True
+        elif bot._is_immediate_reply_event(row, reason):
             should_reply = True
         else:
             should_reply = bot._llm_should_reply_with_context(
@@ -264,6 +266,39 @@ class MessageHandler:
 
         if not should_reply:
             self._mark_event_done(row, now)
+            bot._save_persistent_memory()
+            return
+
+        long_bridge_handled, long_bridge_result = bot._long_bridge_reply(
+            row,
+            reason=reason,
+            is_group=is_group,
+            is_admin=is_admin,
+            latest_message=latest_user_message,
+        )
+        if long_bridge_handled:
+            sent_text = ""
+            if long_bridge_result and long_bridge_result.send:
+                if long_bridge_result.reply:
+                    sent_text = bot._reply(
+                        row,
+                        reason,
+                        focused_bounds=focused_bounds,
+                        latest_message=latest_user_message,
+                        force_message=long_bridge_result.reply,
+                    )
+                bot._send_long_bridge_attachments(
+                    row,
+                    long_bridge_result.attachments,
+                    focused_bounds=focused_bounds,
+                )
+            sent_norm = bot._normalize_preview(sent_text)
+            self._mark_event_done(row, now, sent_norm=sent_norm)
+            if sent_text:
+                bot._remember_sent_for_row(row, sent_norm, now)
+                bot._append_session_item(row, "A", sent_text)
+                if bot._is_normal_reply_event(row, reason):
+                    bot._mark_normal_reply_at(now)
             bot._save_persistent_memory()
             return
 
