@@ -1340,6 +1340,15 @@ class WeChatGuiRpaBot:
         for record in records or []:
             if not isinstance(record, dict):
                 continue
+            # Skip our own replies when merging from a screenshot. The bot
+            # already records every successfully-sent reply via
+            # _append_session_item at send time, so re-reading them from the
+            # screen only risks persisting Vision-LLM hallucinations (messages
+            # that were never actually sent). See _detached_message_record for
+            # the role assignment.
+            role = str(record.get("role", "unknown")).strip().lower()
+            if role == "assistant":
+                continue
             text = str(record.get("text", "")).strip()
             if not text:
                 continue
@@ -1348,7 +1357,7 @@ class WeChatGuiRpaBot:
                 sender_raw = str(record.get("sender_raw", "")).strip()[:40]
             incoming.append(
                 {
-                    "role": str(record.get("role", "unknown")).strip().lower(),
+                    "role": role,
                     "content_type": str(record.get("content_type", "unknown")).strip().lower(),
                     "text": text[:220],
                     "sender": sender_clean,
