@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# WeAuto.app launcher — runs when the .app is double-clicked.
+#
+# LaunchServices starts this directly (not via Terminal), so there is no
+# terminal window and no "close?" prompt. We just exec into the control panel.
+set -euo pipefail
+
+# Locate the project root. The .app lives inside the repo, so its parent's
+# parent's parent is the project root:
+#   <root>/WeAuto.app/Contents/MacOS/launcher
+APP_ROOT="$(cd "$(dirname "$0")/.." && pwd)"        # .../WeAuto.app/Contents
+BUNDLE_ROOT="$(cd "$APP_ROOT/.." && pwd)"           # .../WeAuto.app
+PROJECT_ROOT="$(cd "$BUNDLE_ROOT/.." && pwd)"       # <repo root>
+cd "$PROJECT_ROOT"
+
+# Load optional env files (same as start_app.sh).
+for env_file in "$PROJECT_ROOT/.env.weauto" "$PROJECT_ROOT/.env"; do
+  if [[ -f "$env_file" ]]; then
+    set -a
+    # shellcheck disable=SC1090
+    source "$env_file"
+    set +a
+  fi
+done
+
+export WEAUTO_SCREENSHOT_HIGH_RES="${WEAUTO_SCREENSHOT_HIGH_RES:-0}"
+export WEAUTO_LOG_WIDTH="${WEAUTO_LOG_WIDTH:-140}"
+
+PYTHON="$PROJECT_ROOT/.venv312/bin/python"
+if [[ ! -x "$PYTHON" ]]; then
+  # No venv yet — can't show a GUI dialog easily from a background agent, so
+  # write to stderr (visible in Console.app) and bail out.
+  echo "[WeAuto] venv not found at $PYTHON" >&2
+  echo "[WeAuto] Run once in Terminal: cd $PROJECT_ROOT && ./start_app.sh --headless --no-bot" >&2
+  exit 1
+fi
+
+# exec replaces this shell with the python process. LaunchServices considers
+# the .app's lifecycle tied to this process, so quitting from the menu bar
+# (which calls supervisor.shutdown() + rumps.quit_application) cleanly exits.
+exec "$PYTHON" -u -m app.main "$@"

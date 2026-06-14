@@ -17,28 +17,25 @@ WeAuto 提供一个现代入口 `start_app.sh`，替代需要常驻终端窗口�
 
 ## 1. 启动
 
-### 双击启动（推荐，最接近原生 App）
+### 双击 App 启动（推荐）
 
-双击项目根目录的 **`WeAuto.command`** 即可启动。它会：
+双击项目根目录的 **`WeAuto.app`** 即可启动。
 
-1. 用 `nohup` 把控制面板脱离终端后台运行（`PPID=1`，完全独立）。
-2. 启动菜单栏图标 + Web UI + Bot。
-3. 约 1.5 秒后自动关闭自己弹出的 Terminal 窗口。
+- macOS 的 `LaunchServices` 直接启动它，**不经过 Terminal**——没有终端窗口、没有"是否关闭"弹窗。
+- `Info.plist` 里设了 `LSUIElement`，所以**不显示 Dock 图标**，只在菜单栏出现图标。
+- 启动后：菜单栏图标 + Web UI + Bot 同时就绪。
 
-最终结果：**只剩菜单栏图标，没有任何终端窗口残留**。
+**放到桌面 / Dock / 「应用程序」文件夹**：按住 ⌥⌘ 把 `WeAuto.app` 拖到目标位置会生成替身；
+也可以直接拷贝（注意 `.app` 内部的 launcher 用相对路径定位项目根目录，所以**不要移出项目目录**，
+要用替身或拖到 Dock）。
 
 > **首次使用前**：需先在终端跑一次 `./start_app.sh --headless --no-bot` 初始化
-> `.venv312`（装依赖）。之后双击 `WeAuto.command` 即可，无需再开终端。
-
-**放到桌面 / 「应用程序」文件夹**：把 `WeAuto.command` 拷贝（或做替身）到桌面、
-Dock 或「应用程序」文件夹，以后像普通 App 一样双击/单击启动。
-> 注意：`WeAuto.command` 内部用绝对路径定位项目根目录，所以如果移动的是**拷贝**
-> 而非替身，需要保持原文件不动；推荐用替身（按住 ⌥⌘ 拖拽生成）。
+> `.venv312`（装依赖）。之后双击 `WeAuto.app` 即可，无需再开终端。
 
 ### 命令行启动
 
 ```bash
-# 默认：菜单栏 App + Web UI + Bot（与双击 .command 等价，但留在终端前台）
+# 默认：菜单栏 App + Web UI + Bot（留在终端前台，可看输出）
 ./start_app.sh
 
 # 仅 Web UI + Bot，不起菜单栏（SSH 远程 / 无 GUI 环境）
@@ -179,7 +176,7 @@ curl "http://127.0.0.1:8721/api/messages?session=real%E5%88%98%E6%99%93%E4%BA%AE
 
 | 场景 | 用哪个 |
 |------|--------|
-| **日常使用**（双击即跑，无终端残留） | 双击 `WeAuto.command` |
+| **日常使用**（双击即跑，无终端、无弹窗、无 Dock） | 双击 `WeAuto.app` |
 | 命令行启动（想留在终端前台看输出） | `./start_app.sh` |
 | 纯命令行调试（想直接看到 stdout、用 Ctrl+C） | `./start_rpa.sh` |
 | 定期重启守护（6h 强制重启） | `./start_rpa_watchdog.sh` |
