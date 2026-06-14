@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>WeAuto 控制面板</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span id="status-dot" class="dot dot-off"></span>
+    <h1>WeAuto</h1>
+    <span id="status-text" class="status-text">连接中…</span>
+  </div>
+  <nav class="tabs">
+    <button class="tab active" data-tab="overview">概览</button>
+    <button class="tab" data-tab="sessions">会话</button>
+    <button class="tab" data-tab="logs">日志</button>
+  </nav>
+  <div class="spacer"></div>
+  <span id="clock" class="clock"></span>
+</header>
+
+<main>
+  <!-- ====================== 概览 ====================== -->
+  <section id="tab-overview" class="panel active">
+    <div class="cards">
+      <div class="card" id="card-process">
+        <div class="card-label">进程</div>
+        <div class="card-value" id="ov-process">—</div>
+        <div class="card-sub" id="ov-process-sub">—</div>
+      </div>
+      <div class="card" id="card-uptime">
+        <div class="card-label">运行时长</div>
+        <div class="card-value" id="ov-uptime">—</div>
+        <div class="card-sub" id="ov-restarts">—</div>
+      </div>
+      <div class="card" id="card-bridge">
+        <div class="card-label">桥接</div>
+        <div class="card-value" id="ov-bridge">—</div>
+        <div class="card-sub" id="ov-bridge-sub">—</div>
+      </div>
+      <div class="card" id="card-activity">
+        <div class="card-label">最近活动</div>
+        <div class="card-value" id="ov-activity">—</div>
+        <div class="card-sub" id="ov-activity-sub">—</div>
+      </div>
+      <div class="card" id="card-heartbeat">
+        <div class="card-label">最近心跳</div>
+        <div class="card-value" id="ov-heartbeat">—</div>
+        <div class="card-sub" id="ov-heartbeat-sub">—</div>
+      </div>
+      <div class="card" id="card-reply">
+        <div class="card-label">最近回复</div>
+        <div class="card-value" id="ov-reply">—</div>
+        <div class="card-sub" id="ov-reply-sub">—</div>
+      </div>
+    </div>
+
+    <div class="meta-grid">
+      <div class="meta-row"><span>PID</span><span id="ov-pid">—</span></div>
+      <div class="meta-row"><span>自动重启</span><span id="ov-auto-restart">—</span></div>
+      <div class="meta-row"><span>配置文件</span><span id="ov-config">—</span></div>
+      <div class="meta-row"><span>当前日志</span><span id="ov-logfile">—</span></div>
+      <div class="meta-row"><span>问题日志</span><span id="ov-issuesfile">—</span></div>
+      <div class="meta-row"><span>状态文件刷新</span><span id="ov-saved">—</span></div>
+    </div>
+  </section>
+
+  <!-- ====================== 会话 ====================== -->
+  <section id="tab-sessions" class="panel">
+    <div class="sessions-layout">
+      <aside class="session-list">
+        <div class="session-search">
+          <input id="session-filter" type="search" placeholder="过滤会话…" autocomplete="off">
+        </div>
+        <ul id="session-list-ul" class="session-ul"></ul>
+      </aside>
+      <article class="session-detail">
+        <header class="session-header">
+          <h2 id="msg-title">选择左侧会话</h2>
+          <span id="msg-count" class="muted"></span>
+        </header>
+        <div id="messages" class="messages">
+          <p class="placeholder">点击左侧任一会话查看最近消息记录（只读）。</p>
+        </div>
+      </article>
+    </div>
+  </section>
+
+  <!-- ====================== 日志 ====================== -->
+  <section id="tab-logs" class="panel">
+    <div class="log-toolbar">
+      <label class="toggle">
+        <input id="log-autoscroll" type="checkbox" checked> 自动滚动
+      </label>
+      <label class="toggle">
+        <input id="log-pause" type="checkbox"> 暂停
+      </label>
+      <input id="log-tag" type="search" placeholder="按 tag 过滤，如 cycle / event / warn / error" autocomplete="off">
+      <label class="toggle">
+        显示历史 <input id="log-load-history" type="number" value="300" min="0" max="2000" step="50">
+      </label>
+      <button id="log-clear" class="btn">清屏</button>
+      <span id="log-status" class="muted"></span>
+    </div>
+    <pre id="log-box" class="log-box"></pre>
+  </section>
+</main>
+
+<script src="/app.js"></script>
+</body>
+</html>

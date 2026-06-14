@@ -377,3 +377,24 @@ output_dir = "data/edited_images"
 watermark = false
 prompt_extend = true
 max_input_bytes = 10485760
+
+# ============================================================
+# Control Panel (menu-bar app + web UI)
+# ============================================================
+# This section is read only by app/main.py (the modern entry point). The bot
+# itself (wechat_rpa.config.AppConfig) ignores unknown tables, so adding it is
+# safe and does not affect run.py / start_rpa.sh in any way.
+# Launch with:  ./start_app.sh          (menu bar + web + bot)
+#           or:  ./start_app.sh --headless --host 0.0.0.0   (remote web only)
+[webui]
+# Bind address. 127.0.0.1 = local only; 0.0.0.0 = allow remote IP access.
+host = "127.0.0.1"
+port = 8721
+# In-memory ring buffer size for the live log view / SSE stream.
+log_ring_lines = 2000
+# Auto-respawn the bot subprocess when it crashes.
+auto_restart = true
+# Minimum seconds between crash-triggered restarts (anti-storm guard).
+restart_min_interval_sec = 30.0
+# When false, the supervisor stays idle after the bot exits (manual control).
+supervisor_enabled = true

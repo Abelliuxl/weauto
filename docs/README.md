@@ -6,6 +6,7 @@
 2. [运行与运维](03-run-and-operations.md)
 3. [调试与排障](04-debug-and-troubleshooting.md)
 4. [架构与代码地图](05-architecture.md)
+5. [控制面板（菜单栏 App + Web UI）](06-control-panel.md)
 
 ## 快速上手
 
