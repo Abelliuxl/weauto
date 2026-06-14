@@ -37,6 +37,7 @@ from .config import AppConfig
 from .detector import ChatRowState, detect_chat_rows
 from .detached_window_receiver import (
     capture_window_by_id,
+    DetachedWindowInfo,
     list_detached_wechat_windows,
     request_screen_capture_access,
     safe_window_name,
@@ -378,6 +379,32 @@ class DetachedOcrProxy:
             return self._snapshot_from_dict(snapshot_payload)
         except Exception:
             return None
+
+    def list_windows(self, app_name: str) -> list[dict] | None:
+        """Enumerate detached WeChat windows via the worker.
+
+        ``CGWindowListCopyWindowInfo`` leaks Mach message memory in the caller,
+        so window enumeration must also run in the worker. Returns a list of
+        window dicts (window_id/owner/title/x/y/width/height), or ``None`` on
+        any worker failure (fail-open — the caller falls back to in-process
+        enumeration).
+        """
+        request = {
+            "mode": "list_windows",
+            "app_name": str(app_name or "WeChat"),
+        }
+        payload = self._request_once(request)
+        if payload is None:
+            return None
+        if "error" in payload:
+            self._fail_streak += 1
+            return None
+        windows = payload.get("windows")
+        if not isinstance(windows, list):
+            self._fail_streak += 1
+            return None
+        self._fail_streak = 0
+        return [dict(w) for w in windows if isinstance(w, dict)]
 
     def capture_only(self, window_id: int) -> tuple[Path, str, dict] | None:
         """Capture a window via the worker and return ``(image_path, body_hash,
@@ -6045,11 +6072,39 @@ class WeChatGuiRpaBot:
             time.sleep(1.0)
 
     def _detached_windows(self):
-        windows = list_detached_wechat_windows(self.cfg.app_name)
+        windows = self._enumerate_detached_windows()
         filters = [str(x).strip() for x in self.cfg.detached_window_title_filter if str(x).strip()]
         if filters:
             windows = [w for w in windows if any(token in w.title for token in filters)]
         return [w for w in windows if w.title and not self._is_ignored_title_text(w.title)]
+
+    def _enumerate_detached_windows(self) -> list[DetachedWindowInfo]:
+        """Enumerate detached WeChat windows, isolating the Mach-leaking
+        ``CGWindowListCopyWindowInfo`` call in the worker when enabled.
+
+        Falls back to in-process enumeration on any worker failure so a single
+        recycle never drops a cycle.
+        """
+        if self.ocr_proxy is not None:
+            raw = self.ocr_proxy.list_windows(self.cfg.app_name)
+            if raw is not None:
+                try:
+                    return [
+                        DetachedWindowInfo(
+                            window_id=int(w.get("window_id", 0)),
+                            owner=str(w.get("owner", "") or ""),
+                            title=str(w.get("title", "") or ""),
+                            x=int(w.get("x", 0)),
+                            y=int(w.get("y", 0)),
+                            width=int(w.get("width", 0)),
+                            height=int(w.get("height", 0)),
+                        )
+                        for w in raw
+                    ]
+                except (TypeError, ValueError):
+                    pass
+            # Worker failed — fall through to in-process enumeration.
+        return list_detached_wechat_windows(self.cfg.app_name)
 
     def _canonicalize_visible_message(self, message: dict) -> dict:
         if not isinstance(message, dict):

@@ -299,6 +299,82 @@ def test_capture_only_failopens_on_error(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# list_windows (window enumeration isolation)
+# ---------------------------------------------------------------------------
+
+
+def test_list_windows_returns_window_dicts(monkeypatch):
+    proxy, fakes = _make_proxy(monkeypatch)
+    proxy._ensure_worker()
+    fakes[0].stdout.push(json.dumps({"windows": [
+        {"window_id": 101, "owner": "WeChat", "title": "real刘晓亮", "x": 0, "y": 0, "width": 800, "height": 900},
+        {"window_id": 202, "owner": "WeChat", "title": "群-魔兽", "x": 820, "y": 0, "width": 800, "height": 900},
+    ]}) + "\n")
+    result = proxy.list_windows("WeChat")
+    assert result is not None
+    assert len(result) == 2
+    assert result[0] == {"window_id": 101, "owner": "WeChat", "title": "real刘晓亮", "x": 0, "y": 0, "width": 800, "height": 900}
+    request = json.loads(fakes[0].stdin.write_buffer[0])
+    assert request["mode"] == "list_windows"
+    assert request["app_name"] == "WeChat"
+    proxy.close()
+
+
+def test_list_windows_failopens_on_error(monkeypatch):
+    proxy, fakes = _make_proxy(monkeypatch)
+    proxy._ensure_worker()
+    fakes[0].stdout.push(json.dumps({"error": "list_windows failed: boom"}) + "\n")
+    assert proxy.list_windows("WeChat") is None
+
+
+def test_list_windows_failopens_on_malformed(monkeypatch):
+    proxy, fakes = _make_proxy(monkeypatch)
+    proxy._ensure_worker()
+    fakes[0].stdout.push(json.dumps({"windows": "not a list"}) + "\n")
+    assert proxy.list_windows("WeChat") is None
+
+
+def test_enumerate_detached_windows_falls_back_on_worker_none(monkeypatch):
+    """When the worker returns None, _enumerate_detached_windows falls back to
+    in-process enumeration so a recycle never drops a cycle."""
+    from wechat_rpa.bot import WeChatGuiRpaBot
+    from wechat_rpa.detached_window_receiver import DetachedWindowInfo
+
+    bot = WeChatGuiRpaBot.__new__(WeChatGuiRpaBot)
+    bot.ocr_proxy = SimpleNamespace(list_windows=lambda *a, **k: None)
+    inproc = [DetachedWindowInfo(1, "WeChat", "fallback-win", 0, 0, 10, 10)]
+    captured = {"called": False}
+
+    def _fake_inproc(app_name):
+        captured["called"] = True
+        return inproc
+
+    bot.cfg = SimpleNamespace(app_name="WeChat")
+    monkeypatch.setattr("wechat_rpa.bot.list_detached_wechat_windows", _fake_inproc)
+    result = bot._enumerate_detached_windows()
+    assert captured["called"] is True
+    assert result == inproc
+
+
+def test_enumerate_detached_windows_uses_worker_when_available(monkeypatch):
+    from wechat_rpa.bot import WeChatGuiRpaBot
+
+    bot = WeChatGuiRpaBot.__new__(WeChatGuiRpaBot)
+    bot.ocr_proxy = SimpleNamespace(list_windows=lambda app_name: [
+        {"window_id": 55, "owner": "WeChat", "title": "via-worker", "x": 1, "y": 2, "width": 3, "height": 4},
+    ])
+    bot.cfg = SimpleNamespace(app_name="WeChat")
+    # In-process must NOT be called when worker succeeds.
+    def _should_not_call(app_name):
+        raise AssertionError("in-process enumeration should not run when worker is available")
+    monkeypatch.setattr("wechat_rpa.bot.list_detached_wechat_windows", _should_not_call)
+    result = bot._enumerate_detached_windows()
+    assert len(result) == 1
+    assert result[0].window_id == 55
+    assert result[0].title == "via-worker"
+
+
+# ---------------------------------------------------------------------------
 # worker run_worker loop with a fake capture+parser
 # ---------------------------------------------------------------------------
 
@@ -519,6 +595,63 @@ def test_run_worker_capture_only_writes_png_and_returns_hash(monkeypatch, tmp_pa
     assert payloads[1]["image_size"] == {"width": 200, "height": 400}
     # The PNG was actually written to disk.
     assert (capture_tmp / "win_99.png").exists()
+
+
+def test_run_worker_list_windows_returns_window_list(monkeypatch):
+    """list_windows mode enumerates windows without capturing or touching OCR."""
+    import wechat_rpa.ocr_worker as worker_mod
+
+    written = []
+
+    class _In:
+        def __init__(self):
+            self.lines = iter([
+                json.dumps({"mode": "list_windows", "app_name": "WeChat"}),
+                "",  # EOF
+            ])
+
+        def readline(self):
+            try:
+                return next(self.lines)
+            except StopIteration:
+                return ""
+
+    class _Out:
+        def write(self, text):
+            written.append(text)
+
+        def flush(self):
+            pass
+
+    monkeypatch.setattr(worker_mod.sys, "stdin", _In())
+    monkeypatch.setattr(worker_mod.sys, "stdout", _Out())
+
+    from wechat_rpa.detached_window_receiver import DetachedWindowInfo
+
+    fake_windows = [
+        DetachedWindowInfo(101, "WeChat", "群-A", 0, 0, 800, 900),
+        DetachedWindowInfo(202, "WeChat", "real刘晓亮", 820, 0, 800, 900),
+    ]
+
+    import wechat_rpa.detached_window_receiver as dwr
+    import wechat_rpa.ocr as ocr_mod
+
+    monkeypatch.setattr(dwr, "list_detached_wechat_windows", lambda app_name: fake_windows)
+    monkeypatch.setattr(dwr, "capture_window_by_id", lambda *a, **k: None)
+    monkeypatch.setattr(ocr_mod, "OcrEngine", lambda *a, **k: object())
+    monkeypatch.setattr(worker_mod, "VisibleMessageParser", lambda engine: object())
+
+    run_worker(ocr_cfg=SimpleNamespace(), capture_backend="quartz", max_rss_mb=0)
+
+    full_output = "".join(written)
+    payloads = [json.loads(line) for line in full_output.splitlines() if line.strip()]
+    assert payloads[0] == {"ready": True}
+    assert len(payloads[1]["windows"]) == 2
+    assert payloads[1]["windows"][0] == {
+        "window_id": 101, "owner": "WeChat", "title": "群-A",
+        "x": 0, "y": 0, "width": 800, "height": 900,
+    }
+    assert payloads[1]["windows"][1]["title"] == "real刘晓亮"
 
 
 # ---------------------------------------------------------------------------

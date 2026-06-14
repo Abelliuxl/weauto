@@ -126,7 +126,7 @@ def run_worker(
     # Import locally so the module can be imported (e.g. in tests) without
     # pulling in the heavy OCR / Quartz stack.
     from .ocr import OcrEngine
-    from .detached_window_receiver import capture_window_by_id
+    from .detached_window_receiver import capture_window_by_id, list_detached_wechat_windows
 
     engine = OcrEngine(ocr_cfg, log_fn=log_fn)
     parser = VisibleMessageParser(engine)
@@ -151,9 +151,37 @@ def run_worker(
             _emit({"__exit__": True, "reason": "rss_limit", "rss_mb": _current_rss_mb()})
             break
 
+        mode = str(request.get("mode", "parse") or "parse").strip().lower()
+
+        # list_windows: enumerate detached WeChat windows WITHOUT capturing.
+        # CGWindowListCopyWindowInfo also leaks Mach message memory, so it must
+        # live in the worker too, not the main process.
+        if mode == "list_windows":
+            app_name = str(request.get("app_name", "WeChat") or "WeChat")
+            try:
+                found = list_detached_wechat_windows(app_name)
+                payload = {
+                    "windows": [
+                        {
+                            "window_id": int(w.window_id),
+                            "owner": str(w.owner),
+                            "title": str(w.title),
+                            "x": int(w.x),
+                            "y": int(w.y),
+                            "width": int(w.width),
+                            "height": int(w.height),
+                        }
+                        for w in found
+                    ]
+                }
+            except Exception as exc:  # noqa: BLE001 - worker must stay alive
+                _emit({"error": f"list_windows failed: {type(exc).__name__}: {exc}"})
+                continue
+            _emit(payload)
+            continue
+
         window_id = int(request.get("window_id", 0))
         title = str(request.get("title", "") or "")
-        mode = str(request.get("mode", "parse") or "parse").strip().lower()
         backend = str(request.get("capture_backend") or capture_backend)
 
         try:
