@@ -80,6 +80,7 @@ class VisibleMessageStateStore:
         new_messages: list[dict[str, Any]] = []
 
         start_idx = -1
+        tail_anchor_lost = False
         if previous_order:
             current_order = [fingerprint for fingerprint, _ in indexed_messages]
             for anchor in reversed(previous_order):
@@ -87,8 +88,9 @@ class VisibleMessageStateStore:
                     start_idx = current_order.index(anchor)
                     break
             # If every previous tail vanished, OCR/window layout is unstable.
-            # Resync the visible page instead of treating old visible bubbles as new.
+            # Resync the visible page, but preserve a new incoming tail message.
             if start_idx < 0:
+                tail_anchor_lost = True
                 start_idx = len(indexed_messages) - 1
 
         for idx, (fingerprint, message) in enumerate(indexed_messages):
@@ -101,7 +103,16 @@ class VisibleMessageStateStore:
             stored["first_seen_at"] = now
             stored["last_seen_at"] = now
             state.seen[fingerprint] = stored
-            if (not previous_order) or (idx > start_idx and fingerprint not in previous_seen):
+            is_new_tail_after_resync = (
+                tail_anchor_lost
+                and idx == len(indexed_messages) - 1
+                and self.is_incoming(stored)
+            )
+            if (
+                (not previous_order)
+                or (idx > start_idx and fingerprint not in previous_seen)
+                or is_new_tail_after_resync
+            ):
                 new_messages.append(stored)
 
         state.order = [fingerprint for fingerprint, _ in indexed_messages]

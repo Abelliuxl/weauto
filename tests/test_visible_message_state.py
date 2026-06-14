@@ -31,5 +31,23 @@ def test_visible_message_state_resyncs_when_tail_anchor_is_lost():
     state = VisibleMessageStateStore()
     state.update(window_id=1, messages=[_msg("a"), _msg("b")])
 
-    second = state.update(window_id=1, messages=[_msg("x"), _msg("y")])
+    second = state.update(
+        window_id=1,
+        messages=[_msg("x"), _msg("y", side="self")],
+    )
     assert second == []
+
+
+def test_visible_message_state_preserves_new_incoming_tail_when_anchor_is_lost():
+    state = VisibleMessageStateStore()
+    state.update(window_id=1, messages=[_msg("old-question"), _msg("old-answer", side="self")])
+
+    second = state.update(
+        window_id=1,
+        messages=[
+            _msg("long-answer", side="self"),
+            _msg("follow-up", text="他们之前有推出过什么模型吗？"),
+        ],
+    )
+
+    assert [msg["fingerprint"] for msg in second] == ["follow-up"]
