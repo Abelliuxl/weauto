@@ -196,6 +196,15 @@ class AppConfig:
     # quartz: faster in-process CoreGraphics capture, but may grow Mach memory over time.
     detached_window_capture_backend: str = "screencapture"
     detached_debug_save: bool = False
+    # When enabled, the high-frequency detached-window capture+OCR pipeline
+    # runs in a dedicated child process that the main bot auto-recycles when
+    # its RSS exceeds ocr_worker_max_rss_mb. This isolates the native (Mach /
+    # CoreGraphics / cv2 / onnxruntime) memory growth that cannot be reclaimed
+    # by gc.collect(), so the main bot process never needs to restart.
+    ocr_worker_enabled: bool = False
+    ocr_worker_max_rss_mb: int = 2048
+    ocr_worker_request_timeout_sec: float = 20.0
+    ocr_worker_ready_timeout_sec: float = 15.0
     detached_reply_on_image: bool = False
     detached_process_existing_on_start: bool = False
     # When enabled, changed detached chat windows are parsed by the vision LLM
@@ -609,6 +618,19 @@ def load_config(path: str | Path | None) -> AppConfig:
         capture_backend if capture_backend in {"screencapture", "quartz"} else "screencapture"
     )
     cfg.detached_debug_save = bool(data.get("detached_debug_save", cfg.detached_debug_save))
+    cfg.ocr_worker_enabled = bool(data.get("ocr_worker_enabled", cfg.ocr_worker_enabled))
+    cfg.ocr_worker_max_rss_mb = max(
+        256,
+        int(data.get("ocr_worker_max_rss_mb", cfg.ocr_worker_max_rss_mb)),
+    )
+    cfg.ocr_worker_request_timeout_sec = max(
+        2.0,
+        float(data.get("ocr_worker_request_timeout_sec", cfg.ocr_worker_request_timeout_sec)),
+    )
+    cfg.ocr_worker_ready_timeout_sec = max(
+        2.0,
+        float(data.get("ocr_worker_ready_timeout_sec", cfg.ocr_worker_ready_timeout_sec)),
+    )
     cfg.detached_reply_on_image = bool(
         data.get("detached_reply_on_image", cfg.detached_reply_on_image)
     )

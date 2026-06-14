@@ -35,7 +35,14 @@ from .agent_store import ChatHistoryStore, MemoryStore, PeopleStore, SkillStore
 from .bridge import BridgeClient
 from .config import AppConfig
 from .detector import ChatRowState, detect_chat_rows
-from .detached_window_receiver import capture_window_by_id, list_detached_wechat_windows, safe_window_name
+from .detached_window_receiver import (
+    capture_window_by_id,
+    list_detached_wechat_windows,
+    request_screen_capture_access,
+    safe_window_name,
+    screen_capture_access_granted,
+    visible_window_owner_summary,
+)
 from .image_editing import ImageEditingError, ImageEditor
 from .image_generation import ImageGenerationError, ImageGenerator
 from .llm import LlmReplyGenerator, prepare_terminal_for_log_line
@@ -181,6 +188,253 @@ class SessionState:
     seen_content: set = field(default_factory=set)
 
 
+class DetachedOcrProxy:
+    """Owns the recycled capture+OCR worker subprocess.
+
+    Replaces the in-process ``self.visible_message_parser.parse(...)`` call for
+    the detached-window hot path. The worker holds all the native (Mach /
+    CoreGraphics / cv2 / onnxruntime) memory that gc.collect() cannot reclaim;
+    when the worker's RSS exceeds the configured limit it exits and this proxy
+    spawns a fresh one. The main bot process therefore never accumulates that
+    memory and never needs to restart.
+
+    Every call returns a ``VisibleChatSnapshot`` or ``None`` (fail-open: a
+    transient worker hiccup is reported as "no snapshot this cycle" and the
+    next cycle recovers, since the main loop already handles ``snapshot is
+    None``).
+    """
+
+    def __init__(
+        self,
+        cfg: AppConfig,
+        *,
+        config_path: str = "config.toml",
+        log_fn=None,
+    ) -> None:
+        self._cfg = cfg
+        self._config_path = config_path
+        self._log_fn = log_fn if log_fn is not None else print
+        self._proc: subprocess.Popen | None = None
+        self._ready = False
+        self._fail_streak = 0
+        self._recycle_count = 0
+
+    def _spawn(self) -> None:
+        env = dict(os.environ)
+        env["WEAUTO_CONFIG_PATH"] = str(self._config_path)
+        env["WEAUTO_OCR_WORKER_MAX_RSS_MB"] = str(self._cfg.ocr_worker_max_rss_mb)
+        # Detach from the bot's stdout so the worker's OCR diagnostics never
+        # corrupt the bot's structured logs; the bot only reads its stdout.
+        self._proc = subprocess.Popen(
+            [sys.executable, "-u", "-m", "wechat_rpa.ocr_worker"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            bufsize=1,
+            env=env,
+        )
+        self._ready = False
+        # Wait for the worker's {"ready": true} handshake (engine warmup).
+        ready_timeout = max(2.0, float(self._cfg.ocr_worker_ready_timeout_sec))
+        try:
+            first = self._proc.stdout.readline()  # type: ignore[union-attr]
+        except Exception:
+            first = ""
+        if self._proc.poll() is None and first.strip():
+            try:
+                payload = json.loads(first)
+                self._ready = bool(payload.get("ready"))
+            except (json.JSONDecodeError, ValueError):
+                self._ready = False
+        if not self._ready:
+            # Worker failed to warm up in time / died; tear down so the next
+            # call respawns. Don't block the caller here.
+            self._terminate()
+            self._log_fn(f"[ocr-worker] startup failed after {ready_timeout:.0f}s")
+
+    def _terminate(self) -> None:
+        proc = self._proc
+        self._proc = None
+        self._ready = False
+        if proc is None:
+            return
+        for stream in (proc.stdin, proc.stdout):
+            try:
+                if stream is not None:
+                    stream.close()
+            except Exception:
+                pass
+        try:
+            proc.terminate()
+            proc.wait(timeout=2.0)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+    def _ensure_worker(self) -> bool:
+        if self._proc is not None and self._proc.poll() is None and self._ready:
+            return True
+        self._terminate()
+        self._spawn()
+        return self._proc is not None and self._proc.poll() is None and self._ready
+
+    def _recycle(self, *, reason: str) -> None:
+        self._recycle_count += 1
+        self._log_fn(f"[ocr-worker] recycled #{self._recycle_count} reason={reason}")
+        self._terminate()
+
+    def _request_once(self, request: dict) -> dict | None:
+        """Send one JSON request and read one JSON response.
+
+        Returns the decoded payload dict, or ``None`` on any transport failure
+        (timeout, EOF, bad JSON). Handles worker RSS-exit by recycling and
+        returning ``None``. Does NOT interpret business fields (snapshot/error).
+        """
+        if not self._ensure_worker():
+            self._fail_streak += 1
+            return None
+        proc = self._proc
+        assert proc is not None and proc.stdin is not None and proc.stdout is not None
+        try:
+            proc.stdin.write(json.dumps(request, ensure_ascii=False) + "\n")
+            proc.stdin.flush()
+        except (BrokenPipeError, OSError, ValueError):
+            self._recycle(reason="write_failed")
+            self._fail_streak += 1
+            return None
+
+        timeout = max(2.0, float(self._cfg.ocr_worker_request_timeout_sec))
+        # Use a watchdog thread to enforce the timeout without blocking forever.
+        import threading as _threading
+
+        line_holder: list[str] = []
+
+        def _read() -> None:
+            try:
+                line_holder.append(proc.stdout.readline())
+            except Exception:
+                line_holder.append("")
+
+        reader = _threading.Thread(target=_read, daemon=True)
+        reader.start()
+        reader.join(timeout=timeout)
+        if reader.is_alive() or not line_holder or not line_holder[0].strip():
+            # Timed out or EOF. Recycle so the next call gets a fresh worker.
+            self._recycle(reason="timeout_or_eof")
+            self._fail_streak += 1
+            return None
+
+        raw_line = line_holder[0]
+        try:
+            payload = json.loads(raw_line)
+        except (json.JSONDecodeError, ValueError):
+            self._fail_streak += 1
+            return None
+
+        # Worker asked to exit (RSS limit hit): acknowledge and recycle.
+        if payload.get("__exit__"):
+            rss_mb = payload.get("rss_mb", "?")
+            self._recycle(reason=f"rss_limit({rss_mb}MB)")
+            self._fail_streak = 0
+            return None
+
+        return payload
+
+    def parse(
+        self,
+        window_id: int,
+        *,
+        title: str,
+        image_output_dir: Path | None = None,
+        include_debug: bool = False,
+    ) -> VisibleChatSnapshot | None:
+        request = {
+            "mode": "parse",
+            "window_id": int(window_id),
+            "title": str(title or ""),
+            "image_output_dir": str(image_output_dir) if image_output_dir else None,
+            "include_debug": bool(include_debug),
+        }
+        payload = self._request_once(request)
+        if payload is None:
+            return None
+
+        if "error" in payload:
+            # A transient OCR/capture error inside the worker — fail open this
+            # cycle, the worker stays alive for the next request.
+            self._fail_streak += 1
+            return None
+
+        snapshot_payload = payload.get("snapshot")
+        if not isinstance(snapshot_payload, dict):
+            self._fail_streak += 1
+            return None
+
+        self._fail_streak = 0
+        try:
+            return self._snapshot_from_dict(snapshot_payload)
+        except Exception:
+            return None
+
+    def capture_only(self, window_id: int) -> tuple[Path, str, dict] | None:
+        """Capture a window via the worker and return ``(image_path, body_hash,
+        image_size)``.
+
+        This is the vision-path entry point: the worker does the leaky
+        CoreGraphics capture and persists the PNG to a temp path it owns; the
+        bot reads the file back with PIL (no Mach growth) for the vision LLM.
+        The caller MUST delete ``image_path`` after use. Returns ``None`` on any
+        worker failure (fail-open).
+        """
+        request = {
+            "mode": "capture_only",
+            "window_id": int(window_id),
+        }
+        payload = self._request_once(request)
+        if payload is None:
+            return None
+
+        if "error" in payload:
+            self._fail_streak += 1
+            return None
+
+        image_path_raw = payload.get("image_path")
+        body_hash = payload.get("body_hash")
+        if not image_path_raw or not body_hash:
+            self._fail_streak += 1
+            return None
+        self._fail_streak = 0
+        image_size = payload.get("image_size") or {}
+        if not isinstance(image_size, dict):
+            image_size = {}
+        return (Path(str(image_path_raw)), str(body_hash), dict(image_size))
+
+    @staticmethod
+    def _snapshot_from_dict(payload: dict) -> VisibleChatSnapshot:
+        messages = payload.get("messages") or []
+        if not isinstance(messages, list):
+            messages = []
+        latest = payload.get("latest_message")
+        debug = payload.get("debug")
+        return VisibleChatSnapshot(
+            schema=str(payload.get("schema", "weauto_visible_messages_v1")),
+            window_id=int(payload.get("window_id", 0) or 0),
+            title=str(payload.get("title", "") or ""),
+            captured_at=float(payload.get("captured_at", 0.0) or 0.0),
+            source=str(payload.get("source", "ocr_worker") or "ocr_worker"),
+            image_size=dict(payload.get("image_size") or {"width": 0, "height": 0}),
+            messages=[dict(m) for m in messages if isinstance(m, dict)],
+            latest_message=dict(latest) if isinstance(latest, dict) else None,
+            debug=dict(debug) if isinstance(debug, dict) else None,
+        )
+
+    def close(self) -> None:
+        self._terminate()
+
+
 class WeChatGuiRpaBot:
     def __init__(self, cfg: AppConfig) -> None:
         self.cfg = cfg
@@ -211,6 +465,14 @@ class WeChatGuiRpaBot:
         self.action_processor = ActionProcessor(self)
         self.message_handler = MessageHandler(self)
         self.visible_message_parser = VisibleMessageParser(self.ocr_engine)
+        # Recycled capture+OCR subprocess for the high-frequency detached-window
+        # path. When enabled, the leaky native (Mach/cv2/ORT) memory lives in
+        # the worker, not in this process. We still build the in-process parser
+        # above as a fallback and for the legacy_list / title-probe paths.
+        self.ocr_worker_enabled = bool(getattr(cfg, "ocr_worker_enabled", False))
+        self.ocr_proxy: DetachedOcrProxy | None = None
+        if self.ocr_worker_enabled:
+            self.ocr_proxy = DetachedOcrProxy(cfg, log_fn=print)
         self.visible_message_state = VisibleMessageStateStore()
         self._detached_window_image_hashes: dict[int, str] = {}
         self._detached_bootstrapped = False
@@ -982,6 +1244,8 @@ class WeChatGuiRpaBot:
     def close(self) -> None:
         self.long_bridge_client.close()
         self._msg_executor.shutdown(wait=False, cancel_futures=True)
+        if self.ocr_proxy is not None:
+            self.ocr_proxy.close()
 
     def _canonicalize_sender_pair(self, sender: str) -> tuple[str, str]:
         raw = str(sender or "").strip()
@@ -1043,7 +1307,12 @@ class WeChatGuiRpaBot:
     def _load_session_payload(self, key: str, sess: SessionState) -> None:
         meta = self._session_index.get(key, {})
         dir_name = str(meta.get("dir", key))
-        history_records = self.chat_history.load_all(dir_name)
+        history_limit = max(0, int(self.cfg.memory_history_max_items))
+        history_records = (
+            self.chat_history.read_recent(dir_name, limit=history_limit)
+            if history_limit > 0
+            else self.chat_history.load_all(dir_name)
+        )
         history_items = self._normalize_history_items(history_records)
         if not sess.short and isinstance(meta.get("short", []), list):
             sess.short = [str(x) for x in meta["short"]][-max(4, self.cfg.memory_short_max_items) :]
@@ -1053,11 +1322,7 @@ class WeChatGuiRpaBot:
             sess.titles = set(self._normalize_session_titles(meta.get("titles", [])))
         if not sess.muted:
             sess.muted = bool(meta.get("muted", False))
-        sess.history = (
-            history_items[-max(0, self.cfg.memory_history_max_items) :]
-            if self.cfg.memory_history_max_items > 0
-            else history_items
-        )
+        sess.history = history_items
         sess.loaded = True
         for item in history_items:
             sender = str(item.get("sender", "")).strip()
@@ -5955,6 +6220,114 @@ class WeChatGuiRpaBot:
             debug=None,
         )
 
+    def _capture_detached_image(self, window_id: int) -> tuple[Image.Image, str] | None:
+        """Capture a detached window and return ``(image, body_hash)``.
+
+        When the recycled capture+OCR worker is enabled, the leaky
+        ``CGWindowListCreateImage`` capture runs in the worker subprocess: the
+        worker persists the PNG to a temp path it owns and returns the path +
+        body hash, and we read the file back with PIL (a plain file read, no
+        CoreGraphics, no Mach growth). The returned image carries a
+        ``_weauto_tmp_path`` attribute the loop deletes after use.
+
+        Otherwise (worker disabled) this does the in-process capture + hash.
+
+        Returns ``None`` if the capture failed on both paths.
+        """
+        if self.ocr_proxy is not None:
+            result = self.ocr_proxy.capture_only(window_id)
+            if result is not None:
+                image_path, body_hash, _image_size = result
+                try:
+                    image = Image.open(image_path)
+                    image.load()
+                except Exception:
+                    try:
+                        image_path.unlink()
+                    except Exception:
+                        pass
+                    return None
+                # Tag the temp path so the loop can delete it after use.
+                try:
+                    image._weauto_tmp_path = image_path  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+                return image, body_hash
+            # Worker failed this cycle — fall through to in-process capture so a
+            # single worker hiccup doesn't drop the whole cycle.
+        image = capture_window_by_id(
+            window_id,
+            backend=self.cfg.detached_window_capture_backend,
+        )
+        try:
+            body_hash = self._detached_chat_body_hash(image)
+        except Exception:
+            body_hash = ""
+        return image, body_hash
+
+    @staticmethod
+    def _close_detached_image(image) -> None:
+        """Close a detached capture image and delete its worker temp file.
+
+        When the capture ran through the worker, the PIL image is backed by a
+        temp PNG on disk; closing the image alone would leave that file behind,
+        so unlink it too. No-op for in-process captures (no temp path).
+        """
+        if image is None:
+            return
+        tmp_path = getattr(image, "_weauto_tmp_path", None)
+        try:
+            image.close()
+        except Exception:
+            pass
+        if tmp_path is not None:
+            try:
+                Path(str(tmp_path)).unlink()
+            except Exception:
+                pass
+
+    def _parse_detached_snapshot_ocr(
+        self,
+        image,
+        *,
+        window_id: int,
+        title: str,
+        title_slug: str = "",
+        image_output_dir: Path | None = None,
+        include_debug: bool = False,
+    ) -> VisibleChatSnapshot:
+        """Run the new-message OCR parse for a detached window.
+
+        When the recycled capture+OCR worker is enabled, this dispatches to it
+        (the worker captures by window_id and returns a JSON snapshot, so the
+        ``image`` argument is unused on that branch — its native memory stays
+        isolated in the worker). Otherwise it falls back to the in-process
+        parser using the provided ``image``.
+
+        The worker may transiently return ``None`` (fail-open during a recycle);
+        in that case we fall back to the in-process parser so the cycle never
+        produces an empty snapshot purely because the worker recycled.
+        """
+        if self.ocr_proxy is not None:
+            snapshot = self.ocr_proxy.parse(
+                window_id,
+                title=title,
+                image_output_dir=image_output_dir,
+                include_debug=include_debug,
+            )
+            if snapshot is not None:
+                return snapshot
+            # Worker recycled or failed this cycle: fall through to in-process
+            # parse using the image the loop already captured. This is rare and
+            # keeps a single OCR miss from dropping a whole cycle.
+        return self.visible_message_parser.parse(
+            image,
+            window_id=window_id,
+            title=title,
+            image_output_dir=image_output_dir,
+            include_debug=include_debug,
+        )
+
     def _detached_local_snapshot_has_unseen_content(
         self,
         *,
@@ -6410,9 +6783,25 @@ class WeChatGuiRpaBot:
     def run_detached_window_forever(self) -> None:
         self._ensure_start_activity_at(time.time())
         image_root = Path(self.cfg.detached_window_output_dir).expanduser()
+        screen_capture_access = screen_capture_access_granted()
         print("[start] WeChat detached-window receiver started")
         print(f"[start] receiver=detached_windows poll={self.cfg.poll_interval_sec:.1f}s dry_run={self.cfg.dry_run}")
         print(f"[start] capture-backend={self.cfg.detached_window_capture_backend}")
+        if self.ocr_worker_enabled:
+            print(
+                f"[start] ocr-worker: enabled (isolated capture+OCR subprocess, "
+                f"recycle at {self.cfg.ocr_worker_max_rss_mb}MB)"
+            )
+        else:
+            print("[start] ocr-worker: disabled (in-process capture+OCR)")
+        print(f"[start] screen-capture-access={screen_capture_access}")
+        if screen_capture_access is False:
+            requested_access = request_screen_capture_access()
+            print(
+                "[warn] Screen Recording permission is missing for this launcher "
+                f"(request_result={requested_access}). Grant WeAuto access in System Settings, "
+                "then quit and reopen WeAuto."
+            )
         print(
             f"[start] mention-send: enabled={self.cfg.mention_send_enabled} "
             f"source={self._mention_mapping_source_text()} "
@@ -6423,6 +6812,7 @@ class WeChatGuiRpaBot:
         print(f"[start] image-gen: {self._image_generation_status_text()}")
         print(f"[start] image-edit: {self._image_editing_status_text()}")
         print(f"[start] memory-sqlite: disabled (archived)")
+        empty_window_diagnostic_logged = False
         while True:
             self._cycle += 1
             now = time.time()
@@ -6433,6 +6823,15 @@ class WeChatGuiRpaBot:
                 time.sleep(0.2)
                 continue
             windows = self._detached_windows()
+            if windows:
+                empty_window_diagnostic_logged = False
+            elif not empty_window_diagnostic_logged:
+                empty_window_diagnostic_logged = True
+                print(
+                    "[warn] detached window enumeration returned 0: "
+                    f"screen_capture_access={screen_capture_access_granted()} "
+                    f"visible_layer0_owners={visible_window_owner_summary()}"
+                )
             if self.cfg.log_verbose:
                 names = ", ".join([w.title for w in windows]) or "-"
                 print(f"[cycle] id={self._cycle:>4} detached_windows={len(windows)} {self._fit_col(names, max(24, self._term_width() - 34))}")
@@ -6448,22 +6847,23 @@ class WeChatGuiRpaBot:
                             window_id=window.window_id,
                             title=window.title,
                         )
-                    image = capture_window_by_id(
-                        window.window_id,
-                        backend=self.cfg.detached_window_capture_backend,
-                    )
+                    capture_result = self._capture_detached_image(window.window_id)
+                    if capture_result is None:
+                        raise RuntimeError(f"window capture failed: window_id={window.window_id}")
+                    image, captured_body_hash = capture_result
                     image_hash = ""
                     if resume_snapshot is not None:
                         try:
-                            image_hash = f"{window.title}|{self._detached_chat_body_hash(image)}"
+                            image_hash = f"{window.title}|{captured_body_hash}"
                             self._detached_window_image_hashes[window.window_id] = image_hash
                         except Exception:
                             image_hash = ""
                         try:
-                            local_snapshot = self.visible_message_parser.parse(
+                            local_snapshot = self._parse_detached_snapshot_ocr(
                                 image,
                                 window_id=window.window_id,
                                 title=window.title,
+                                title_slug=title_slug,
                                 image_output_dir=image_root / title_slug / "images",
                                 include_debug=False,
                             )
@@ -6496,14 +6896,12 @@ class WeChatGuiRpaBot:
                         self._detached_watchdog_resume_window_ids.discard(int(window.window_id))
                     if self.cfg.detached_vision_parse_enabled and self.llm.is_vision_enabled():
                         if snapshot is None:
-                            image_hash = f"{window.title}|{self._detached_chat_body_hash(image)}"
+                            image_hash = f"{window.title}|{captured_body_hash}"
                             old_hash = self._detached_window_image_hashes.get(window.window_id, "")
                             if old_hash and old_hash == image_hash:
                                 if image is not None:
-                                    try:
-                                        image.close()
-                                    except Exception:
-                                        pass
+                                    self._close_detached_image(image)
+                                    image = None
                                 continue
                             try:
                                 snapshot = self._parse_detached_snapshot_with_vision(
@@ -6521,18 +6919,16 @@ class WeChatGuiRpaBot:
                             except Exception as exc:
                                 print(f"[warn] detached vision parse failed title={window.title!r}: {exc}")
                                 if not self.cfg.vision.fail_open:
-                                    if image is not None:
-                                        try:
-                                            image.close()
-                                        except Exception:
-                                            pass
+                                    self._close_detached_image(image)
+                                    image = None
                                     continue
                                 print("[vision] fail-open: fallback to local OCR parser")
                     if snapshot is None:
-                        snapshot = self.visible_message_parser.parse(
+                        snapshot = self._parse_detached_snapshot_ocr(
                             image,
                             window_id=window.window_id,
                             title=window.title,
+                            title_slug=title_slug,
                             image_output_dir=image_root / title_slug / "images",
                             include_debug=self.cfg.detached_debug_save,
                         )
@@ -6545,11 +6941,8 @@ class WeChatGuiRpaBot:
                     snapshot.latest_message = snapshot.messages[-1] if snapshot.messages else None
                 except Exception as exc:
                     print(f"[warn] detached capture/parse failed title={window.title!r}: {exc}")
-                    if image is not None:
-                        try:
-                            image.close()
-                        except Exception:
-                            pass
+                    self._close_detached_image(image)
+                    image = None
                     continue
 
                 if self.cfg.detached_debug_save and image is not None:
@@ -6560,11 +6953,8 @@ class WeChatGuiRpaBot:
                         json.dumps(snapshot.messages, ensure_ascii=False, indent=2),
                         encoding="utf-8",
                     )
-                if image is not None:
-                    try:
-                        image.close()
-                    except Exception:
-                        pass
+                self._close_detached_image(image)
+                image = None
 
                 row_for_merge = ChatRowState(
                     row_idx=int(window.window_id),
