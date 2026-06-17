@@ -12,6 +12,10 @@ def _msg(text: str, side: str = "other"):
     }
 
 
+def _selected_texts(selected):
+    return [message["text"] for message, _allow_pass in selected]
+
+
 def test_detached_batch_selects_latest_normal_group_message():
     bot = object.__new__(WeChatGuiRpaBot)
     bot.cfg = SimpleNamespace(detached_reply_on_image=False, normal_reply_interval_sec=300.0)
@@ -43,7 +47,8 @@ def test_detached_batch_selects_latest_normal_group_message():
         ],
     )
 
-    assert [message["text"] for message in selected] == ["我测试一下"]
+    assert _selected_texts(selected) == ["我测试一下"]
+    assert [allow_pass for _message, allow_pass in selected] == [True]
 
 
 def test_detached_batch_keeps_all_mentions_and_latest_normal_message():
@@ -83,11 +88,12 @@ def test_detached_batch_keeps_all_mentions_and_latest_normal_message():
         ],
     )
 
-    assert [message["text"] for message in selected] == [
+    assert _selected_texts(selected) == [
         "@萨比 第一条",
         "@萨比 第二条",
         "普通闲聊二",
     ]
+    assert [allow_pass for _message, allow_pass in selected] == [False, False, True]
 
 
 def test_detached_batch_drops_normal_group_message_during_cooldown():
@@ -190,8 +196,58 @@ def test_detached_batch_logs_latest_normal_selection(capsys):
         new_messages=[_msg("普通闲聊一"), _msg("普通闲聊二")],
     )
 
-    assert [message["text"] for message in selected] == ["普通闲聊二"]
+    assert _selected_texts(selected) == ["普通闲聊二"]
+    assert [allow_pass for _message, allow_pass in selected] == [True]
     out = capsys.readouterr().out
     assert "[batch-select]" in out
     assert "policy=latest_normal" in out
     assert "selected=1" in out
+
+
+def test_detached_handler_allows_selected_normal_message_through_reserved_cooldown():
+    bot = object.__new__(WeChatGuiRpaBot)
+    bot.cfg = SimpleNamespace(
+        detached_reply_on_image=False,
+        log_verbose=False,
+        processing_mode="long_bridge",
+        normal_reply_interval_sec=300.0,
+    )
+    bot._last_normal_reply_at = 1000.0
+    bot.visible_message_state = SimpleNamespace(is_incoming=lambda message: True)
+    bot._detached_row_for_message = lambda **kwargs: SimpleNamespace(
+        title=kwargs["title"],
+        preview=kwargs["message"].get("text", ""),
+        has_mention=False,
+    )
+    bot._is_ignored_title = lambda row: False
+    bot._is_admin_session = lambda row: False
+    bot._is_row_muted = lambda row: False
+    bot._is_group_chat = lambda row: True
+    bot._should_reply_group = lambda row, reason: True
+    bot._is_normal_reply_event = lambda row, reason: reason == "new_message"
+    bot._normal_reply_interval_active = lambda: True
+    bot._image_followup_context_for_text = lambda row, text: ""
+    bot._detached_context_text = lambda messages: ""
+    bot._build_session_context = lambda row: ""
+    bot._workspace_context_for_row = lambda row, **kwargs: ""
+    bot._workspace_memory_recall_for_row = lambda row, query, is_admin=False: ""
+    bot._save_persistent_memory = lambda: None
+
+    calls = []
+
+    def long_bridge_reply(row, **kwargs):
+        calls.append(kwargs["latest_message"])
+        return True, None
+
+    bot._long_bridge_reply = long_bridge_reply
+
+    bot._handle_detached_new_message(
+        window_id=1,
+        title="群-临沧",
+        messages=[_msg("普通闲聊")],
+        message=_msg("普通闲聊"),
+        now=1000.0,
+        allow_normal_cooldown_pass=True,
+    )
+
+    assert calls == ["普通闲聊"]

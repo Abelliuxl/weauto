@@ -6704,8 +6704,8 @@ class WeChatGuiRpaBot:
         title: str,
         new_messages: list[dict],
         now: float,
-    ) -> list[dict]:
-        immediate: list[tuple[int, dict]] = []
+    ) -> list[tuple[dict, bool]]:
+        immediate: list[tuple[int, dict, bool]] = []
         normal_group: list[tuple[int, dict]] = []
         incoming_count = 0
         skipped: defaultdict[str, int] = defaultdict(int)
@@ -6757,7 +6757,7 @@ class WeChatGuiRpaBot:
             if self._is_normal_reply_event(row, reason):
                 normal_group.append((idx, message))
             else:
-                immediate.append((idx, message))
+                immediate.append((idx, message, False))
 
         selected = list(immediate)
         if normal_group:
@@ -6769,7 +6769,7 @@ class WeChatGuiRpaBot:
                 # For ordinary group chatter, answer only the newest message in
                 # the batch. Mentions/private/admin messages above are all kept.
                 latest_normal = max(normal_group, key=lambda item: item[0])
-                selected.append(latest_normal)
+                selected.append((latest_normal[0], latest_normal[1], True))
                 self._mark_normal_reply_at(now)
                 if log_verbose:
                     print(
@@ -6799,7 +6799,10 @@ class WeChatGuiRpaBot:
                 f"skipped={skipped_text}"
             )
 
-        return [message for _, message in sorted(selected, key=lambda item: item[0])]
+        return [
+            (message, allow_normal_cooldown_pass)
+            for _, message, allow_normal_cooldown_pass in sorted(selected, key=lambda item: item[0])
+        ]
 
     def _handle_detached_new_message(
         self,
@@ -6809,6 +6812,7 @@ class WeChatGuiRpaBot:
         messages: list[dict],
         message: dict,
         now: float,
+        allow_normal_cooldown_pass: bool = False,
     ) -> None:
         row = self._detached_row_for_message(window_id=window_id, title=title, message=message)
         if not self.visible_message_state.is_incoming(message):
@@ -6860,6 +6864,7 @@ class WeChatGuiRpaBot:
             self._is_normal_reply_event(row, reason)
             and self._normal_reply_interval_active()
             and (now - self._last_normal_reply_at) < self.cfg.normal_reply_interval_sec
+            and not allow_normal_cooldown_pass
         ):
             if self.cfg.log_verbose:
                 remain = self.cfg.normal_reply_interval_sec - (now - self._last_normal_reply_at)
@@ -7061,12 +7066,18 @@ class WeChatGuiRpaBot:
         if q is None:
             return
         while not q.empty():
-            title, messages, message, now = q.get_nowait()
+            item = q.get_nowait()
+            if len(item) >= 5:
+                title, messages, message, now, allow_normal_cooldown_pass = item[:5]
+            else:
+                title, messages, message, now = item
+                allow_normal_cooldown_pass = False
             try:
                 if self.visible_message_state.is_incoming(message):
                     self._handle_detached_new_message(
                         window_id=window_id, title=title,
                         messages=messages, message=message, now=now,
+                        allow_normal_cooldown_pass=allow_normal_cooldown_pass,
                     )
             except Exception as exc:
                 print(f"[warn] detached msg queue error window={window_id}: {exc}")
@@ -7355,8 +7366,8 @@ class WeChatGuiRpaBot:
                         f"queue_before={self._session_queues.get(window.window_id).qsize() if window.window_id in self._session_queues else 0}"
                     )
                 q = self._session_queues.setdefault(window.window_id, queue.Queue())
-                for message in messages_to_handle:
-                    q.put((window.title, snapshot.messages, message, now))
+                for message, allow_normal_cooldown_pass in messages_to_handle:
+                    q.put((window.title, snapshot.messages, message, now, allow_normal_cooldown_pass))
                 if self._session_busy.get(window.window_id):
                     if self.cfg.log_verbose and messages_to_handle:
                         print(f"[queue] window={window.window_id} busy, {q.qsize()} queued")
