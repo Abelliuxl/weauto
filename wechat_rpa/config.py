@@ -212,7 +212,7 @@ class AppConfig:
     detached_vision_parse_enabled: bool = False
     poll_interval_sec: float = 2.0
     action_cooldown_sec: float = 8.0
-    normal_reply_interval_sec: float = 60.0
+    normal_reply_interval_sec: float = 300.0
     dry_run: bool = True
     activate_wait_sec: float = 0.6
     click_move_duration_sec: float = 0.18

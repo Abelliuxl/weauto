@@ -118,3 +118,80 @@ def test_detached_batch_drops_normal_group_message_during_cooldown():
     )
 
     assert selected == []
+
+
+def test_detached_batch_logs_cooldown_reason(capsys):
+    bot = object.__new__(WeChatGuiRpaBot)
+    bot.cfg = SimpleNamespace(
+        detached_reply_on_image=False,
+        normal_reply_interval_sec=300.0,
+        log_verbose=True,
+    )
+    bot._last_normal_reply_at = 900.0
+    bot.visible_message_state = SimpleNamespace(
+        is_incoming=lambda message: message.get("side") == "other"
+    )
+    bot._detached_row_for_message = lambda **kwargs: SimpleNamespace(
+        title=kwargs["title"],
+        preview=kwargs["message"].get("text", ""),
+        has_mention=False,
+    )
+    bot._is_ignored_title = lambda row: False
+    bot._is_admin_session = lambda row: False
+    bot._is_row_muted = lambda row: False
+    bot._is_group_chat = lambda row: True
+    bot._should_reply_group = lambda row, reason: True
+    bot._is_normal_reply_event = lambda row, reason: reason == "new_message"
+    bot._normal_reply_interval_active = lambda: True
+
+    selected = bot._select_detached_messages_to_handle(
+        window_id=1,
+        title="群-临沧",
+        now=1000.0,
+        new_messages=[_msg("普通闲聊")],
+    )
+
+    assert selected == []
+    out = capsys.readouterr().out
+    assert "[cooldown]" in out
+    assert "reason=normal_reply_interval" in out
+    assert "drop=1" in out
+    assert "[batch-result]" in out
+
+
+def test_detached_batch_logs_latest_normal_selection(capsys):
+    bot = object.__new__(WeChatGuiRpaBot)
+    bot.cfg = SimpleNamespace(
+        detached_reply_on_image=False,
+        normal_reply_interval_sec=300.0,
+        log_verbose=True,
+    )
+    bot._last_normal_reply_at = 0.0
+    bot.visible_message_state = SimpleNamespace(
+        is_incoming=lambda message: message.get("side") == "other"
+    )
+    bot._detached_row_for_message = lambda **kwargs: SimpleNamespace(
+        title=kwargs["title"],
+        preview=kwargs["message"].get("text", ""),
+        has_mention=False,
+    )
+    bot._is_ignored_title = lambda row: False
+    bot._is_admin_session = lambda row: False
+    bot._is_row_muted = lambda row: False
+    bot._is_group_chat = lambda row: True
+    bot._should_reply_group = lambda row, reason: True
+    bot._is_normal_reply_event = lambda row, reason: reason == "new_message"
+    bot._normal_reply_interval_active = lambda: True
+
+    selected = bot._select_detached_messages_to_handle(
+        window_id=1,
+        title="群-临沧",
+        now=1000.0,
+        new_messages=[_msg("普通闲聊一"), _msg("普通闲聊二")],
+    )
+
+    assert [message["text"] for message in selected] == ["普通闲聊二"]
+    out = capsys.readouterr().out
+    assert "[batch-select]" in out
+    assert "policy=latest_normal" in out
+    assert "selected=1" in out

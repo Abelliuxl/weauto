@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 from PIL import Image
+from PIL import ImageDraw
 
 from wechat_rpa.bot import WeChatGuiRpaBot
 from wechat_rpa.llm import LlmReplyGenerator
@@ -34,6 +35,105 @@ def test_detached_chat_body_hash_is_stable():
 
     assert first
     assert first == second
+
+
+def test_detached_stable_chat_body_hash_ignores_media_frame_changes():
+    first = Image.new("RGB", (720, 1800), (247, 247, 247))
+    second = Image.new("RGB", (720, 1800), (247, 247, 247))
+    try:
+        for image, color in ((first, (180, 40, 40)), (second, (40, 80, 190))):
+            draw = ImageDraw.Draw(image)
+            draw.rectangle((190, 320, 460, 540), fill=color)
+
+        assert WeChatGuiRpaBot._detached_chat_body_hash(first) != WeChatGuiRpaBot._detached_chat_body_hash(second)
+        assert (
+            WeChatGuiRpaBot._detached_stable_chat_body_hash(first)
+            == WeChatGuiRpaBot._detached_stable_chat_body_hash(second)
+        )
+
+        changed_layout = Image.new("RGB", (720, 1800), (247, 247, 247))
+        ImageDraw.Draw(changed_layout).rectangle((190, 380, 460, 600), fill=(180, 40, 40))
+        try:
+            assert (
+                WeChatGuiRpaBot._detached_stable_chat_body_hash(first)
+                != WeChatGuiRpaBot._detached_stable_chat_body_hash(changed_layout)
+            )
+        finally:
+            changed_layout.close()
+    finally:
+        first.close()
+        second.close()
+
+
+def test_detached_stable_chat_body_hash_masks_small_left_stickers():
+    first = Image.new("RGB", (1826, 1940), (247, 247, 247))
+    second = Image.new("RGB", (1826, 1940), (247, 247, 247))
+    try:
+        for image, color in ((first, (15, 15, 15)), (second, (220, 220, 220))):
+            draw = ImageDraw.Draw(image)
+            draw.rectangle((137, 1605, 230, 1712), fill=color)
+
+        assert WeChatGuiRpaBot._detached_chat_body_hash(first) != WeChatGuiRpaBot._detached_chat_body_hash(second)
+        assert (
+            WeChatGuiRpaBot._detached_stable_chat_body_hash(first)
+            == WeChatGuiRpaBot._detached_stable_chat_body_hash(second)
+        )
+    finally:
+        first.close()
+        second.close()
+
+
+def test_detached_text_anchor_shift_detects_structural_scroll():
+    previous = [
+        {"key": "动图会导致截图的hash一直变", "y": 400},
+        {"key": "一直提示有新信息", "y": 520},
+        {"key": "不过还好doubao够便宜", "y": 650},
+        {"key": "测试看看", "y": 900},
+    ]
+    current = [{**anchor, "y": anchor["y"] - 80} for anchor in previous]
+
+    assert WeChatGuiRpaBot._detached_text_anchor_changed(previous, current) is True
+
+
+def test_detached_text_anchor_shift_ignores_jitter_and_animation():
+    previous = [
+        {"key": "动图会导致截图的hash一直变", "y": 400},
+        {"key": "一直提示有新信息", "y": 520},
+        {"key": "不过还好doubao够便宜", "y": 650},
+        {"key": "测试看看", "y": 900},
+    ]
+    current = [
+        {"key": "动图会导致截图的hash一直变", "y": 404},
+        {"key": "一直提示有新信息", "y": 517},
+        {"key": "不过还好doubao够便宜", "y": 652},
+        {"key": "测试看看", "y": 902},
+    ]
+
+    assert WeChatGuiRpaBot._detached_text_anchor_changed(previous, current) is False
+
+
+def test_detached_text_anchor_shift_detects_new_tail_text():
+    previous = [
+        {"key": "动图会导致截图的hash一直变", "y": 400},
+        {"key": "一直提示有新信息", "y": 520},
+        {"key": "不过还好doubao够便宜", "y": 650},
+    ]
+    current = [
+        *previous,
+        {"key": "这是一条新的文字消息", "y": 760},
+    ]
+
+    assert WeChatGuiRpaBot._detached_text_anchor_changed(previous, current) is True
+
+
+def test_detached_text_anchor_shift_returns_unknown_when_too_few_anchors():
+    assert (
+        WeChatGuiRpaBot._detached_text_anchor_changed(
+            [{"key": "只有一个文本", "y": 100}],
+            [{"key": "只有一个文本", "y": 40}],
+        )
+        is None
+    )
 
 
 def test_vision_sender_is_canonicalized_with_people_aliases(tmp_path):

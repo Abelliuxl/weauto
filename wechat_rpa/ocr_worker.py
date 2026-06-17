@@ -25,6 +25,8 @@ IPC protocol (one JSON object per line, UTF-8, on stdout/stdin):
                    "title": "...", "capture_backend": "quartz"}``
 * worker -> bot (capture_only):
                    ``{"image_path": "/tmp/.../win.png", "body_hash": "...",
+                      "stable_body_hash": "...",
+                      "text_anchors": [{"key": "...", "x": 1, "y": 2}],
                       "image_size": {"width": w, "height": h}}``
                    The bot loads the PNG (cheap PIL read, no CoreGraphics),
                    uses it for the vision LLM / hash, then deletes the file.
@@ -38,7 +40,6 @@ IPC protocol (one JSON object per line, UTF-8, on stdout/stdin):
 from __future__ import annotations
 
 from dataclasses import asdict
-import hashlib
 import json
 import os
 import subprocess
@@ -79,21 +80,11 @@ def _body_hash(image) -> str:
     Mirrors ``WeChatGuiRpaBot._detached_chat_body_hash`` so the bot's change
     detection works identically whether capture happens in-process or here.
     """
-    from PIL import Image as _PILImage
+    return VisibleMessageParser.chat_body_hash(image)
 
-    width, height = image.size
-    body_y1, body_y2 = VisibleMessageParser._chat_body_bounds(height)
-    body_y1 = max(0, min(height, body_y1))
-    body_y2 = max(body_y1, min(height, body_y2))
-    crop = image.crop((0, body_y1, width, body_y2))
-    try:
-        small = crop.convert("L").resize((96, 160))
-        try:
-            return hashlib.sha1(small.tobytes()).hexdigest()
-        finally:
-            small.close()
-    finally:
-        crop.close()
+
+def _stable_body_hash(image) -> str:
+    return VisibleMessageParser.chat_body_hash(image, mask_media=True)
 
 
 # Per-worker temp dir for capture_only PNGs. Recreated on each worker spawn;
@@ -118,15 +109,15 @@ def run_worker(
     """Run the capture (+ optional OCR) worker loop until stdin closes or RSS
     exceeds the limit.
 
-    The RapidOCR engine is constructed lazily on the first ``parse`` request
-    and reused afterward. Workers used only for window enumeration and vision
-    capture therefore never load rapidocr/onnxruntime.
+    The RapidOCR engine is constructed lazily on the first ``parse`` request or
+    capture request that asks for text anchors, and reused afterward.
     """
     # Import locally so the module can be imported (e.g. in tests) without
     # pulling in the heavy OCR / Quartz stack.
     from .ocr import OcrEngine
     from .detached_window_receiver import capture_window_by_id, list_detached_wechat_windows
 
+    engine: OcrEngine | None = None
     parser: VisibleMessageParser | None = None
 
     _emit({"ready": True})
@@ -198,11 +189,17 @@ def run_worker(
                 payload = {
                     "image_path": str(tmp_path),
                     "body_hash": _body_hash(image),
+                    "stable_body_hash": _stable_body_hash(image),
                     "image_size": {"width": int(image.size[0]), "height": int(image.size[1])},
                 }
+                if bool(request.get("include_text_anchors", False)):
+                    if engine is None:
+                        engine = OcrEngine(ocr_cfg, log_fn=log_fn)
+                    payload["text_anchors"] = VisibleMessageParser.text_anchors(image, engine)
             else:
                 if parser is None:
-                    engine = OcrEngine(ocr_cfg, log_fn=log_fn)
+                    if engine is None:
+                        engine = OcrEngine(ocr_cfg, log_fn=log_fn)
                     parser = VisibleMessageParser(engine)
                 image_output_dir_raw = request.get("image_output_dir")
                 image_output_dir: Path | None = None

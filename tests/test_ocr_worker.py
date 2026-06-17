@@ -300,14 +300,18 @@ def test_capture_only_returns_image_path_and_hash(monkeypatch):
     fake.stdout.push(json.dumps({
         "image_path": "/tmp/weauto-capture-xyz/win_42.png",
         "body_hash": "abc123def456",
+        "stable_body_hash": "stable456",
+        "text_anchors": [{"key": "hello", "x": 10, "y": 20}],
         "image_size": {"width": 1600, "height": 1900},
     }) + "\n")
     result = proxy.capture_only(42)
     assert result is not None
-    image_path, body_hash, image_size = result
+    image_path, body_hash, stable_body_hash, image_size, text_anchors = result
     assert str(image_path) == "/tmp/weauto-capture-xyz/win_42.png"
     assert body_hash == "abc123def456"
+    assert stable_body_hash == "stable456"
     assert image_size == {"width": 1600, "height": 1900}
+    assert text_anchors == [{"key": "hello", "x": 10, "y": 20}]
     # The request carried mode=capture_only.
     request = json.loads(fake.stdin.write_buffer[0])
     assert request["mode"] == "capture_only"
@@ -617,10 +621,11 @@ def test_run_worker_capture_only_writes_png_and_returns_hash(monkeypatch, tmp_pa
     import wechat_rpa.ocr as ocr_mod
     ocr_created = []
 
-    # _body_hash uses VisibleMessageParser._chat_body_bounds (a class attr), so
-    # patch with a real class carrying that attribute, not a factory function.
+    # Hash helpers use VisibleMessageParser class methods, so patch with a real
+    # class carrying those attributes, not a factory function.
     class _StubParser:
         _chat_body_bounds = staticmethod(lambda height: (190, min(height - 210, 1720)))
+        chat_body_hash = staticmethod(lambda image, mask_media=False: "stable" if mask_media else "raw")
 
         def __init__(self, engine):
             pass
@@ -639,11 +644,64 @@ def test_run_worker_capture_only_writes_png_and_returns_hash(monkeypatch, tmp_pa
     payloads = [json.loads(line) for line in full_output.splitlines() if line.strip()]
     assert payloads[0] == {"ready": True}
     assert payloads[1]["image_path"].endswith("win_99.png")
-    assert "body_hash" in payloads[1] and payloads[1]["body_hash"]
+    assert payloads[1]["body_hash"] == "raw"
+    assert payloads[1]["stable_body_hash"] == "stable"
     assert payloads[1]["image_size"] == {"width": 200, "height": 400}
     # The PNG was actually written to disk.
     assert (capture_tmp / "win_99.png").exists()
     assert ocr_created == []
+
+
+def test_run_worker_capture_only_can_return_text_anchors(monkeypatch, tmp_path):
+    import wechat_rpa.ocr_worker as worker_mod
+    from PIL import Image as _PILImage
+
+    written = []
+    capture_tmp = tmp_path / "captures"
+    capture_tmp.mkdir()
+    monkeypatch.setattr(worker_mod, "_capture_tmp_dir", lambda: capture_tmp)
+
+    class _In:
+        def __init__(self):
+            self.lines = iter([
+                json.dumps({"mode": "capture_only", "window_id": 99, "include_text_anchors": True}),
+                "",
+            ])
+
+        def readline(self):
+            try:
+                return next(self.lines)
+            except StopIteration:
+                return ""
+
+    class _Out:
+        def write(self, text):
+            written.append(text)
+
+        def flush(self):
+            pass
+
+    class _StubParser:
+        chat_body_hash = staticmethod(lambda image, mask_media=False: "stable" if mask_media else "raw")
+        text_anchors = staticmethod(lambda image, engine: [{"key": "anchor", "x": 1, "y": 2}])
+
+        def __init__(self, engine):
+            pass
+
+    monkeypatch.setattr(worker_mod.sys, "stdin", _In())
+    monkeypatch.setattr(worker_mod.sys, "stdout", _Out())
+
+    import wechat_rpa.detached_window_receiver as dwr
+    import wechat_rpa.ocr as ocr_mod
+
+    monkeypatch.setattr(dwr, "capture_window_by_id", lambda *_a, **_k: _PILImage.new("RGB", (200, 400)))
+    monkeypatch.setattr(ocr_mod, "OcrEngine", lambda *a, **k: object())
+    monkeypatch.setattr(worker_mod, "VisibleMessageParser", _StubParser)
+
+    run_worker(ocr_cfg=SimpleNamespace(), capture_backend="quartz", max_rss_mb=0)
+
+    payloads = [json.loads(line) for line in "".join(written).splitlines() if line.strip()]
+    assert payloads[1]["text_anchors"] == [{"key": "anchor", "x": 1, "y": 2}]
 
 
 def test_run_worker_list_windows_returns_window_list(monkeypatch):
