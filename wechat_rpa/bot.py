@@ -199,10 +199,10 @@ class DetachedOcrProxy:
     spawns a fresh one. The main bot process therefore never accumulates that
     memory and never needs to restart.
 
-    Every call returns a ``VisibleChatSnapshot`` or ``None`` (fail-open: a
-    transient worker hiccup is reported as "no snapshot this cycle" and the
-    next cycle recovers, since the main loop already handles ``snapshot is
-    None``).
+    Requests are retried once with a fresh worker after transport failures,
+    worker errors, or RSS-driven recycling. A second failure returns ``None``
+    so the caller can skip the current scan cycle without running the leaking
+    capture/OCR path in the main process.
     """
 
     def __init__(
@@ -219,6 +219,8 @@ class DetachedOcrProxy:
         self._ready = False
         self._fail_streak = 0
         self._recycle_count = 0
+        self._retry_count = 0
+        self._skipped_request_count = 0
 
     def _spawn(self) -> None:
         env = dict(os.environ)
@@ -236,7 +238,7 @@ class DetachedOcrProxy:
             env=env,
         )
         self._ready = False
-        # Wait for the worker's {"ready": true} handshake (engine warmup).
+        # Wait for the worker's {"ready": true} IPC handshake.
         ready_timeout = max(2.0, float(self._cfg.ocr_worker_ready_timeout_sec))
         try:
             first = self._proc.stdout.readline()  # type: ignore[union-attr]
@@ -249,8 +251,8 @@ class DetachedOcrProxy:
             except (json.JSONDecodeError, ValueError):
                 self._ready = False
         if not self._ready:
-            # Worker failed to warm up in time / died; tear down so the next
-            # call respawns. Don't block the caller here.
+            # Worker failed its IPC handshake or died; tear down so the next
+            # call respawns.
             self._terminate()
             self._log_fn(f"[ocr-worker] startup failed after {ready_timeout:.0f}s")
 
@@ -332,6 +334,7 @@ class DetachedOcrProxy:
         try:
             payload = json.loads(raw_line)
         except (json.JSONDecodeError, ValueError):
+            self._recycle(reason="invalid_json")
             self._fail_streak += 1
             return None
 
@@ -343,6 +346,39 @@ class DetachedOcrProxy:
             return None
 
         return payload
+
+    def _request(self, request: dict, *, validator=None) -> dict | None:
+        """Run a worker request, rebuilding the worker and retrying once."""
+        mode = str(request.get("mode", "parse") or "parse")
+        for attempt in range(2):
+            payload = self._request_once(request)
+            valid_payload = bool(
+                payload is not None
+                and "error" not in payload
+                and (validator is None or validator(payload))
+            )
+            if valid_payload:
+                return payload
+            if payload is not None:
+                if "error" in payload:
+                    error = str(payload.get("error", "worker_error") or "worker_error")
+                    reason = f"worker_error({error[:80]})"
+                else:
+                    reason = f"invalid_response({mode})"
+                self._recycle(reason=reason)
+                self._fail_streak += 1
+            if attempt == 0:
+                self._retry_count += 1
+                self._log_fn(
+                    f"[ocr-worker] retry #{self._retry_count} mode={mode} "
+                    "with fresh worker"
+                )
+        self._skipped_request_count += 1
+        self._log_fn(
+            f"[ocr-worker] request skipped #{self._skipped_request_count} "
+            f"mode={mode} after retry"
+        )
+        return None
 
     def parse(
         self,
@@ -359,20 +395,15 @@ class DetachedOcrProxy:
             "image_output_dir": str(image_output_dir) if image_output_dir else None,
             "include_debug": bool(include_debug),
         }
-        payload = self._request_once(request)
+        payload = self._request(
+            request,
+            validator=lambda item: isinstance(item.get("snapshot"), dict),
+        )
         if payload is None:
             return None
 
-        if "error" in payload:
-            # A transient OCR/capture error inside the worker — fail open this
-            # cycle, the worker stays alive for the next request.
-            self._fail_streak += 1
-            return None
-
         snapshot_payload = payload.get("snapshot")
-        if not isinstance(snapshot_payload, dict):
-            self._fail_streak += 1
-            return None
+        assert isinstance(snapshot_payload, dict)
 
         self._fail_streak = 0
         try:
@@ -386,23 +417,20 @@ class DetachedOcrProxy:
         ``CGWindowListCopyWindowInfo`` leaks Mach message memory in the caller,
         so window enumeration must also run in the worker. Returns a list of
         window dicts (window_id/owner/title/x/y/width/height), or ``None`` on
-        any worker failure (fail-open — the caller falls back to in-process
-        enumeration).
+        failure after the fresh-worker retry.
         """
         request = {
             "mode": "list_windows",
             "app_name": str(app_name or "WeChat"),
         }
-        payload = self._request_once(request)
+        payload = self._request(
+            request,
+            validator=lambda item: isinstance(item.get("windows"), list),
+        )
         if payload is None:
             return None
-        if "error" in payload:
-            self._fail_streak += 1
-            return None
         windows = payload.get("windows")
-        if not isinstance(windows, list):
-            self._fail_streak += 1
-            return None
+        assert isinstance(windows, list)
         self._fail_streak = 0
         return [dict(w) for w in windows if isinstance(w, dict)]
 
@@ -420,19 +448,18 @@ class DetachedOcrProxy:
             "mode": "capture_only",
             "window_id": int(window_id),
         }
-        payload = self._request_once(request)
+        payload = self._request(
+            request,
+            validator=lambda item: bool(
+                item.get("image_path") and item.get("body_hash")
+            ),
+        )
         if payload is None:
-            return None
-
-        if "error" in payload:
-            self._fail_streak += 1
             return None
 
         image_path_raw = payload.get("image_path")
         body_hash = payload.get("body_hash")
-        if not image_path_raw or not body_hash:
-            self._fail_streak += 1
-            return None
+        assert image_path_raw and body_hash
         self._fail_streak = 0
         image_size = payload.get("image_size") or {}
         if not isinstance(image_size, dict):
@@ -465,7 +492,16 @@ class DetachedOcrProxy:
 class WeChatGuiRpaBot:
     def __init__(self, cfg: AppConfig) -> None:
         self.cfg = cfg
-        self.ocr_engine = OcrEngine(cfg.ocr, log_fn=print)
+        self.ocr_worker_enabled = bool(getattr(cfg, "ocr_worker_enabled", False))
+        self._strict_detached_worker = bool(
+            self.ocr_worker_enabled
+            and getattr(cfg, "receiver_mode", "detached_windows") == "detached_windows"
+        )
+        self.ocr_engine: OcrEngine | None = None
+        self.visible_message_parser: VisibleMessageParser | None = None
+        if not self._strict_detached_worker:
+            self.ocr_engine = OcrEngine(cfg.ocr, log_fn=print)
+            self.visible_message_parser = VisibleMessageParser(self.ocr_engine)
         self.llm_reply = LlmReplyGenerator(cfg.llm_reply, cfg.vision)
         self.llm_decision = LlmReplyGenerator(cfg.llm_decision, cfg.vision)
         self.llm_planner = LlmReplyGenerator(cfg.llm_planner, cfg.vision)
@@ -491,12 +527,9 @@ class WeChatGuiRpaBot:
         self.heartbeat = None
         self.action_processor = ActionProcessor(self)
         self.message_handler = MessageHandler(self)
-        self.visible_message_parser = VisibleMessageParser(self.ocr_engine)
         # Recycled capture+OCR subprocess for the high-frequency detached-window
-        # path. When enabled, the leaky native (Mach/cv2/ORT) memory lives in
-        # the worker, not in this process. We still build the in-process parser
-        # above as a fallback and for the legacy_list / title-probe paths.
-        self.ocr_worker_enabled = bool(getattr(cfg, "ocr_worker_enabled", False))
+        # path. In strict detached mode the main process does not initialize an
+        # OCR engine and never falls back to native capture/OCR.
         self.ocr_proxy: DetachedOcrProxy | None = None
         if self.ocr_worker_enabled:
             self.ocr_proxy = DetachedOcrProxy(cfg, log_fn=print)
@@ -534,6 +567,10 @@ class WeChatGuiRpaBot:
         self._last_activity_at = 0.0
         self._last_memory_gc_at = 0.0
         self._memory_restart_pending = False
+        self._mach_diag_inprocess_capture = 0
+        self._mach_diag_inprocess_enum = 0
+        self._mach_diag_screenshot_region = 0
+        self._mach_diag_pyautogui = 0
         self._load_runtime_state()
         self._load_persistent_memory()
         self.long_bridge_client.set_outbound_handler(
@@ -557,6 +594,13 @@ class WeChatGuiRpaBot:
                 pil_image.close()
             except Exception:
                 pass
+
+    def _ensure_local_ocr(self) -> tuple[OcrEngine, VisibleMessageParser]:
+        if self.ocr_engine is None:
+            self.ocr_engine = OcrEngine(self.cfg.ocr, log_fn=print)
+        if self.visible_message_parser is None:
+            self.visible_message_parser = VisibleMessageParser(self.ocr_engine)
+        return self.ocr_engine, self.visible_message_parser
 
     @staticmethod
     def _current_rss_mb() -> int:
@@ -617,7 +661,23 @@ class WeChatGuiRpaBot:
         collected = gc.collect()
         rss_mb = self._current_rss_mb()
         if self.cfg.log_verbose and rss_mb:
-            print(f"[memory] rss={rss_mb}MB gc_collected={collected}")
+            worker_diag = ""
+            if self.ocr_proxy is not None:
+                worker_diag = (
+                    f" worker_recycles={self.ocr_proxy._recycle_count}"
+                    f" worker_retries={self.ocr_proxy._retry_count}"
+                    f" worker_skips={self.ocr_proxy._skipped_request_count}"
+                )
+            diag = (
+                f"inproc_capture={getattr(self, '_mach_diag_inprocess_capture', 0)} "
+                f"inproc_enum={getattr(self, '_mach_diag_inprocess_enum', 0)} "
+                f"screenshot_region={getattr(self, '_mach_diag_screenshot_region', 0)} "
+                f"pyautogui_ops={getattr(self, '_mach_diag_pyautogui', 0)}"
+            )
+            print(
+                f"[memory] rss={rss_mb}MB gc_collected={collected} "
+                f"{diag}{worker_diag}"
+            )
         should_restart = max_rss_mb > 0 and rss_mb > max_rss_mb
         if should_restart:
             self._memory_restart_pending = True
@@ -2426,7 +2486,8 @@ class WeChatGuiRpaBot:
         # high-res capture here to reduce long-run memory growth.
         shot = screenshot_region(x, y, w, h, high_res=False)
         bgr = self._to_np_rgb(shot)[:, :, ::-1]
-        lines = self.ocr_engine.detect_lines(bgr)
+        ocr_engine, _ = self._ensure_local_ocr()
+        lines = ocr_engine.detect_lines(bgr)
         raw_count = len(lines)
         if not lines:
             return "", raw_count, 0, (x, y, w, h), region
@@ -4782,7 +4843,11 @@ class WeChatGuiRpaBot:
         title = (title or "").strip()
         if not title:
             return False
-        return any(keyword and keyword in title for keyword in self.cfg.ignore_title_keywords)
+        if any(keyword and keyword in title for keyword in self.cfg.ignore_title_keywords):
+            return True
+        if any(title == kw for kw in self.cfg.ignore_exact_titles if kw):
+            return True
+        return False
 
     def _should_reply_group(self, row: ChatRowState, reason: str) -> bool:
         if reason == "mention":
@@ -4921,7 +4986,8 @@ class WeChatGuiRpaBot:
             high_res=False,
         )
         shot_rgb = self._to_np_rgb(shot)
-        detected = detect_chat_rows(shot_rgb, bounds, self.cfg, self.ocr_engine)
+        ocr_engine, _ = self._ensure_local_ocr()
+        detected = detect_chat_rows(shot_rgb, bounds, self.cfg, ocr_engine)
         return detected.rows
 
     def _find_row_in_snapshot(
@@ -6082,28 +6148,30 @@ class WeChatGuiRpaBot:
         """Enumerate detached WeChat windows, isolating the Mach-leaking
         ``CGWindowListCopyWindowInfo`` call in the worker when enabled.
 
-        Falls back to in-process enumeration on any worker failure so a single
-        recycle never drops a cycle.
+        In worker mode, a failed request skips the current scan cycle. It must
+        not fall back to the main process because each Quartz enumeration can
+        leave unreclaimable Mach-message mappings behind.
         """
         if self.ocr_proxy is not None:
             raw = self.ocr_proxy.list_windows(self.cfg.app_name)
-            if raw is not None:
-                try:
-                    return [
-                        DetachedWindowInfo(
-                            window_id=int(w.get("window_id", 0)),
-                            owner=str(w.get("owner", "") or ""),
-                            title=str(w.get("title", "") or ""),
-                            x=int(w.get("x", 0)),
-                            y=int(w.get("y", 0)),
-                            width=int(w.get("width", 0)),
-                            height=int(w.get("height", 0)),
-                        )
-                        for w in raw
-                    ]
-                except (TypeError, ValueError):
-                    pass
-            # Worker failed — fall through to in-process enumeration.
+            if raw is None:
+                return []
+            try:
+                return [
+                    DetachedWindowInfo(
+                        window_id=int(w.get("window_id", 0)),
+                        owner=str(w.get("owner", "") or ""),
+                        title=str(w.get("title", "") or ""),
+                        x=int(w.get("x", 0)),
+                        y=int(w.get("y", 0)),
+                        width=int(w.get("width", 0)),
+                        height=int(w.get("height", 0)),
+                    )
+                    for w in raw
+                ]
+            except (TypeError, ValueError):
+                return []
+        self._mach_diag_inprocess_enum += 1
         return list_detached_wechat_windows(self.cfg.app_name)
 
     def _canonicalize_visible_message(self, message: dict) -> dict:
@@ -6286,8 +6354,7 @@ class WeChatGuiRpaBot:
         ``_weauto_tmp_path`` attribute the loop deletes after use.
 
         Otherwise (worker disabled) this does the in-process capture + hash.
-
-        Returns ``None`` if the capture failed on both paths.
+        A worker failure returns ``None`` and skips this scan cycle.
         """
         if self.ocr_proxy is not None:
             result = self.ocr_proxy.capture_only(window_id)
@@ -6308,8 +6375,8 @@ class WeChatGuiRpaBot:
                 except Exception:
                     pass
                 return image, body_hash
-            # Worker failed this cycle — fall through to in-process capture so a
-            # single worker hiccup doesn't drop the whole cycle.
+            return None
+        self._mach_diag_inprocess_capture += 1
         image = capture_window_by_id(
             window_id,
             backend=self.cfg.detached_window_capture_backend,
@@ -6356,12 +6423,9 @@ class WeChatGuiRpaBot:
         When the recycled capture+OCR worker is enabled, this dispatches to it
         (the worker captures by window_id and returns a JSON snapshot, so the
         ``image`` argument is unused on that branch — its native memory stays
-        isolated in the worker). Otherwise it falls back to the in-process
-        parser using the provided ``image``.
-
-        The worker may transiently return ``None`` (fail-open during a recycle);
-        in that case we fall back to the in-process parser so the cycle never
-        produces an empty snapshot purely because the worker recycled.
+        isolated in the worker). Otherwise it uses the in-process parser.
+        A worker failure raises so the detached loop closes the image and skips
+        the current window without contaminating the main process.
         """
         if self.ocr_proxy is not None:
             snapshot = self.ocr_proxy.parse(
@@ -6372,10 +6436,11 @@ class WeChatGuiRpaBot:
             )
             if snapshot is not None:
                 return snapshot
-            # Worker recycled or failed this cycle: fall through to in-process
-            # parse using the image the loop already captured. This is rare and
-            # keeps a single OCR miss from dropping a whole cycle.
-        return self.visible_message_parser.parse(
+            raise RuntimeError(
+                f"ocr worker unavailable after retry: window_id={window_id}"
+            )
+        _, parser = self._ensure_local_ocr()
+        return parser.parse(
             image,
             window_id=window_id,
             title=title,
@@ -6560,6 +6625,7 @@ class WeChatGuiRpaBot:
                 # For ordinary group chatter, answer only the newest message in
                 # the batch. Mentions/private/admin messages above are all kept.
                 selected.append(max(normal_group, key=lambda item: item[0]))
+                self._mark_normal_reply_at(now)
 
         return [message for _, message in sorted(selected, key=lambda item: item[0])]
 
@@ -6838,7 +6904,11 @@ class WeChatGuiRpaBot:
     def run_detached_window_forever(self) -> None:
         self._ensure_start_activity_at(time.time())
         image_root = Path(self.cfg.detached_window_output_dir).expanduser()
-        screen_capture_access = screen_capture_access_granted()
+        screen_capture_access = (
+            "delegated-to-worker"
+            if self.ocr_worker_enabled
+            else screen_capture_access_granted()
+        )
         print("[start] WeChat detached-window receiver started")
         print(f"[start] receiver=detached_windows poll={self.cfg.poll_interval_sec:.1f}s dry_run={self.cfg.dry_run}")
         print(f"[start] capture-backend={self.cfg.detached_window_capture_backend}")
@@ -6850,7 +6920,7 @@ class WeChatGuiRpaBot:
         else:
             print("[start] ocr-worker: disabled (in-process capture+OCR)")
         print(f"[start] screen-capture-access={screen_capture_access}")
-        if screen_capture_access is False:
+        if (not self.ocr_worker_enabled) and screen_capture_access is False:
             requested_access = request_screen_capture_access()
             print(
                 "[warn] Screen Recording permission is missing for this launcher "
@@ -6882,11 +6952,17 @@ class WeChatGuiRpaBot:
                 empty_window_diagnostic_logged = False
             elif not empty_window_diagnostic_logged:
                 empty_window_diagnostic_logged = True
-                print(
-                    "[warn] detached window enumeration returned 0: "
-                    f"screen_capture_access={screen_capture_access_granted()} "
-                    f"visible_layer0_owners={visible_window_owner_summary()}"
-                )
+                if self.ocr_worker_enabled:
+                    print(
+                        "[warn] detached window enumeration returned 0; "
+                        "worker request failed or no matching windows"
+                    )
+                else:
+                    print(
+                        "[warn] detached window enumeration returned 0: "
+                        f"screen_capture_access={screen_capture_access_granted()} "
+                        f"visible_layer0_owners={visible_window_owner_summary()}"
+                    )
             if self.cfg.log_verbose:
                 names = ", ".join([w.title for w in windows]) or "-"
                 print(f"[cycle] id={self._cycle:>4} detached_windows={len(windows)} {self._fit_col(names, max(24, self._term_width() - 34))}")
@@ -7702,7 +7778,8 @@ class WeChatGuiRpaBot:
             )
             shot_rgb = self._to_np_rgb(shot)
 
-            detected = detect_chat_rows(shot_rgb, bounds, self.cfg, self.ocr_engine)
+            ocr_engine, _ = self._ensure_local_ocr()
+            detected = detect_chat_rows(shot_rgb, bounds, self.cfg, ocr_engine)
             self._log_cycle_snapshot(detected.rows, now)
             if not self._baseline:
                 self._set_baseline(detected.rows, now)

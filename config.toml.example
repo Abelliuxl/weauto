@@ -34,7 +34,7 @@ log_verbose = true
 debug_scan = false
 skip_first_action_on_start = true
 memory_gc_interval_sec = 60.0
-memory_watchdog_max_rss_mb = 8192
+memory_watchdog_max_rss_mb = 1536
 
 # ============================================================
 # Session Memory

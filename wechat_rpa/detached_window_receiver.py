@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 import re
@@ -60,6 +61,41 @@ def _app_aliases(app_name: str) -> list[str]:
     if not aliases:
         aliases = ["WeChat", "微信"]
     return aliases
+
+
+def screen_capture_access_granted() -> bool | None:
+    preflight = getattr(Quartz, "CGPreflightScreenCaptureAccess", None)
+    if preflight is None:
+        return None
+    try:
+        return bool(preflight())
+    except Exception:
+        return None
+
+
+def request_screen_capture_access() -> bool | None:
+    request = getattr(Quartz, "CGRequestScreenCaptureAccess", None)
+    if request is None:
+        return None
+    try:
+        return bool(request())
+    except Exception:
+        return None
+
+
+def visible_window_owner_summary() -> str:
+    counts: Counter[str] = Counter()
+    with _autorelease_pool():
+        window_list = Quartz.CGWindowListCopyWindowInfo(
+            Quartz.kCGWindowListOptionOnScreenOnly,
+            Quartz.kCGNullWindowID,
+        )
+        for item in window_list or []:
+            if int(item.get("kCGWindowLayer", 0)) != 0:
+                continue
+            owner = str(item.get("kCGWindowOwnerName", "") or "").strip()
+            counts[owner or "<unnamed>"] += 1
+    return ", ".join(f"{owner}:{count}" for owner, count in counts.most_common()) or "-"
 
 
 def list_detached_wechat_windows(app_name: str = "WeChat") -> list[DetachedWindowInfo]:

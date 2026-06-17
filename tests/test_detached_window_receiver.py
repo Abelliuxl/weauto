@@ -40,3 +40,34 @@ def test_capture_window_by_id_quartz_backend(monkeypatch):
 
     assert image.size == (3, 3)
     assert calls == [456]
+
+
+def test_screen_capture_access_helpers(monkeypatch):
+    monkeypatch.setattr(
+        detached_window_receiver.Quartz,
+        "CGPreflightScreenCaptureAccess",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        detached_window_receiver.Quartz,
+        "CGRequestScreenCaptureAccess",
+        lambda: True,
+    )
+
+    assert detached_window_receiver.screen_capture_access_granted() is False
+    assert detached_window_receiver.request_screen_capture_access() is True
+
+
+def test_visible_window_owner_summary(monkeypatch):
+    monkeypatch.setattr(
+        detached_window_receiver.Quartz,
+        "CGWindowListCopyWindowInfo",
+        lambda *_args: [
+            {"kCGWindowLayer": 0, "kCGWindowOwnerName": "WeChat"},
+            {"kCGWindowLayer": 0, "kCGWindowOwnerName": "WeChat"},
+            {"kCGWindowLayer": 0, "kCGWindowOwnerName": ""},
+            {"kCGWindowLayer": 25, "kCGWindowOwnerName": "WeChat"},
+        ],
+    )
+
+    assert detached_window_receiver.visible_window_owner_summary() == "WeChat:2, <unnamed>:1"

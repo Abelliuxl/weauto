@@ -20,7 +20,7 @@ The main bot process therefore never needs to restart for this reason.
 
 IPC protocol (one JSON object per line, UTF-8, on stdout/stdin):
 
-* worker -> bot:  ``{"ready": true}`` once after engine warmup.
+* worker -> bot:  ``{"ready": true}`` once after IPC startup.
 * bot -> worker:  ``{"mode": "capture_only"|"parse", "window_id": 123,
                    "title": "...", "capture_backend": "quartz"}``
 * worker -> bot (capture_only):
@@ -118,18 +118,16 @@ def run_worker(
     """Run the capture (+ optional OCR) worker loop until stdin closes or RSS
     exceeds the limit.
 
-    The RapidOCR engine is constructed ONCE here (warmup cost paid up front)
-    and reused for every ``parse`` request — this is the one place rapidocr/cv2
-    get imported for the detached-window path. ``capture_only`` requests never
-    touch OCR.
+    The RapidOCR engine is constructed lazily on the first ``parse`` request
+    and reused afterward. Workers used only for window enumeration and vision
+    capture therefore never load rapidocr/onnxruntime.
     """
     # Import locally so the module can be imported (e.g. in tests) without
     # pulling in the heavy OCR / Quartz stack.
     from .ocr import OcrEngine
     from .detached_window_receiver import capture_window_by_id, list_detached_wechat_windows
 
-    engine = OcrEngine(ocr_cfg, log_fn=log_fn)
-    parser = VisibleMessageParser(engine)
+    parser: VisibleMessageParser | None = None
 
     _emit({"ready": True})
 
@@ -203,6 +201,9 @@ def run_worker(
                     "image_size": {"width": int(image.size[0]), "height": int(image.size[1])},
                 }
             else:
+                if parser is None:
+                    engine = OcrEngine(ocr_cfg, log_fn=log_fn)
+                    parser = VisibleMessageParser(engine)
                 image_output_dir_raw = request.get("image_output_dir")
                 image_output_dir: Path | None = None
                 if image_output_dir_raw:

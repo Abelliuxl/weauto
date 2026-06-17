@@ -212,8 +212,9 @@ def test_parse_failopens_on_error_payload(monkeypatch):
     fake = fakes[0]
     fake.stdout.push(json.dumps({"error": "boom"}) + "\n")
     assert proxy.parse(1, title="x") is None
-    # Worker is NOT torn down on a transient OCR error — still ready.
-    assert proxy._proc is fake
+    assert fake.terminated is True
+    assert proxy._retry_count == 1
+    assert proxy._skipped_request_count == 1
 
 
 def test_parse_failopens_on_invalid_json(monkeypatch):
@@ -238,21 +239,53 @@ def test_parse_failopens_on_eof_and_recycles(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_parse_recycles_when_worker_reports_rss_exit(monkeypatch):
-    proxy, fakes = _make_proxy(monkeypatch)
+def test_parse_retries_with_fresh_worker_after_rss_exit(monkeypatch):
+    snapshot_payload = {
+        "window_id": 1,
+        "title": "x",
+        "messages": [{"side": "other", "text": "retried"}],
+        "latest_message": {"side": "other", "text": "retried"},
+        "image_size": {"width": 100, "height": 200},
+        "schema": "weauto_visible_messages_v1",
+        "captured_at": 1.0,
+        "source": "ocr_worker",
+    }
+    spawn_count = 0
+
+    def popener(*args, **kwargs):
+        nonlocal spawn_count
+        fake = _FakePopen(**kwargs)
+        spawn_count += 1
+        if spawn_count == 2:
+            fake.stdout.push(json.dumps({"snapshot": snapshot_payload}) + "\n")
+        return fake
+
+    proxy, fakes = _make_proxy(monkeypatch, popener=popener)
     proxy._ensure_worker()
     fake = fakes[0]
-    # Worker hits the RSS cap and asks to exit instead of producing a snapshot.
     fake.stdout.push(json.dumps({"__exit__": True, "reason": "rss_limit", "rss_mb": 2100}) + "\n")
-    assert proxy.parse(1, title="x") is None
-    # The exhausted worker was terminated; recycle count bumped.
+    result = proxy.parse(1, title="x")
+    assert result is not None
+    assert result.messages == [{"side": "other", "text": "retried"}]
     assert proxy._recycle_count == 1
+    assert proxy._retry_count == 1
+    assert proxy._skipped_request_count == 0
     assert fake.terminated is True
-    assert proxy._proc is None
-    # Next call respawns a fresh worker.
-    assert proxy._ensure_worker()
     assert len(fakes) == 2
     proxy.close()
+
+
+def test_parse_skips_after_retry_also_fails(monkeypatch):
+    proxy, fakes = _make_proxy(monkeypatch)
+    proxy._ensure_worker()
+    fakes[0].stdout.push(
+        json.dumps({"__exit__": True, "reason": "rss_limit", "rss_mb": 2100}) + "\n"
+    )
+
+    assert proxy.parse(1, title="x") is None
+    assert len(fakes) == 2
+    assert proxy._retry_count == 1
+    assert proxy._skipped_request_count == 1
 
 
 # ---------------------------------------------------------------------------
@@ -334,26 +367,22 @@ def test_list_windows_failopens_on_malformed(monkeypatch):
     assert proxy.list_windows("WeChat") is None
 
 
-def test_enumerate_detached_windows_falls_back_on_worker_none(monkeypatch):
-    """When the worker returns None, _enumerate_detached_windows falls back to
-    in-process enumeration so a recycle never drops a cycle."""
+def test_enumerate_detached_windows_skips_on_worker_none(monkeypatch):
     from wechat_rpa.bot import WeChatGuiRpaBot
-    from wechat_rpa.detached_window_receiver import DetachedWindowInfo
 
     bot = WeChatGuiRpaBot.__new__(WeChatGuiRpaBot)
     bot.ocr_proxy = SimpleNamespace(list_windows=lambda *a, **k: None)
-    inproc = [DetachedWindowInfo(1, "WeChat", "fallback-win", 0, 0, 10, 10)]
     captured = {"called": False}
 
     def _fake_inproc(app_name):
         captured["called"] = True
-        return inproc
+        raise AssertionError("strict worker mode must not enumerate in-process")
 
     bot.cfg = SimpleNamespace(app_name="WeChat")
     monkeypatch.setattr("wechat_rpa.bot.list_detached_wechat_windows", _fake_inproc)
     result = bot._enumerate_detached_windows()
-    assert captured["called"] is True
-    assert result == inproc
+    assert captured["called"] is False
+    assert result == []
 
 
 def test_enumerate_detached_windows_uses_worker_when_available(monkeypatch):
@@ -372,6 +401,20 @@ def test_enumerate_detached_windows_uses_worker_when_available(monkeypatch):
     assert len(result) == 1
     assert result[0].window_id == 55
     assert result[0].title == "via-worker"
+
+
+def test_capture_detached_image_skips_on_worker_none(monkeypatch):
+    from wechat_rpa.bot import WeChatGuiRpaBot
+
+    bot = WeChatGuiRpaBot.__new__(WeChatGuiRpaBot)
+    bot.ocr_proxy = SimpleNamespace(capture_only=lambda *a, **k: None)
+    bot.cfg = SimpleNamespace(detached_window_capture_backend="quartz")
+
+    def _should_not_capture(*args, **kwargs):
+        raise AssertionError("strict worker mode must not capture in-process")
+
+    monkeypatch.setattr("wechat_rpa.bot.capture_window_by_id", _should_not_capture)
+    assert bot._capture_detached_image(123) is None
 
 
 # ---------------------------------------------------------------------------
@@ -572,6 +615,7 @@ def test_run_worker_capture_only_writes_png_and_returns_hash(monkeypatch, tmp_pa
 
     import wechat_rpa.detached_window_receiver as dwr
     import wechat_rpa.ocr as ocr_mod
+    ocr_created = []
 
     # _body_hash uses VisibleMessageParser._chat_body_bounds (a class attr), so
     # patch with a real class carrying that attribute, not a factory function.
@@ -582,7 +626,11 @@ def test_run_worker_capture_only_writes_png_and_returns_hash(monkeypatch, tmp_pa
             pass
 
     monkeypatch.setattr(dwr, "capture_window_by_id", _fake_capture)
-    monkeypatch.setattr(ocr_mod, "OcrEngine", lambda *a, **k: object())
+    monkeypatch.setattr(
+        ocr_mod,
+        "OcrEngine",
+        lambda *a, **k: ocr_created.append(True) or object(),
+    )
     monkeypatch.setattr(worker_mod, "VisibleMessageParser", _StubParser)
 
     run_worker(ocr_cfg=SimpleNamespace(), capture_backend="quartz", max_rss_mb=0)
@@ -595,6 +643,7 @@ def test_run_worker_capture_only_writes_png_and_returns_hash(monkeypatch, tmp_pa
     assert payloads[1]["image_size"] == {"width": 200, "height": 400}
     # The PNG was actually written to disk.
     assert (capture_tmp / "win_99.png").exists()
+    assert ocr_created == []
 
 
 def test_run_worker_list_windows_returns_window_list(monkeypatch):
@@ -655,27 +704,22 @@ def test_run_worker_list_windows_returns_window_list(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Bot integration: dispatch helper falls back to in-process on worker miss
+# Bot integration: worker miss never falls back to in-process OCR
 # ---------------------------------------------------------------------------
 
 
-def test_parse_detached_snapshot_ocr_falls_back_on_worker_none(monkeypatch, tmp_path):
+def test_parse_detached_snapshot_ocr_skips_on_worker_none():
     from wechat_rpa.bot import WeChatGuiRpaBot
 
     bot = WeChatGuiRpaBot.__new__(WeChatGuiRpaBot)
     bot.ocr_proxy = SimpleNamespace(parse=lambda *a, **k: None)
     bot.visible_message_parser = SimpleNamespace(
-        parse=lambda image, **k: VisibleChatSnapshot(
-            schema="fallback", window_id=k["window_id"], title=k.get("title", ""),
-            captured_at=0.0, source="in_process_fallback",
-            image_size={"width": 1, "height": 1}, messages=[], latest_message=None, debug=None,
-        )
+        parse=lambda *a, **k: pytest.fail("strict worker mode must not parse in-process")
     )
 
-    result = bot._parse_detached_snapshot_ocr(
-        "image-placeholder",
-        window_id=9,
-        title="fallback-test",
-    )
-    assert result.source == "in_process_fallback"
-    assert result.window_id == 9
+    with pytest.raises(RuntimeError, match="ocr worker unavailable"):
+        bot._parse_detached_snapshot_ocr(
+            "image-placeholder",
+            window_id=9,
+            title="no-fallback-test",
+        )

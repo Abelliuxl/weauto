@@ -362,6 +362,7 @@ class AppConfig:
         default_factory=lambda: ["@助手", "@机器人", "机器人", "bot", "小助手", "@萨比", "萨比"]
     )
     ignore_title_keywords: list[str] = field(default_factory=lambda: ["折叠的聊天"])
+    ignore_exact_titles: list[str] = field(default_factory=lambda: ["微信"])
     use_manual_row_boxes: bool = False
     manual_row_boxes_path: str = "data/manual_row_boxes.json"
     row_title_region_enabled: bool = False
