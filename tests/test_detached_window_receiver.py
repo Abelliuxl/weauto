@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from PIL import Image
 
 from wechat_rpa import detached_window_receiver
+from wechat_rpa.detached_window_receiver import DetachedWindowInfo
 
 
 def test_capture_window_by_id_uses_temp_file_not_dash(monkeypatch):
@@ -71,3 +72,41 @@ def test_visible_window_owner_summary(monkeypatch):
     )
 
     assert detached_window_receiver.visible_window_owner_summary() == "WeChat:2, <unnamed>:1"
+
+
+def test_set_detached_wechat_window_size_runs_osascript(monkeypatch):
+    calls = []
+
+    def fake_run(cmd, *, capture_output, text, timeout):
+        calls.append((cmd, capture_output, text, timeout))
+        assert cmd[0] == "osascript"
+        assert "set size of w to {852, 970}" in cmd[-1]
+        assert 'if (name of w) is "群-魔兽"' in cmd[-1]
+        return SimpleNamespace(returncode=0, stdout="ok\n", stderr="")
+
+    monkeypatch.setattr(detached_window_receiver.subprocess, "run", fake_run)
+
+    ok = detached_window_receiver.set_detached_wechat_window_size(
+        DetachedWindowInfo(101, "WeChat", "群-魔兽", 0, 25, 1328, 970),
+        width=852,
+        height=970,
+    )
+
+    assert ok is True
+    assert calls
+
+
+def test_set_detached_wechat_window_size_returns_false_when_missing(monkeypatch):
+    monkeypatch.setattr(
+        detached_window_receiver.subprocess,
+        "run",
+        lambda *a, **k: SimpleNamespace(returncode=0, stdout="not_found\n", stderr=""),
+    )
+
+    ok = detached_window_receiver.set_detached_wechat_window_size(
+        DetachedWindowInfo(101, "WeChat", "群-魔兽", 0, 25, 1328, 970),
+        width=852,
+        height=970,
+    )
+
+    assert ok is False

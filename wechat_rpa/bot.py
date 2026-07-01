@@ -42,6 +42,7 @@ from .detached_window_receiver import (
     request_screen_capture_access,
     safe_window_name,
     screen_capture_access_granted,
+    set_detached_wechat_window_size,
     visible_window_owner_summary,
 )
 from .image_editing import ImageEditingError, ImageEditor
@@ -6212,6 +6213,49 @@ class WeChatGuiRpaBot:
         self._mach_diag_inprocess_enum += 1
         return list_detached_wechat_windows(self.cfg.app_name)
 
+    def _resize_detached_windows_on_start(self) -> None:
+        if not bool(getattr(self.cfg, "detached_window_resize_on_start", False)):
+            return
+        target_w = int(getattr(self.cfg, "detached_window_standard_width", 0) or 0)
+        target_h = int(getattr(self.cfg, "detached_window_standard_height", 0) or 0)
+        if target_w <= 0 or target_h <= 0:
+            print(
+                "[warn] detached window resize skipped: invalid target "
+                f"{target_w}x{target_h}"
+            )
+            return
+        windows = self._detached_windows()
+        changed = 0
+        skipped = 0
+        failed = 0
+        for window in windows:
+            if abs(int(window.width) - target_w) <= 1 and abs(int(window.height) - target_h) <= 1:
+                skipped += 1
+                continue
+            try:
+                ok = set_detached_wechat_window_size(
+                    window,
+                    width=target_w,
+                    height=target_h,
+                )
+            except Exception as exc:
+                failed += 1
+                print(f"[warn] detached window resize failed title={window.title!r}: {exc}")
+                continue
+            if ok:
+                changed += 1
+                print(
+                    f"[resize] detached title={window.title!r} "
+                    f"{window.width}x{window.height} -> {target_w}x{target_h}"
+                )
+            else:
+                failed += 1
+                print(f"[warn] detached window resize target not found title={window.title!r}")
+        print(
+            f"[start] window-resize: size={target_w}x{target_h} "
+            f"changed={changed} skipped={skipped} failed={failed}"
+        )
+
     def _canonicalize_visible_message(self, message: dict) -> dict:
         if not isinstance(message, dict):
             return message
@@ -7150,6 +7194,7 @@ class WeChatGuiRpaBot:
         print(f"[start] image-gen: {self._image_generation_status_text()}")
         print(f"[start] image-edit: {self._image_editing_status_text()}")
         print(f"[start] memory-sqlite: disabled (archived)")
+        self._resize_detached_windows_on_start()
         empty_window_diagnostic_logged = False
         while True:
             self._cycle += 1

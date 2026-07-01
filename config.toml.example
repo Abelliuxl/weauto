@@ -10,6 +10,9 @@ detached_window_output_dir = "data/detached_window_images"
 # screencapture: memory-stable but slower; quartz: faster but may grow Mach memory, use watchdog.
 detached_window_capture_backend = "screencapture"
 detached_debug_save = false
+detached_window_resize_on_start = false
+detached_window_standard_width = 852
+detached_window_standard_height = 970
 detached_reply_on_image = false
 detached_process_existing_on_start = false
 detached_vision_parse_enabled = false
@@ -203,6 +206,7 @@ group_only_reply_when_mentioned = false
 group_allow_llm_no_reply = false
 group_reply_keywords = ["@助手", "@机器人", "机器人", "bot", "小助手", "@萨比", "萨比"]
 ignore_title_keywords = ["折叠的聊天"]
+ignore_exact_titles = ["微信"]
 
 # ============================================================
 # Legacy List Mode Geometry

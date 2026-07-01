@@ -28,6 +28,10 @@ class DetachedWindowInfo:
     height: int
 
 
+def _apple_quote(value: str) -> str:
+    return str(value or "").replace("\\", "\\\\").replace('"', '\\"')
+
+
 def _autorelease_pool():
     if objc is None:
         return nullcontext()
@@ -132,6 +136,47 @@ def list_detached_wechat_windows(app_name: str = "WeChat") -> list[DetachedWindo
                 )
             )
     return windows
+
+
+def set_detached_wechat_window_size(
+    window: DetachedWindowInfo,
+    *,
+    width: int,
+    height: int,
+    timeout: float = 5.0,
+) -> bool:
+    """Set one detached WeChat window size via macOS Accessibility.
+
+    Returns False when the matching System Events window is not found. Permission
+    or AppleScript failures raise RuntimeError so the caller can surface them.
+    """
+    owner = _apple_quote(window.owner or "WeChat")
+    title = _apple_quote(window.title)
+    script = f'''
+tell application "System Events"
+  tell process "{owner}"
+    repeat with w in windows
+      try
+        if (name of w) is "{title}" then
+          set size of w to {{{int(width)}, {int(height)}}}
+          return "ok"
+        end if
+      end try
+    end repeat
+  end tell
+end tell
+return "not_found"
+'''
+    proc = subprocess.run(
+        ["osascript", "-e", script],
+        capture_output=True,
+        text=True,
+        timeout=max(1.0, float(timeout)),
+    )
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()
+        raise RuntimeError(detail or f"osascript exited {proc.returncode}")
+    return proc.stdout.strip() == "ok"
 
 
 def _capture_window_by_id_quartz(window_id: int) -> Image.Image:
