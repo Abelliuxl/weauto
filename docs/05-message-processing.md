@@ -22,7 +22,7 @@
 
 ## 2. 窗口枚举与捕获
 
-`detached_window_receiver.py` 使用 macOS Quartz 枚举微信独立窗口。窗口必须：
+`detached_window_receiver.py` 在 macOS 使用 Quartz、在 Windows 使用 Win32 API 枚举微信独立窗口。窗口必须：
 
 - 属于 `app_name` 对应的应用
 - 有有效 window ID 和尺寸
@@ -30,8 +30,10 @@
 
 截图后端：
 
-- `screencapture`：在短生命周期子进程中捕获，默认路径
-- `quartz`：进程内捕获，更快但长期运行可能增长 Mach 内存
+- `auto`：macOS 选择 `screencapture`，Windows 选择 Win32 `PrintWindow` 并在必要时回退屏幕区域捕获
+- `screencapture`：macOS 在短生命周期子进程中捕获
+- `quartz`：macOS 进程内捕获，更快但长期运行可能增长 Mach 内存
+- `win32`：Windows 原生按窗口捕获；即使旧配置仍写着 macOS 后端，Windows 也会自动使用该实现
 
 ## 3. OCR 解析
 

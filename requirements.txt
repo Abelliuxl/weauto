@@ -4,16 +4,18 @@ opencv-python==4.10.0.84; python_version < "3.9"
 opencv-python==4.10.0.84; python_version >= "3.9"
 numpy==1.24.4; python_version < "3.9"
 numpy>=1.26.0; python_version >= "3.9"
-onnxruntime<1.24
+onnxruntime<1.21; sys_platform == "win32"
+onnxruntime<1.24; sys_platform != "win32"
 Pillow>=10.0.0
-pyobjc-core==9.2; python_version < "3.9"
-pyobjc-framework-Cocoa==9.2; python_version < "3.9"
-pyobjc-framework-Quartz==9.2; python_version < "3.9"
-pyobjc-framework-Quartz>=11.0; python_version >= "3.9"
+pyobjc-core==9.2; python_version < "3.9" and sys_platform == "darwin"
+pyobjc-framework-Cocoa==9.2; python_version < "3.9" and sys_platform == "darwin"
+pyobjc-framework-Quartz==9.2; python_version < "3.9" and sys_platform == "darwin"
+pyobjc-framework-Quartz>=11.0; python_version >= "3.9" and sys_platform == "darwin"
 pyperclip>=1.8.2
 tomli>=2.0.1; python_version < "3.11"
 certifi>=2024.8.30
 playwright>=1.60.0
 websockets>=15.0,<17
-pyobjc-framework-Cocoa>=11.0
-rumps>=0.4.0
+pyobjc-framework-Cocoa>=11.0; sys_platform == "darwin"
+rumps>=0.4.0; sys_platform == "darwin"
+pystray>=0.19.5; sys_platform == "win32"

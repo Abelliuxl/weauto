@@ -30,12 +30,20 @@ plutil -p WeAuto.app/Contents/Info.plist
 
 可直接运行 `./start_app.sh` 获取终端错误。
 
-## 3. 菜单栏不存在
+Windows 先在 PowerShell 运行 `.\start_app.ps1` 查看错误。重点检查：
+
+- `uv --version` 是否可用；未安装时执行 `winget install --id=astral-sh.uv -e`
+- `.venv312\Scripts\python.exe` 是否存在
+- PowerShell 执行策略是否允许脚本；可使用 `powershell -ExecutionPolicy Bypass -File .\start_app.ps1`
+- `onnxruntime` 应由锁文件在 Windows 解析为 `<1.21`，这是当前 Windows 10 / 旧款 CPU 的兼容基线
+
+## 3. 菜单栏 / 系统托盘不存在
 
 - 确认当前是 macOS GUI 登录会话
 - SSH 环境使用 `--headless`
 - 检查 `rumps` 和 Cocoa 依赖
 - 确认没有另一个 WeAuto 实例
+- Windows 检查托盘的隐藏图标区域和 `pystray` 依赖；服务会话应使用 `--headless`
 
 App 设置了 `LSUIElement`，没有普通 Dock 窗口是预期行为。
 
@@ -46,6 +54,9 @@ lsof -nP -iTCP:8721 -sTCP:LISTEN
 curl http://127.0.0.1:8721/api/status
 ```
 
+Windows 可使用 `Get-NetTCPConnection -LocalPort 8721` 和
+`Invoke-RestMethod http://127.0.0.1:8721/api/status`。
+
 若端口占用，使用：
 
 ```bash
@@ -55,8 +66,8 @@ curl http://127.0.0.1:8721/api/status
 远程访问时确认：
 
 - `host = "0.0.0.0"`
-- macOS 防火墙允许端口
-- 客户端使用 Mac 的局域网 IP
+- macOS / Windows 防火墙允许端口
+- 客户端使用运行 WeAuto 机器的局域网 IP
 - 网络属于可信环境
 
 ## 5. 检测不到窗口
@@ -66,7 +77,7 @@ curl http://127.0.0.1:8721/api/status
 - 会话是否已拖成独立窗口
 - `app_name` 是否匹配当前微信进程
 - `detached_window_title_filter` 是否过滤了目标
-- 屏幕录制权限
+- macOS 屏幕录制权限；Windows 上 WeAuto 与微信应使用相同权限级别
 - 窗口是否最小化或不可见
 
 运行：

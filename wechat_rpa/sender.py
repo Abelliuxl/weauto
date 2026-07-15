@@ -2,9 +2,13 @@ from __future__ import annotations
 
 from pathlib import Path
 import subprocess
+import sys
 import time
 
 from .config import AppConfig
+
+
+IS_WINDOWS = sys.platform == "win32"
 
 
 class SendError(RuntimeError):
@@ -16,6 +20,13 @@ class WeChatGuiSender:
         self.cfg = cfg
 
     def activate(self) -> None:
+        if IS_WINDOWS:
+            from .win32 import activate_app
+
+            if activate_app(self.cfg.app_name) is None:
+                print(f"[warn] failed to activate app: {self.cfg.app_name!r}")
+            return
+
         aliases = [x.strip() for x in self.cfg.app_name.split("|") if x.strip()]
         if "WeChat" in aliases and "微信" not in aliases:
             aliases.append("微信")
@@ -39,6 +50,16 @@ class WeChatGuiSender:
         if not clean_title:
             self.activate()
             return False
+        if IS_WINDOWS:
+            from .win32 import activate_app
+
+            target = activate_app(self.cfg.app_name, clean_title)
+            if target is None:
+                self.activate()
+                return False
+            time.sleep(max(0.05, self.cfg.activate_wait_sec))
+            return True
+
         aliases = [x.strip() for x in self.cfg.app_name.split("|") if x.strip()]
         if "WeChat" in aliases and "微信" not in aliases:
             aliases.append("微信")
@@ -97,6 +118,22 @@ return "not_found"
         clean_title = str(title or "").strip()
         if not clean_title:
             return False
+        if IS_WINDOWS:
+            from .win32 import activate_app
+
+            target = activate_app(self.cfg.app_name, clean_title)
+            if target is None:
+                return False
+            time.sleep(max(0.05, self.cfg.activate_wait_sec))
+            point = getattr(self.cfg, "input_point", None)
+            ratio_x = float(getattr(point, "x", 0.5))
+            ratio_y = float(getattr(point, "y", 0.92))
+            self.safe_click(
+                target.x + int(target.width * ratio_x),
+                target.y + int(target.height * ratio_y),
+            )
+            return True
+
         aliases = [x.strip() for x in self.cfg.app_name.split("|") if x.strip()]
         if "WeChat" in aliases and "微信" not in aliases:
             aliases.append("微信")
@@ -141,6 +178,12 @@ return "not_found"
         time.sleep(0.05)
         delay_sec = self.send_delay_sec()
 
+        if IS_WINDOWS:
+            pyautogui.hotkey("ctrl", "v")
+            time.sleep(delay_sec)
+            pyautogui.press("enter")
+            return
+
         paste_script = 'tell application "System Events" to keystroke "v" using command down'
         enter_script = 'tell application "System Events" to key code 36'
         proc = subprocess.run(
@@ -178,6 +221,22 @@ return "not_found"
 
         suffix = str(self.cfg.mention_trigger_suffix or "A")[:8] or "A"
         after_paste, after_backspace, after_confirm = self.mention_timing()
+
+        if IS_WINDOWS:
+            pyperclip.copy(f"@{mention}{suffix}")
+            time.sleep(0.05)
+            pyautogui.hotkey("ctrl", "v")
+            time.sleep(after_paste)
+            pyautogui.press("backspace")
+            time.sleep(after_backspace)
+            pyautogui.press("enter")
+            time.sleep(after_confirm)
+            pyperclip.copy(f" {body}")
+            time.sleep(0.05)
+            pyautogui.hotkey("ctrl", "v")
+            time.sleep(self.send_delay_sec())
+            pyautogui.press("enter")
+            return
 
         pyperclip.copy(f"@{mention}{suffix}")
         time.sleep(0.05)
@@ -243,13 +302,17 @@ return "not_found"
 
     def paste_and_send_to_window(self, title: str, message: str) -> bool:
         raised = self.activate_chat_window(title)
+        if IS_WINDOWS and not raised:
+            return False
         self.paste_and_send(message)
         return raised
 
     def mention_and_send_to_window(self, title: str, mention_name: str, message: str) -> bool:
-        raised = self.click_chat_input_for_window(title)
-        if not raised:
+        raised = self.activate_chat_window(title) if IS_WINDOWS else self.click_chat_input_for_window(title)
+        if (not IS_WINDOWS) and not raised:
             raised = self.activate_chat_window(title)
+        if IS_WINDOWS and not raised:
+            return False
         self.mention_and_send(mention_name, message)
         return raised
 
@@ -262,6 +325,19 @@ return "not_found"
             return False
 
         delay_sec = self.send_delay_sec()
+        if IS_WINDOWS:
+            from .win32 import copy_files_to_clipboard
+
+            try:
+                copy_files_to_clipboard([target])
+            except Exception as exc:  # noqa: BLE001 - sending should fail open
+                print(f"[warn] Windows file clipboard failed: {exc}")
+                return False
+            pyautogui.hotkey("ctrl", "v")
+            time.sleep(delay_sec)
+            pyautogui.press("enter")
+            return True
+
         set_clip_script = f'set the clipboard to (POSIX file "{self.apple_quote(str(target))}")'
         paste_script = 'tell application "System Events" to keystroke "v" using command down'
         enter_script = 'tell application "System Events" to key code 36'
@@ -301,5 +377,7 @@ return "not_found"
 
     def paste_file_and_send_to_window(self, title: str, file_path: Path) -> bool:
         raised = self.activate_chat_window(title)
+        if IS_WINDOWS and not raised:
+            return False
         sent = self.paste_file_and_send(file_path)
         return bool(raised and sent)

@@ -34,3 +34,27 @@ def test_detect_blocks_keeps_large_text_bubbles_as_text_not_images():
         ("text", "self", [178, 888, 586, 1082]),
         ("text", "other", [130, 1122, 546, 1396]),
     ]
+
+
+def test_detect_blocks_supports_windows_short_bubbles_and_rich_card_near_input():
+    image = np.full((971, 919, 3), 250, dtype=np.uint8)
+    image[199:240, 109:215] = (238, 238, 240)
+    image[362:416, 109:194] = (238, 238, 240)
+    image[539:738, 109:487] = (238, 238, 240)
+    # Input panel top border, close enough that an unfiltered merge swallows
+    # the rich card into an invalid full-width block.
+    image[750:761, 22:895] = (243, 243, 243)
+
+    body_y1, body_y2 = VisibleMessageParser._chat_body_bounds(image.shape[0])
+    blocks = VisibleMessageParser._detect_blocks(
+        image,
+        body_y1=body_y1,
+        body_y2=body_y2,
+    )
+
+    assert (body_y1, body_y2) == (115, 761)
+    assert [(block.kind, block.side, block.bbox) for block in blocks] == [
+        ("text", "other", [109, 199, 215, 240]),
+        ("text", "other", [109, 362, 194, 416]),
+        ("text", "other", [109, 539, 487, 738]),
+    ]

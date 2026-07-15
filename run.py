@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import os
 from pathlib import Path
+import signal
 import sys
 
 
@@ -12,7 +13,11 @@ def _maybe_reexec_with_project_venv() -> None:
         return
 
     root_dir = Path(__file__).resolve().parent
-    venv_python = root_dir / ".venv312" / "bin" / "python"
+    venv_python = (
+        root_dir / ".venv312" / "Scripts" / "python.exe"
+        if sys.platform == "win32"
+        else root_dir / ".venv312" / "bin" / "python"
+    )
     if not venv_python.exists():
         return
 
@@ -29,7 +34,7 @@ from wechat_rpa.config import load_config
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="WeChat macOS GUI-only RPA (no hook/injection/db access)."
+        description="WeChat macOS/Windows GUI-only RPA (no hook/injection/db access)."
     )
     parser.add_argument(
         "command",
@@ -56,6 +61,15 @@ def main() -> None:
     args = parse_args()
     cfg = load_config(args.config)
     bot = WeChatGuiRpaBot(cfg)
+
+    def _interrupt(_signum, _frame) -> None:
+        raise KeyboardInterrupt
+
+    if sys.platform == "win32":
+        for signal_name in ("SIGBREAK", "SIGTERM"):
+            signum = getattr(signal, signal_name, None)
+            if signum is not None:
+                signal.signal(signum, _interrupt)
     try:
         if args.command == "recover":
             bot.run_recover_mode(countdown_sec=max(0, int(args.recover_countdown)))

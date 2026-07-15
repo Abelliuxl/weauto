@@ -5,6 +5,7 @@ import argparse
 from dataclasses import asdict
 import json
 from pathlib import Path
+import sys
 import time
 
 from PIL import ImageDraw, ImageFont
@@ -34,9 +35,19 @@ def parse_args() -> argparse.Namespace:
 def annotate(image, messages: list[dict], path: Path) -> None:
     out = image.convert("RGB")
     draw = ImageDraw.Draw(out)
-    try:
-        font = ImageFont.truetype("/System/Library/Fonts/PingFang.ttc", 20)
-    except Exception:
+    font_candidates = (
+        [r"C:\Windows\Fonts\msyh.ttc", r"C:\Windows\Fonts\simhei.ttf"]
+        if sys.platform == "win32"
+        else ["/System/Library/Fonts/PingFang.ttc"]
+    )
+    font = None
+    for font_path in font_candidates:
+        try:
+            font = ImageFont.truetype(font_path, 20)
+            break
+        except Exception:
+            continue
+    if font is None:
         font = ImageFont.load_default()
     for idx, msg in enumerate(messages, start=1):
         x1, y1, x2, y2 = [int(v) for v in msg.get("bbox", [0, 0, 0, 0])]
@@ -56,9 +67,7 @@ def main() -> None:
     out_root = Path(args.output_dir or (Path.home() / "Downloads" / f"weauto_detached_windows_{stamp}"))
     out_root.mkdir(parents=True, exist_ok=True)
 
-    windows = list_detached_wechat_windows(cfg.app_name)
-    if args.title:
-        windows = [w for w in windows if args.title in w.title]
+    windows = filtered_windows(cfg, args.title)
     (out_root / "windows.json").write_text(
         json.dumps([asdict(w) for w in windows], ensure_ascii=False, indent=2),
         encoding="utf-8",
@@ -70,14 +79,28 @@ def main() -> None:
     print(f"[detached] windows={len(windows)} out={out_root}")
     while True:
         if args.watch:
-            windows = list_detached_wechat_windows(cfg.app_name)
-            if args.title:
-                windows = [w for w in windows if args.title in w.title]
+            windows = filtered_windows(cfg, args.title)
         for window in windows:
             process_window(args, parser, state, out_root, window)
         if not args.watch:
             break
         time.sleep(max(0.2, float(args.interval)))
+
+
+def filtered_windows(cfg, title_filter: str = ""):
+    windows = list_detached_wechat_windows(cfg.app_name)
+    exact = {str(item).strip().casefold() for item in cfg.ignore_exact_titles if str(item).strip()}
+    keywords = [str(item).strip() for item in cfg.ignore_title_keywords if str(item).strip()]
+    windows = [
+        window
+        for window in windows
+        if window.title
+        and window.title.strip().casefold() not in exact
+        and not any(keyword in window.title for keyword in keywords)
+    ]
+    if title_filter:
+        windows = [window for window in windows if title_filter in window.title]
+    return windows
 
 
 def process_window(

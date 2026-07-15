@@ -8,6 +8,7 @@ from wechat_rpa.detached_window_receiver import DetachedWindowInfo
 
 
 def test_capture_window_by_id_uses_temp_file_not_dash(monkeypatch):
+    monkeypatch.setattr(detached_window_receiver, "IS_WINDOWS", False)
     calls = []
 
     def fake_run(cmd, *, capture_output, timeout):
@@ -29,6 +30,7 @@ def test_capture_window_by_id_uses_temp_file_not_dash(monkeypatch):
 
 
 def test_capture_window_by_id_quartz_backend(monkeypatch):
+    monkeypatch.setattr(detached_window_receiver, "IS_WINDOWS", False)
     calls = []
 
     def fake_quartz(window_id):
@@ -44,6 +46,7 @@ def test_capture_window_by_id_quartz_backend(monkeypatch):
 
 
 def test_screen_capture_access_helpers(monkeypatch):
+    monkeypatch.setattr(detached_window_receiver, "IS_WINDOWS", False)
     monkeypatch.setattr(
         detached_window_receiver.Quartz,
         "CGPreflightScreenCaptureAccess",
@@ -60,6 +63,7 @@ def test_screen_capture_access_helpers(monkeypatch):
 
 
 def test_visible_window_owner_summary(monkeypatch):
+    monkeypatch.setattr(detached_window_receiver, "IS_WINDOWS", False)
     monkeypatch.setattr(
         detached_window_receiver.Quartz,
         "CGWindowListCopyWindowInfo",
@@ -75,6 +79,7 @@ def test_visible_window_owner_summary(monkeypatch):
 
 
 def test_set_detached_wechat_window_size_runs_osascript(monkeypatch):
+    monkeypatch.setattr(detached_window_receiver, "IS_WINDOWS", False)
     calls = []
 
     def fake_run(cmd, *, capture_output, text, timeout):
@@ -97,6 +102,7 @@ def test_set_detached_wechat_window_size_runs_osascript(monkeypatch):
 
 
 def test_set_detached_wechat_window_size_returns_false_when_missing(monkeypatch):
+    monkeypatch.setattr(detached_window_receiver, "IS_WINDOWS", False)
     monkeypatch.setattr(
         detached_window_receiver.subprocess,
         "run",

@@ -216,6 +216,13 @@ class BotSupervisor:
         """Start one bot subprocess + its reader thread."""
         env = self._build_env()
         cmd = self._build_command()
+        popen_session: dict[str, Any]
+        if sys.platform == "win32":
+            popen_session = {
+                "creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+            }
+        else:
+            popen_session = {"start_new_session": True}
         try:
             proc = subprocess.Popen(  # noqa: S603 - command is built from our own args
                 cmd,
@@ -225,7 +232,7 @@ class BotSupervisor:
                 stderr=subprocess.STDOUT,
                 stdin=subprocess.DEVNULL,
                 bufsize=1,
-                start_new_session=True,
+                **popen_session,
             )
         except OSError as exc:
             self._emit_local(f"[supervisor] failed to spawn bot: {exc}")
@@ -261,6 +268,11 @@ class BotSupervisor:
     def _build_env(self) -> dict[str, str]:
         env = os.environ.copy()
         env["WEAUTO_LOG_FILE"] = str(self.log_file)
+        # The supervisor decodes child output as UTF-8.  Windows otherwise
+        # inherits the active console code page (commonly GBK), which turns
+        # Chinese window titles and OCR text into mojibake in logs/Web UI.
+        env.setdefault("PYTHONUTF8", "1")
+        env.setdefault("PYTHONIOENCODING", "utf-8")
         env.setdefault("WEAUTO_SCREENSHOT_HIGH_RES", "0")
         # Preserve terminal width if the parent had one; otherwise pick a sane
         # default so column-aligned logs stay readable.
@@ -328,6 +340,10 @@ class BotSupervisor:
             self._proc = None
         if proc is None or proc.poll() is not None:
             return
+        if sys.platform == "win32":
+            self._terminate_bot_windows(proc, timeout=timeout)
+            self._notify_change()
+            return
         # Try SIGINT (KeyboardInterrupt path the bot already handles for clean
         # memory flush), then escalate to SIGTERM / SIGKILL.
         try:
@@ -358,6 +374,30 @@ class BotSupervisor:
             except Exception:
                 pass
         self._notify_change()
+
+    @staticmethod
+    def _terminate_bot_windows(proc: subprocess.Popen[bytes], *, timeout: float) -> None:
+        """Gracefully stop a Windows process group, then escalate if needed."""
+        try:
+            proc.send_signal(signal.CTRL_BREAK_EVENT)
+        except (AttributeError, OSError, ValueError):
+            pass
+        try:
+            proc.wait(timeout=max(0.1, float(timeout)))
+            return
+        except subprocess.TimeoutExpired:
+            pass
+        try:
+            proc.terminate()
+            proc.wait(timeout=3.0)
+            return
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        try:
+            proc.kill()
+            proc.wait(timeout=2.0)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
 
     # ------------------------------------------------------------------ #
     # Log ingestion
