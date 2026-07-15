@@ -283,6 +283,7 @@ class AppConfig:
     long_bridge_reconnect_max_sec: float = 30.0
     long_bridge_heartbeat_sec: float = 20.0
     long_bridge_attachment_max_mb: int = 20
+    long_bridge_inbound_dedupe_sec: float = 120.0
     long_bridge_fail_open: bool = True
     agent_actions_enabled: bool = True
     agent_actions_max_per_turn: int = 2
@@ -864,6 +865,15 @@ def load_config(path: str | Path | None) -> AppConfig:
             data.get(
                 "long_bridge_attachment_max_mb",
                 cfg.long_bridge_attachment_max_mb,
+            )
+        ),
+    )
+    cfg.long_bridge_inbound_dedupe_sec = max(
+        0.0,
+        float(
+            data.get(
+                "long_bridge_inbound_dedupe_sec",
+                cfg.long_bridge_inbound_dedupe_sec,
             )
         ),
     )

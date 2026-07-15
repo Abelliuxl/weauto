@@ -3,6 +3,9 @@
   "version": "0.1.0",
   "description": "Persistent WebSocket channel bridge between weauto and OpenClaw.",
   "type": "module",
+  "scripts": {
+    "test": "node --test"
+  },
   "dependencies": {
     "ws": "^8.18.3"
   },

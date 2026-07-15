@@ -111,6 +111,8 @@ long_bridge_reconnect_min_sec = 1.0
 long_bridge_reconnect_max_sec = 30.0
 long_bridge_heartbeat_sec = 20.0
 long_bridge_attachment_max_mb = 20
+# Suppress the same stable inbound event briefly without changing position rules.
+long_bridge_inbound_dedupe_sec = 120.0
 long_bridge_fail_open = true
 
 # ============================================================

@@ -25,6 +25,20 @@ def test_vision_messages_to_visible_messages_preserves_order_and_self_sender():
     assert messages[0]["fingerprint"] != messages[3]["fingerprint"]
 
 
+def test_vision_fingerprint_ignores_ocr_whitespace_but_keeps_text_and_position():
+    compact = WeChatGuiRpaBot._vision_messages_to_visible_messages(
+        [{"sender": "刘晓亮", "content": "叫我帅亮"}]
+    )[0]
+    spaced = WeChatGuiRpaBot._vision_messages_to_visible_messages(
+        [{"sender": "刘晓亮", "content": "叫 我帅亮"}]
+    )[0]
+
+    assert compact["fingerprint"] == spaced["fingerprint"]
+    assert compact["text"] == "叫我帅亮"
+    assert spaced["text"] == "叫 我帅亮"
+    assert compact["vision_index"] == spaced["vision_index"] == 0
+
+
 def test_detached_chat_body_hash_is_stable():
     image = Image.new("RGB", (720, 1800), (247, 247, 247))
     try:

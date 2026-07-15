@@ -54,7 +54,11 @@ from .ocr import OcrEngine
 from .people_aliases import PersonAliasResolver
 from .qweather import QWeatherClient
 from .sender import WeChatGuiSender
-from .visible_message_parser import VisibleChatSnapshot, VisibleMessageParser
+from .visible_message_parser import (
+    normalize_message_fingerprint_text,
+    VisibleChatSnapshot,
+    VisibleMessageParser,
+)
 from .visible_message_state import VisibleMessageStateStore
 from .window import WindowNotFoundError, get_front_window_bounds, screenshot_region
 
@@ -1221,10 +1225,12 @@ class WeChatGuiRpaBot:
 
         session_key = self._session_key_for_row(row)
         fingerprint = str(source.get("fingerprint") or "").strip()
-        event_seed = (
-            f"{session_key}|{fingerprint}|{reason}|{time.time_ns()}|"
-            f"{text[:400]}"
-        )
+        if fingerprint:
+            event_seed = f"{session_key}|{fingerprint}|{reason}|{sender}"
+        else:
+            event_seed = (
+                f"{session_key}|{reason}|{sender}|{time.time_ns()}|{text[:400]}"
+            )
         event_id = hashlib.sha256(event_seed.encode("utf-8")).hexdigest()[:32]
         return {
             "event_id": event_id,
@@ -2579,6 +2585,10 @@ class WeChatGuiRpaBot:
             if title_key == self._title_key(t):
                 return True
         return False
+
+    def _should_handle_admin_command_locally(self, is_admin: bool) -> bool:
+        """Keep slash commands local except when OpenClaw owns the turn."""
+        return bool(is_admin) and self.cfg.processing_mode != "long_bridge"
 
     def _is_immediate_reply_event(self, row: ChatRowState, reason: str) -> bool:
         if reason == "mention":
@@ -6420,7 +6430,10 @@ class WeChatGuiRpaBot:
             side = "self" if cls._vision_sender_is_self(sender_raw) else "other"
             sender = "self" if side == "self" else sender_raw
             content_type = cls._vision_content_type(content)
-            fingerprint_base = f"{side}|{content_type}|{sender_raw}|{text}"
+            fingerprint_text = normalize_message_fingerprint_text(text)
+            fingerprint_base = (
+                f"{side}|{content_type}|{sender_raw}|{fingerprint_text}"
+            )
             occurrence = occurrence_counts.get(fingerprint_base, 0)
             occurrence_counts[fingerprint_base] = occurrence + 1
             message: dict = {
@@ -6935,7 +6948,7 @@ class WeChatGuiRpaBot:
             is_admin=is_admin,
         )
 
-        if is_admin:
+        if self._should_handle_admin_command_locally(is_admin):
             cmd_line = self._extract_admin_command_text(row, self._detached_context_snapshot(row.preview))
             if cmd_line:
                 self._append_session_item(row, "U", cmd_line)

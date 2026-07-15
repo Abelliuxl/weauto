@@ -187,6 +187,14 @@ function outboundFrame({ accountId, to, text, attachments = [], requestId }) {
   };
 }
 
+export function shouldDeliverReply(payload, info) {
+  return (
+    info?.kind === "final" &&
+    !payload?.isReasoning &&
+    !payload?.isCompactionNotice
+  );
+}
+
 async function dispatchInbound(state, ws, frame) {
   const eventId = String(frame.event_id || "");
   if (!eventId) throw new Error("event_id is required");
@@ -194,7 +202,13 @@ async function dispatchInbound(state, ws, frame) {
   const cached = turnCache.get(cacheKey);
   if (cached) {
     if (cached.completedAt) {
-      for (const replay of cached.frames) sendJson(ws, replay);
+      sendJson(ws, { type: "ack", event_id: eventId, duplicate: true });
+      sendJson(ws, {
+        type: "turn.complete",
+        request_id: eventId,
+        status: "ok",
+        send: false,
+      });
     } else {
       cached.waiters.add(ws);
     }
@@ -281,24 +295,20 @@ async function dispatchInbound(state, ws, frame) {
     state.cfg,
     route.agentId,
   );
+  const finalTextParts = [];
+  const finalAttachments = [];
   const { dispatcher, replyOptions, markDispatchIdle } =
     channelRuntime.reply.createReplyDispatcherWithTyping({
       humanDelay,
-      deliver: async (payload) => {
+      deliver: async (payload, info) => {
+        if (!shouldDeliverReply(payload, info)) return;
         const mediaUrl = payload.mediaUrl || payload.mediaUrls?.[0];
         const attachment = mediaUrl
           ? await encodeOutboundAttachment(state.account, mediaUrl)
           : null;
-        emitTurnFrame(
-          entry,
-          outboundFrame({
-            accountId: state.account.accountId,
-            to: conversationId,
-            text: payload.text || "",
-            attachments: attachment ? [attachment] : [],
-            requestId: eventId,
-          }),
-        );
+        const text = String(payload.text || "").trim();
+        if (text) finalTextParts.push(text);
+        if (attachment) finalAttachments.push(attachment);
       },
       onError: (error) =>
         state.log?.error?.(`weauto reply delivery: ${String(error)}`),
@@ -315,11 +325,23 @@ async function dispatchInbound(state, ws, frame) {
           replyOptions: { ...replyOptions, disableBlockStreaming: true },
         }),
     });
+    if (finalTextParts.length || finalAttachments.length) {
+      emitTurnFrame(
+        entry,
+        outboundFrame({
+          accountId: state.account.accountId,
+          to: conversationId,
+          text: finalTextParts.join("\n"),
+          attachments: finalAttachments,
+          requestId: eventId,
+        }),
+      );
+    }
     emitTurnFrame(entry, {
       type: "turn.complete",
       request_id: eventId,
       status: "ok",
-      send: true,
+      send: Boolean(finalTextParts.length || finalAttachments.length),
     });
   } catch (error) {
     emitTurnFrame(entry, {

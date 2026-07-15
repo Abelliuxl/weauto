@@ -6,6 +6,7 @@ from pathlib import Path
 import re
 import time
 from typing import Any
+import unicodedata
 
 import cv2
 import numpy as np
@@ -53,6 +54,12 @@ def _normalize_text(text: str) -> str:
     clean = re.sub(r"\s+", " ", str(text or "")).strip()
     # Common RapidOCR case drift for CLI names in the chat UI.
     return clean.replace("wX-", "wx-").replace("WX-", "wx-")
+
+
+def normalize_message_fingerprint_text(text: str) -> str:
+    """Normalize OCR-only drift without changing the message shown to the agent."""
+    normalized = unicodedata.normalize("NFKC", str(text or ""))
+    return re.sub(r"\s+", "", normalized).strip()
 
 
 def _contains(box: list[int], x: float, y: float, *, pad: int = 0) -> bool:
@@ -159,7 +166,10 @@ class VisibleMessageParser:
                     text=text,
                     mentions=mentions,
                     bbox=block.bbox,
-                    fingerprint=f"{block.side}|text|{sender}|{text}",
+                    fingerprint=(
+                        f"{block.side}|text|{sender}|"
+                        f"{normalize_message_fingerprint_text(text)}"
+                    ),
                 )
             )
 

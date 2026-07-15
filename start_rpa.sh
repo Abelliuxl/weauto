@@ -4,20 +4,13 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT_DIR"
 
-VENV_DIR="${VENV_DIR:-.venv312}"
-if [[ -z "${PYTHON_BIN:-}" ]]; then
-  if command -v python3.12 >/dev/null 2>&1; then
-    PYTHON_BIN="python3.12"
-  else
-    PYTHON_BIN="python3"
-  fi
-fi
+VENV_DIR="${UV_PROJECT_ENVIRONMENT:-.venv312}"
+UV_PYTHON="${UV_PYTHON:-3.12.13}"
 CONFIG_PATH="${1:-config.toml}"
 EXTRA_ARGS=()
 if (( "$#" > 1 )); then
   EXTRA_ARGS=("${@:2}")
 fi
-DEPS_MARKER="$VENV_DIR/.deps_installed"
 PLAYWRIGHT_MARKER="$VENV_DIR/.playwright_chromium_installed"
 LOG_DIR="$ROOT_DIR/logs"
 LOG_KEEP_MAX_FILES="${LOG_KEEP_MAX_FILES:-40}"
@@ -79,34 +72,19 @@ _needs_refresh() {
   return 1
 }
 
-UV_BIN="${UV_BIN:-}"
-if [[ -z "$UV_BIN" ]] && command -v uv >/dev/null 2>&1; then
+UV_BIN="${UV_BIN:-$HOME/.local/bin/uv}"
+if [[ ! -x "$UV_BIN" ]] && command -v uv >/dev/null 2>&1; then
   UV_BIN="$(command -v uv)"
 fi
-if [[ -z "$UV_BIN" && -x "$VENV_DIR/bin/uv" ]]; then
-  UV_BIN="$VENV_DIR/bin/uv"
+if [[ ! -x "$UV_BIN" ]]; then
+  echo "[fatal] standalone uv not found at $UV_BIN" >&2
+  exit 1
 fi
 
-if [[ -n "$UV_BIN" && -f pyproject.toml ]]; then
-  echo "[setup] syncing dependencies with uv"
-  UV_PROJECT_ENVIRONMENT="$VENV_DIR" "$UV_BIN" sync --python "$PYTHON_BIN"
-else
-  if [[ ! -d "$VENV_DIR" ]]; then
-    echo "[setup] creating venv: $VENV_DIR"
-    "$PYTHON_BIN" -m venv "$VENV_DIR"
-  fi
-  source "$VENV_DIR/bin/activate"
-  if _needs_refresh "$DEPS_MARKER" requirements.txt pyproject.toml; then
-    echo "[setup] installing dependencies with pip fallback"
-    python -m pip install --upgrade pip >/dev/null
-    python -m pip install -r requirements.txt
-    date > "$DEPS_MARKER"
-  fi
-fi
-
-if [[ -z "${VIRTUAL_ENV:-}" ]]; then
-  source "$VENV_DIR/bin/activate"
-fi
+echo "[setup] syncing dependencies with uv (Python $UV_PYTHON)"
+export UV_PROJECT_ENVIRONMENT="$VENV_DIR"
+"$UV_BIN" sync --locked --python "$UV_PYTHON"
+source "$VENV_DIR/bin/activate"
 
 if python -c "import playwright" >/dev/null 2>&1; then
   if _needs_refresh "$PLAYWRIGHT_MARKER" requirements.txt pyproject.toml uv.lock; then
