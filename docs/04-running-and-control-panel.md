@@ -4,9 +4,12 @@
 
 | 场景 | 入口 |
 |---|---|
-| 日常 GUI 使用 | 双击 `WeAuto.app` |
+| macOS 日常 GUI 使用 | 双击 `WeAuto.app` |
+| Windows 日常 GUI 使用 | 双击 `WeAuto.vbs` |
 | 菜单栏 + Web UI + Bot | `./start_app.sh` |
+| 系统托盘 + Web UI + Bot | `.\start_app.ps1` 或 `start_app.cmd` |
 | SSH / 无菜单栏 | `./start_app.sh --headless` |
+| Windows 无托盘 | `.\start_app.ps1 --headless` |
 | 启动面板但不拉起 Bot | `./start_app.sh --no-bot` |
 | 直接调试 Bot | `./start_rpa.sh config.toml` |
 | 周期性强制重启 | `./start_rpa_watchdog.sh config.toml` |
@@ -54,6 +57,9 @@ WeAuto.app/
 python -u -m app.main
 ```
 
+Windows 的 `start_app.ps1` 执行同一 Python 入口，并使用 `.venv312\Scripts\python.exe`；
+`start_app.cmd` 是便于双击的包装，`WeAuto.vbs` 是隐藏控制台的日常入口。
+
 ### 命令行参数
 
 | 参数 | 说明 |
@@ -67,9 +73,9 @@ python -u -m app.main
 
 `--no-bot` 在有菜单栏时可通过菜单栏“启动 Bot”恢复；Web UI 本身没有写操作。
 
-## 4. 菜单栏功能
+## 4. 菜单栏 / 系统托盘功能
 
-菜单栏每 2 秒刷新一次，提供：
+macOS 菜单栏和 Windows 系统托盘每 2 秒刷新一次，提供：
 
 - Bot 运行状态
 - 运行时长和重启次数

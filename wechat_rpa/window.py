@@ -3,14 +3,22 @@ from __future__ import annotations
 from contextlib import nullcontext
 from dataclasses import dataclass
 import os
+import sys
 
-import Quartz
 import pyautogui
 from PIL import Image
 
-try:
-    import objc
-except Exception:  # pragma: no cover
+IS_WINDOWS = sys.platform == "win32"
+
+if not IS_WINDOWS:
+    import Quartz
+
+    try:
+        import objc
+    except Exception:  # pragma: no cover
+        objc = None
+else:
+    Quartz = None
     objc = None
 
 
@@ -34,6 +42,8 @@ def _autorelease_pool():
 
 
 def _cgimage_to_pil(cg_image) -> Image.Image:
+    if Quartz is None:
+        raise RuntimeError("Quartz capture is only available on macOS")
     width = int(Quartz.CGImageGetWidth(cg_image))
     height = int(Quartz.CGImageGetHeight(cg_image))
     if width <= 0 or height <= 0:
@@ -54,6 +64,24 @@ def _cgimage_to_pil(cg_image) -> Image.Image:
 
 
 def get_front_window_bounds(app_name: str) -> WindowBounds:
+    if IS_WINDOWS:
+        from .win32 import find_app_windows
+
+        candidates = find_app_windows(app_name)
+        if not candidates:
+            raise WindowNotFoundError(
+                f"WeChat window not found: app_name={app_name!r}. "
+                "Please open WeChat desktop and keep at least one chat window visible."
+            )
+        target = max(candidates, key=lambda item: item.width * item.height)
+        return WindowBounds(
+            x=target.x,
+            y=target.y,
+            width=target.width,
+            height=target.height,
+            window_id=target.hwnd,
+        )
+
     # Allow aliases like "WeChat|微信" and fuzzy matching against owner name.
     aliases = [x.strip() for x in app_name.split("|") if x.strip()]
     if "WeChat" in aliases and "微信" not in aliases:
@@ -116,7 +144,7 @@ def screenshot_region(left: int, top: int, width: int, height: int, *, high_res:
     if env_force in {"0", "false", "no", "off"}:
         use_high_res = False
 
-    if use_high_res:
+    if use_high_res and Quartz is not None:
         try:
             with _autorelease_pool():
                 rect = Quartz.CGRectMake(int(left), int(top), int(width), int(height))

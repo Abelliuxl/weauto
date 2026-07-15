@@ -24,7 +24,7 @@ Bot 配置由 `wechat_rpa.config.load_config()` 读取，控制面板的 `[webui
 | `receiver_mode` | 推荐 `detached_windows`；`legacy_list` 仅用于旧布局 |
 | `detached_window_title_filter` | 空列表处理全部，非空时按标题过滤 |
 | `detached_window_output_dir` | 截图、消息图片和调试输出目录 |
-| `detached_window_capture_backend` | `screencapture` 或 `quartz` |
+| `detached_window_capture_backend` | 推荐 `auto`；macOS 可选 `screencapture` / `quartz`，Windows 可选 `win32` |
 | `detached_debug_save` | 保存最新窗口图和解析 JSON |
 | `detached_reply_on_image` | 是否处理纯图片消息 |
 | `detached_process_existing_on_start` | 启动时是否把当前可见消息当作新消息 |

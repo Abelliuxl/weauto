@@ -208,9 +208,13 @@ class VisibleMessageParser:
 
     @staticmethod
     def _chat_body_bounds(height: int) -> tuple[int, int]:
-        # Detached WeChat windows in this setup are retina captures. These
-        # bounds skip the title/header and the input toolbar.
-        return 190, min(height - 210, 1720)
+        # macOS screencapture commonly returns a Retina-sized image while the
+        # Windows Win32 backend returns physical 1x window pixels.  Keep the
+        # established Retina boundary and use the measured Windows header
+        # boundary for compact captures.  The bottom input area is about 210px
+        # in both currently supported detached-window layouts.
+        body_y1 = 115 if height < 1400 else 190
+        return body_y1, min(height - 210, 1720)
 
     @staticmethod
     def text_anchors(image: Image.Image | np.ndarray, ocr_engine: OcrEngine, *, limit: int = 18) -> list[dict[str, Any]]:
@@ -327,14 +331,24 @@ class VisibleMessageParser:
 
         for kind, mask in (("self_text", green), ("other_text", gray_bubble)):
             boxes = VisibleMessageParser._mask_boxes(mask & (body > 0))
+            # A thin full-width input separator can sit within y_tol of a rich
+            # message card on Windows.  Remove it before merging or both become
+            # one >85%-wide box and the actual card is discarded.
+            boxes = [
+                (x, y, bw, bh)
+                for x, y, bw, bh in boxes
+                if not (bw > width * 0.85 and bh < 30)
+            ]
+            min_text_width = max(64, min(120, int(round(width * 0.075))))
+            min_text_height = max(28, min(42, int(round(width * 0.026))))
             for x, y, bw, bh in _merge_boxes(boxes):
                 if kind == "self_text":
-                    if bh >= 35:
+                    if bh >= max(28, min(35, min_text_height)):
                         blocks.append(MessageBlock(kind="text", side="self", bbox=[x, y, x + bw, y + bh]))
                     continue
                 if bw > width * 0.85:
                     continue
-                if bw <= 120 or bh < 42:
+                if bw <= min_text_width or bh < min_text_height:
                     continue
                 if any(VisibleMessageParser._boxes_overlap([x, y, x + bw, y + bh], image.bbox, min_ratio=0.45) for image in blocks if image.kind == "image"):
                     continue

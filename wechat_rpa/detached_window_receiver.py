@@ -6,14 +6,29 @@ from dataclasses import dataclass
 from pathlib import Path
 import re
 import subprocess
+import sys
 import tempfile
 
-import Quartz
 from PIL import Image
 
-try:
-    import objc
-except Exception:  # pragma: no cover
+IS_WINDOWS = sys.platform == "win32"
+
+if not IS_WINDOWS:
+    import Quartz
+
+    try:
+        import objc
+    except Exception:  # pragma: no cover
+        objc = None
+else:
+    class _UnavailableQuartz:
+        CGPreflightScreenCaptureAccess = None
+        CGRequestScreenCaptureAccess = None
+        CGWindowListCopyWindowInfo = None
+        kCGWindowListOptionOnScreenOnly = 0
+        kCGNullWindowID = 0
+
+    Quartz = _UnavailableQuartz()
     objc = None
 
 
@@ -68,6 +83,9 @@ def _app_aliases(app_name: str) -> list[str]:
 
 
 def screen_capture_access_granted() -> bool | None:
+    if IS_WINDOWS:
+        # Desktop capture does not require a separate Windows privacy grant.
+        return True
     preflight = getattr(Quartz, "CGPreflightScreenCaptureAccess", None)
     if preflight is None:
         return None
@@ -78,6 +96,8 @@ def screen_capture_access_granted() -> bool | None:
 
 
 def request_screen_capture_access() -> bool | None:
+    if IS_WINDOWS:
+        return True
     request = getattr(Quartz, "CGRequestScreenCaptureAccess", None)
     if request is None:
         return None
@@ -89,6 +109,13 @@ def request_screen_capture_access() -> bool | None:
 
 def visible_window_owner_summary() -> str:
     counts: Counter[str] = Counter()
+    if IS_WINDOWS:
+        from .win32 import enumerate_windows
+
+        for item in enumerate_windows(None):
+            counts[item.owner or "<unnamed>"] += 1
+        return ", ".join(f"{owner}:{count}" for owner, count in counts.most_common()) or "-"
+
     with _autorelease_pool():
         window_list = Quartz.CGWindowListCopyWindowInfo(
             Quartz.kCGWindowListOptionOnScreenOnly,
@@ -103,6 +130,22 @@ def visible_window_owner_summary() -> str:
 
 
 def list_detached_wechat_windows(app_name: str = "WeChat") -> list[DetachedWindowInfo]:
+    if IS_WINDOWS:
+        from .win32 import find_app_windows
+
+        return [
+            DetachedWindowInfo(
+                window_id=item.hwnd,
+                owner=item.owner,
+                title=item.title,
+                x=item.x,
+                y=item.y,
+                width=item.width,
+                height=item.height,
+            )
+            for item in find_app_windows(app_name)
+        ]
+
     aliases = _app_aliases(app_name)
     windows: list[DetachedWindowInfo] = []
     with _autorelease_pool():
@@ -145,11 +188,16 @@ def set_detached_wechat_window_size(
     height: int,
     timeout: float = 5.0,
 ) -> bool:
-    """Set one detached WeChat window size via macOS Accessibility.
+    """Set one detached WeChat window size via the native platform API.
 
     Returns False when the matching System Events window is not found. Permission
     or AppleScript failures raise RuntimeError so the caller can surface them.
     """
+    if IS_WINDOWS:
+        from .win32 import resize_window
+
+        return resize_window(window.window_id, width, height)
+
     owner = _apple_quote(window.owner or "WeChat")
     title = _apple_quote(window.title)
     script = f'''
@@ -180,6 +228,8 @@ return "not_found"
 
 
 def _capture_window_by_id_quartz(window_id: int) -> Image.Image:
+    if IS_WINDOWS:
+        raise RuntimeError("Quartz capture is only available on macOS")
     with _autorelease_pool():
         cg_img = Quartz.CGWindowListCreateImage(
             Quartz.CGRectNull,
@@ -217,6 +267,10 @@ def _capture_window_by_id_screencapture(window_id: int) -> Image.Image:
 
 
 def capture_window_by_id(window_id: int, *, backend: str = "screencapture") -> Image.Image:
+    if IS_WINDOWS:
+        from .win32 import capture_window
+
+        return capture_window(window_id)
     clean_backend = str(backend or "").strip().lower()
     if clean_backend == "quartz":
         return _capture_window_by_id_quartz(window_id)

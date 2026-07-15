@@ -1,9 +1,9 @@
-"""Entry point for the control panel.
+"""Entry point for the cross-platform control panel.
 
 Wires together the three pieces:
   1. :class:`BotSupervisor` — owns the bot subprocess + log pipes.
   2. :mod:`app.web.server` — read-only HTTP API + SSE on ``cfg.host:cfg.port``.
-  3. :mod:`app.bar.menu_app` — rumps menu-bar app (main thread).
+  3. A macOS menu-bar app (rumps) or Windows system-tray app (pystray).
 
 The menu-bar app must run on the main thread (it owns the macOS CFRunLoop), so
 the supervisor and web server are started as daemon threads first, then we hand
@@ -20,10 +20,9 @@ import logging
 import signal
 import sys
 import threading
-import time
 from pathlib import Path
 
-from .config import load_webui_config
+from .config import WebUIConfig, load_webui_config
 from .supervisor import BotSupervisor
 
 LOG = logging.getLogger("weauto.app")
@@ -116,53 +115,70 @@ def main(argv: list[str] | None = None) -> int:
     start_in_thread(httpd)
     LOG.info("web server listening on http://%s:%s", cfg.host, cfg.port)
 
-    use_menu_bar = (not args.headless) and _can_run_menu_bar()
+    use_status_icon = (not args.headless) and _can_run_status_icon()
+    shutdown_event = threading.Event()
 
     def _shutdown(_signum=None, _frame=None) -> None:
+        if shutdown_event.is_set():
+            return
+        shutdown_event.set()
         LOG.info("shutting down…")
         try:
             httpd.shutdown()
         except Exception:
             pass
         supervisor.shutdown()
+        if _signum is not None:
+            raise SystemExit
 
     signal.signal(signal.SIGINT, _shutdown)
     signal.signal(signal.SIGTERM, _shutdown)
 
-    if use_menu_bar:
+    if use_status_icon:
         try:
-            from .bar.menu_app import run as run_bar
+            if sys.platform == "win32":
+                from .bar.tray_app import run as run_bar
+            else:
+                from .bar.menu_app import run as run_bar
         except Exception as exc:  # noqa: BLE001
-            LOG.warning("menu-bar import failed (%s); falling back to headless", exc)
-            _run_headless()
+            LOG.warning("status-icon import failed (%s); falling back to headless", exc)
+            _run_headless(shutdown_event)
         else:
-            LOG.info("starting menu-bar app on main thread")
+            LOG.info("starting desktop status app on main thread")
             run_bar(supervisor, cfg)
             # run_bar returns when the user quits the app.
             _shutdown()
             return 0
     else:
-        LOG.info("running headless (no menu bar). Ctrl+C to quit.")
-        _run_headless()
+        LOG.info("running headless (no status icon). Ctrl+C to quit.")
+        _run_headless(shutdown_event)
         return 0
 
 
-def _run_headless() -> None:
+def _run_headless(shutdown_event: threading.Event | None = None) -> None:
     """Block the main thread until SIGINT/SIGTERM. Used in headless mode."""
     try:
-        while True:
-            time.sleep(3600)
+        while shutdown_event is None or not shutdown_event.wait(1.0):
+            pass
     except (KeyboardInterrupt, SystemExit):
         pass
 
 
-def _can_run_menu_bar() -> bool:
-    """Heuristic: only attempt the menu-bar app in a macOS GUI session.
+def _can_run_status_icon() -> bool:
+    """Return whether the platform status app is importable in a GUI session.
 
     On macOS without a WindowServer (e.g. SSH login), or when rumps/Cocoa are
     not installed, we fall back to headless. We also avoid the menu bar when
     there's no controlling tty AND no GUI session marker.
     """
+    if sys.platform == "win32":
+        try:
+            import pystray  # noqa: F401
+        except Exception:
+            return False
+        import os
+
+        return os.environ.get("SESSIONNAME", "").casefold() != "services"
     if sys.platform != "darwin":
         return False
     try:

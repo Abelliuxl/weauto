@@ -28,7 +28,7 @@
 ## 文档边界
 
 - 当前推荐接收模式是 `detached_windows`。
-- 当前推荐日常入口是项目内的 `WeAuto.app`。
+- 当前推荐日常入口是 macOS 的 `WeAuto.app` 或 Windows 的 `WeAuto.vbs`。
 - Web 控制台是只读界面；Bot 启停操作在菜单栏 App 中。
 - `legacy_list`、恢复脚本和旧数据迁移能力仍存在，但不会与推荐路径混写。
 - 密钥、个人聊天、人物印象和私有配置不应提交到公共仓库。
@@ -39,6 +39,8 @@
 cp config.toml.example config.toml
 ./start_app.sh
 ```
+
+Windows 对应命令是 `Copy-Item config.toml.example config.toml` 和 `.\start_app.ps1`。
 
 确认 `dry_run = true` 时识别正常，再启用实际发送。首次环境初始化完成后，可以直接双击
 `WeAuto.app`。

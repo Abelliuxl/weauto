@@ -187,14 +187,14 @@ class AppConfig:
     # native: local planner/reply/memory pipeline.
     # bridge: send normalized chat event to an external processor, then use local sender.
     processing_mode: str = "native"
-    # detached_windows: capture each detached chat window by macOS window id.
+    # detached_windows: capture each detached chat window by native window id.
     # legacy_list: old whole-app left-list detector.
     receiver_mode: str = "detached_windows"
     detached_window_title_filter: list[str] = field(default_factory=list)
     detached_window_output_dir: str = "data/detached_window_images"
-    # screencapture: slower but keeps CoreGraphics capture in a short-lived subprocess.
-    # quartz: faster in-process CoreGraphics capture, but may grow Mach memory over time.
-    detached_window_capture_backend: str = "screencapture"
+    # auto: screencapture on macOS, Win32 PrintWindow on Windows.
+    # macOS also accepts screencapture/quartz; Windows accepts win32.
+    detached_window_capture_backend: str = "auto"
     detached_debug_save: bool = False
     detached_window_resize_on_start: bool = False
     detached_window_standard_width: int = 852
@@ -366,7 +366,9 @@ class AppConfig:
         default_factory=lambda: ["@助手", "@机器人", "机器人", "bot", "小助手", "@萨比", "萨比"]
     )
     ignore_title_keywords: list[str] = field(default_factory=lambda: ["折叠的聊天"])
-    ignore_exact_titles: list[str] = field(default_factory=lambda: ["微信"])
+    ignore_exact_titles: list[str] = field(
+        default_factory=lambda: ["微信", "WeChat", "Weixin"]
+    )
     use_manual_row_boxes: bool = False
     manual_row_boxes_path: str = "data/manual_row_boxes.json"
     row_title_region_enabled: bool = False
@@ -620,7 +622,9 @@ def load_config(path: str | Path | None) -> AppConfig:
         data.get("detached_window_capture_backend", cfg.detached_window_capture_backend)
     ).strip().lower()
     cfg.detached_window_capture_backend = (
-        capture_backend if capture_backend in {"screencapture", "quartz"} else "screencapture"
+        capture_backend
+        if capture_backend in {"auto", "screencapture", "quartz", "win32"}
+        else "auto"
     )
     cfg.detached_debug_save = bool(data.get("detached_debug_save", cfg.detached_debug_save))
     cfg.detached_window_resize_on_start = bool(

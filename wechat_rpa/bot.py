@@ -6191,7 +6191,20 @@ class WeChatGuiRpaBot:
         filters = [str(x).strip() for x in self.cfg.detached_window_title_filter if str(x).strip()]
         if filters:
             windows = [w for w in windows if any(token in w.title for token in filters)]
-        return [w for w in windows if w.title and not self._is_ignored_title_text(w.title)]
+        app_titles = {
+            part.strip().casefold()
+            for part in str(getattr(self.cfg, "app_name", "WeChat") or "WeChat").split("|")
+            if part.strip()
+        }
+        if app_titles.intersection({"wechat", "weixin", "微信"}):
+            app_titles.update({"wechat", "weixin", "微信"})
+        return [
+            w
+            for w in windows
+            if w.title
+            and w.title.strip().casefold() not in app_titles
+            and not self._is_ignored_title_text(w.title)
+        ]
 
     def _enumerate_detached_windows(self) -> list[DetachedWindowInfo]:
         """Enumerate detached WeChat windows, isolating the Mach-leaking

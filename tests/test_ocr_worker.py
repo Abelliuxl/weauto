@@ -7,6 +7,7 @@ stdin/stdout streams are in-memory queues. The worker module's own loop
 """
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -307,7 +308,7 @@ def test_capture_only_returns_image_path_and_hash(monkeypatch):
     result = proxy.capture_only(42)
     assert result is not None
     image_path, body_hash, stable_body_hash, image_size, text_anchors = result
-    assert str(image_path) == "/tmp/weauto-capture-xyz/win_42.png"
+    assert image_path == Path("/tmp/weauto-capture-xyz/win_42.png")
     assert body_hash == "abc123def456"
     assert stable_body_hash == "stable456"
     assert image_size == {"width": 1600, "height": 1900}
