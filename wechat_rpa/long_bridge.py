@@ -58,6 +58,7 @@ class LongBridgeClient:
         self._thread: threading.Thread | None = None
         self._pending: dict[str, _PendingTurn] = {}
         self._pending_lock = threading.Lock()
+        self._recent_completed: dict[str, float] = {}
         self._last_error = ""
         self._last_connected_at = 0.0
         self._outbound_handler: Callable[[LongBridgeOutbound], None] | None = None
@@ -124,6 +125,19 @@ class LongBridgeClient:
         }
         pending = _PendingTurn(request_id=request_id, frame=frame)
         with self._pending_lock:
+            now = time.monotonic()
+            dedupe_sec = max(
+                0.0,
+                float(getattr(self.cfg, "long_bridge_inbound_dedupe_sec", 120.0)),
+            )
+            cutoff = now - dedupe_sec
+            self._recent_completed = {
+                key: completed_at
+                for key, completed_at in self._recent_completed.items()
+                if completed_at >= cutoff
+            }
+            if request_id in self._pending or request_id in self._recent_completed:
+                return LongBridgeResult(send=False)
             self._pending[request_id] = pending
 
         timeout = max(5.0, float(self.cfg.long_bridge_timeout_sec))
@@ -136,6 +150,8 @@ class LongBridgeClient:
             self._pending.pop(request_id, None)
         if pending.error:
             raise RuntimeError(pending.error)
+        with self._pending_lock:
+            self._recent_completed[request_id] = time.monotonic()
         return LongBridgeResult(
             replies=list(pending.replies),
             attachments=list(pending.attachments),
@@ -172,6 +188,7 @@ class LongBridgeClient:
                 self._last_error = self._compact_error(exc)
                 self._ready.clear()
                 self._connected.clear()
+                print(f"[long-bridge] disconnected: {self._last_error}", flush=True)
                 if self._stop.wait(reconnect):
                     break
                 reconnect = min(reconnect_max, reconnect * 2.0)
@@ -259,6 +276,8 @@ class LongBridgeClient:
             return
         frame_type = str(data.get("type") or "")
         if frame_type == "ready":
+            if not self._ready.is_set():
+                print("[long-bridge] connected", flush=True)
             self._ready.set()
             return
         if frame_type == "ping":

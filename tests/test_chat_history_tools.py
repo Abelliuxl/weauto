@@ -102,3 +102,48 @@ def test_summarize_chat_history_returns_compact_material_by_hour_and_speaker(tmp
     assert "[01:00]" in obs
     assert "[图片] 游戏内地图界面，讨论节点路线" in obs
     assert bot.appended_records == []
+
+
+def test_read_recent_reads_backwards_across_daily_files(tmp_path):
+    store = ChatHistoryStore(tmp_path / "chat_history")
+    for day, texts in (
+        (4, ["旧一", "旧二"]),
+        (5, ["新一", "新二", "新三"]),
+    ):
+        for minute, text in enumerate(texts):
+            store.append(
+                "群-测试",
+                {
+                    "observed_at": _ts(2026, 6, day, 12, minute),
+                    "role": "user",
+                    "sender": "测试者",
+                    "text": text,
+                },
+            )
+
+    records = store.read_recent("群-测试", limit=4)
+
+    assert [record["text"] for record in records] == ["旧二", "新一", "新二", "新三"]
+
+
+def test_read_recent_does_not_read_entire_file(tmp_path, monkeypatch):
+    store = ChatHistoryStore(tmp_path / "chat_history")
+    path = store._date_path("群-测试", "2026-06-05")
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        "".join(f"[12:{idx // 60:02d}:{idx % 60:02d}] U(测试者): 消息{idx}\n" for idx in range(600)),
+        encoding="utf-8",
+    )
+
+    original_read_text = type(path).read_text
+
+    def reject_history_read_text(self, *args, **kwargs):
+        if self == path:
+            raise AssertionError("read_recent must not load the whole history file")
+        return original_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(type(path), "read_text", reject_history_read_text)
+
+    records = store.read_recent("群-测试", limit=3)
+
+    assert [record["text"] for record in records] == ["消息597", "消息598", "消息599"]

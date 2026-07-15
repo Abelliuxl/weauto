@@ -4,19 +4,18 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT_DIR"
 
-VENV_DIR="${VENV_DIR:-.venv312}"
-if [[ -z "${PYTHON_BIN:-}" ]]; then
-  if command -v python3.12 >/dev/null 2>&1; then
-    PYTHON_BIN="python3.12"
-  else
-    PYTHON_BIN="python3"
-  fi
+VENV_DIR="${UV_PROJECT_ENVIRONMENT:-.venv312}"
+UV_PYTHON="${UV_PYTHON:-3.12.13}"
+UV_BIN="${UV_BIN:-$HOME/.local/bin/uv}"
+if [[ ! -x "$UV_BIN" ]] && command -v uv >/dev/null 2>&1; then
+  UV_BIN="$(command -v uv)"
 fi
-
-if [[ ! -d "$VENV_DIR" ]]; then
-  echo "[setup] creating venv: $VENV_DIR"
-  "$PYTHON_BIN" -m venv "$VENV_DIR"
+if [[ ! -x "$UV_BIN" ]]; then
+  echo "[fatal] standalone uv not found at $UV_BIN" >&2
+  exit 1
 fi
+export UV_PROJECT_ENVIRONMENT="$VENV_DIR"
+"$UV_BIN" sync --locked --python "$UV_PYTHON"
 source "$VENV_DIR/bin/activate"
 
 for env_file in "$ROOT_DIR/.env.weauto" "$ROOT_DIR/.env"; do
@@ -28,10 +27,6 @@ for env_file in "$ROOT_DIR/.env.weauto" "$ROOT_DIR/.env"; do
     set +a
   fi
 done
-
-if [[ -f requirements.txt ]]; then
-  python -m pip install -r requirements.txt >/dev/null
-fi
 
 export COMFYUI_BASE_URL="${COMFYUI_BASE_URL:-http://192.168.5.35:8188}"
 export BRIDGE_HOST="${BRIDGE_HOST:-127.0.0.1}"

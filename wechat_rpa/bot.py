@@ -35,7 +35,16 @@ from .agent_store import ChatHistoryStore, MemoryStore, PeopleStore, SkillStore
 from .bridge import BridgeClient
 from .config import AppConfig
 from .detector import ChatRowState, detect_chat_rows
-from .detached_window_receiver import capture_window_by_id, list_detached_wechat_windows, safe_window_name
+from .detached_window_receiver import (
+    capture_window_by_id,
+    DetachedWindowInfo,
+    list_detached_wechat_windows,
+    request_screen_capture_access,
+    safe_window_name,
+    screen_capture_access_granted,
+    set_detached_wechat_window_size,
+    visible_window_owner_summary,
+)
 from .image_editing import ImageEditingError, ImageEditor
 from .image_generation import ImageGenerationError, ImageGenerator
 from .llm import LlmReplyGenerator, prepare_terminal_for_log_line
@@ -45,7 +54,11 @@ from .ocr import OcrEngine
 from .people_aliases import PersonAliasResolver
 from .qweather import QWeatherClient
 from .sender import WeChatGuiSender
-from .visible_message_parser import VisibleChatSnapshot, VisibleMessageParser
+from .visible_message_parser import (
+    normalize_message_fingerprint_text,
+    VisibleChatSnapshot,
+    VisibleMessageParser,
+)
 from .visible_message_state import VisibleMessageStateStore
 from .window import WindowNotFoundError, get_front_window_bounds, screenshot_region
 
@@ -69,6 +82,13 @@ _LOG_COLOR_RULES: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"^\[cycle\]"), "\033[94m"),
     (re.compile(r"^\[row\]"), "\033[90m"),
     (re.compile(r"^\[event\]"), "\033[95m"),
+    (re.compile(r"^\[msg-"), "\033[95m"),
+    (re.compile(r"^\[batch-"), "\033[36m"),
+    (re.compile(r"^\[route\]"), "\033[36m"),
+    (re.compile(r"^\[decision\]"), "\033[35m"),
+    (re.compile(r"^\[cooldown\]"), "\033[33m"),
+    (re.compile(r"^\[queue"), "\033[94m"),
+    (re.compile(r"^\[long-bridge\]"), "\033[96m"),
     (re.compile(r"^\[focus-"), "\033[36m"),
     (re.compile(r"^\[ctx\]"), "\033[97m"),
     (re.compile(r"^\[ocr"), "\033[96m"),
@@ -181,10 +201,330 @@ class SessionState:
     seen_content: set = field(default_factory=set)
 
 
+class DetachedOcrProxy:
+    """Owns the recycled capture+OCR worker subprocess.
+
+    Replaces the in-process ``self.visible_message_parser.parse(...)`` call for
+    the detached-window hot path. The worker holds all the native (Mach /
+    CoreGraphics / cv2 / onnxruntime) memory that gc.collect() cannot reclaim;
+    when the worker's RSS exceeds the configured limit it exits and this proxy
+    spawns a fresh one. The main bot process therefore never accumulates that
+    memory and never needs to restart.
+
+    Requests are retried once with a fresh worker after transport failures,
+    worker errors, or RSS-driven recycling. A second failure returns ``None``
+    so the caller can skip the current scan cycle without running the leaking
+    capture/OCR path in the main process.
+    """
+
+    def __init__(
+        self,
+        cfg: AppConfig,
+        *,
+        config_path: str = "config.toml",
+        log_fn=None,
+    ) -> None:
+        self._cfg = cfg
+        self._config_path = config_path
+        self._log_fn = log_fn if log_fn is not None else print
+        self._proc: subprocess.Popen | None = None
+        self._ready = False
+        self._fail_streak = 0
+        self._recycle_count = 0
+        self._retry_count = 0
+        self._skipped_request_count = 0
+
+    def _spawn(self) -> None:
+        env = dict(os.environ)
+        env["WEAUTO_CONFIG_PATH"] = str(self._config_path)
+        env["WEAUTO_OCR_WORKER_MAX_RSS_MB"] = str(self._cfg.ocr_worker_max_rss_mb)
+        # Detach from the bot's stdout so the worker's OCR diagnostics never
+        # corrupt the bot's structured logs; the bot only reads its stdout.
+        self._proc = subprocess.Popen(
+            [sys.executable, "-u", "-m", "wechat_rpa.ocr_worker"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            bufsize=1,
+            env=env,
+        )
+        self._ready = False
+        # Wait for the worker's {"ready": true} IPC handshake.
+        ready_timeout = max(2.0, float(self._cfg.ocr_worker_ready_timeout_sec))
+        try:
+            first = self._proc.stdout.readline()  # type: ignore[union-attr]
+        except Exception:
+            first = ""
+        if self._proc.poll() is None and first.strip():
+            try:
+                payload = json.loads(first)
+                self._ready = bool(payload.get("ready"))
+            except (json.JSONDecodeError, ValueError):
+                self._ready = False
+        if not self._ready:
+            # Worker failed its IPC handshake or died; tear down so the next
+            # call respawns.
+            self._terminate()
+            self._log_fn(f"[ocr-worker] startup failed after {ready_timeout:.0f}s")
+
+    def _terminate(self) -> None:
+        proc = self._proc
+        self._proc = None
+        self._ready = False
+        if proc is None:
+            return
+        for stream in (proc.stdin, proc.stdout):
+            try:
+                if stream is not None:
+                    stream.close()
+            except Exception:
+                pass
+        try:
+            proc.terminate()
+            proc.wait(timeout=2.0)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+    def _ensure_worker(self) -> bool:
+        if self._proc is not None and self._proc.poll() is None and self._ready:
+            return True
+        self._terminate()
+        self._spawn()
+        return self._proc is not None and self._proc.poll() is None and self._ready
+
+    def _recycle(self, *, reason: str) -> None:
+        self._recycle_count += 1
+        self._log_fn(f"[ocr-worker] recycled #{self._recycle_count} reason={reason}")
+        self._terminate()
+
+    def _request_once(self, request: dict) -> dict | None:
+        """Send one JSON request and read one JSON response.
+
+        Returns the decoded payload dict, or ``None`` on any transport failure
+        (timeout, EOF, bad JSON). Handles worker RSS-exit by recycling and
+        returning ``None``. Does NOT interpret business fields (snapshot/error).
+        """
+        if not self._ensure_worker():
+            self._fail_streak += 1
+            return None
+        proc = self._proc
+        assert proc is not None and proc.stdin is not None and proc.stdout is not None
+        try:
+            proc.stdin.write(json.dumps(request, ensure_ascii=False) + "\n")
+            proc.stdin.flush()
+        except (BrokenPipeError, OSError, ValueError):
+            self._recycle(reason="write_failed")
+            self._fail_streak += 1
+            return None
+
+        timeout = max(2.0, float(self._cfg.ocr_worker_request_timeout_sec))
+        # Use a watchdog thread to enforce the timeout without blocking forever.
+        import threading as _threading
+
+        line_holder: list[str] = []
+
+        def _read() -> None:
+            try:
+                line_holder.append(proc.stdout.readline())
+            except Exception:
+                line_holder.append("")
+
+        reader = _threading.Thread(target=_read, daemon=True)
+        reader.start()
+        reader.join(timeout=timeout)
+        if reader.is_alive() or not line_holder or not line_holder[0].strip():
+            # Timed out or EOF. Recycle so the next call gets a fresh worker.
+            self._recycle(reason="timeout_or_eof")
+            self._fail_streak += 1
+            return None
+
+        raw_line = line_holder[0]
+        try:
+            payload = json.loads(raw_line)
+        except (json.JSONDecodeError, ValueError):
+            self._recycle(reason="invalid_json")
+            self._fail_streak += 1
+            return None
+
+        # Worker asked to exit (RSS limit hit): acknowledge and recycle.
+        if payload.get("__exit__"):
+            rss_mb = payload.get("rss_mb", "?")
+            self._recycle(reason=f"rss_limit({rss_mb}MB)")
+            self._fail_streak = 0
+            return None
+
+        return payload
+
+    def _request(self, request: dict, *, validator=None) -> dict | None:
+        """Run a worker request, rebuilding the worker and retrying once."""
+        mode = str(request.get("mode", "parse") or "parse")
+        for attempt in range(2):
+            payload = self._request_once(request)
+            valid_payload = bool(
+                payload is not None
+                and "error" not in payload
+                and (validator is None or validator(payload))
+            )
+            if valid_payload:
+                return payload
+            if payload is not None:
+                if "error" in payload:
+                    error = str(payload.get("error", "worker_error") or "worker_error")
+                    reason = f"worker_error({error[:80]})"
+                else:
+                    reason = f"invalid_response({mode})"
+                self._recycle(reason=reason)
+                self._fail_streak += 1
+            if attempt == 0:
+                self._retry_count += 1
+                self._log_fn(
+                    f"[ocr-worker] retry #{self._retry_count} mode={mode} "
+                    "with fresh worker"
+                )
+        self._skipped_request_count += 1
+        self._log_fn(
+            f"[ocr-worker] request skipped #{self._skipped_request_count} "
+            f"mode={mode} after retry"
+        )
+        return None
+
+    def parse(
+        self,
+        window_id: int,
+        *,
+        title: str,
+        image_output_dir: Path | None = None,
+        include_debug: bool = False,
+    ) -> VisibleChatSnapshot | None:
+        request = {
+            "mode": "parse",
+            "window_id": int(window_id),
+            "title": str(title or ""),
+            "image_output_dir": str(image_output_dir) if image_output_dir else None,
+            "include_debug": bool(include_debug),
+        }
+        payload = self._request(
+            request,
+            validator=lambda item: isinstance(item.get("snapshot"), dict),
+        )
+        if payload is None:
+            return None
+
+        snapshot_payload = payload.get("snapshot")
+        assert isinstance(snapshot_payload, dict)
+
+        self._fail_streak = 0
+        try:
+            return self._snapshot_from_dict(snapshot_payload)
+        except Exception:
+            return None
+
+    def list_windows(self, app_name: str) -> list[dict] | None:
+        """Enumerate detached WeChat windows via the worker.
+
+        ``CGWindowListCopyWindowInfo`` leaks Mach message memory in the caller,
+        so window enumeration must also run in the worker. Returns a list of
+        window dicts (window_id/owner/title/x/y/width/height), or ``None`` on
+        failure after the fresh-worker retry.
+        """
+        request = {
+            "mode": "list_windows",
+            "app_name": str(app_name or "WeChat"),
+        }
+        payload = self._request(
+            request,
+            validator=lambda item: isinstance(item.get("windows"), list),
+        )
+        if payload is None:
+            return None
+        windows = payload.get("windows")
+        assert isinstance(windows, list)
+        self._fail_streak = 0
+        return [dict(w) for w in windows if isinstance(w, dict)]
+
+    def capture_only(self, window_id: int, *, include_text_anchors: bool = False) -> tuple[Path, str, str, dict, list[dict]] | None:
+        """Capture a window via the worker and return image path, hashes, size,
+        and optional text anchors.
+
+        This is the vision-path entry point: the worker does the leaky
+        CoreGraphics capture and persists the PNG to a temp path it owns; the
+        bot reads the file back with PIL (no Mach growth) for the vision LLM.
+        The caller MUST delete ``image_path`` after use. Returns ``None`` on any
+        worker failure (fail-open).
+        """
+        request = {
+            "mode": "capture_only",
+            "window_id": int(window_id),
+            "include_text_anchors": bool(include_text_anchors),
+        }
+        payload = self._request(
+            request,
+            validator=lambda item: bool(
+                item.get("image_path") and item.get("body_hash")
+            ),
+        )
+        if payload is None:
+            return None
+
+        image_path_raw = payload.get("image_path")
+        body_hash = payload.get("body_hash")
+        stable_body_hash = payload.get("stable_body_hash") or body_hash
+        assert image_path_raw and body_hash
+        self._fail_streak = 0
+        image_size = payload.get("image_size") or {}
+        if not isinstance(image_size, dict):
+            image_size = {}
+        text_anchors = payload.get("text_anchors") or []
+        if not isinstance(text_anchors, list):
+            text_anchors = []
+        return (
+            Path(str(image_path_raw)),
+            str(body_hash),
+            str(stable_body_hash),
+            dict(image_size),
+            [dict(item) for item in text_anchors if isinstance(item, dict)],
+        )
+
+    @staticmethod
+    def _snapshot_from_dict(payload: dict) -> VisibleChatSnapshot:
+        messages = payload.get("messages") or []
+        if not isinstance(messages, list):
+            messages = []
+        latest = payload.get("latest_message")
+        debug = payload.get("debug")
+        return VisibleChatSnapshot(
+            schema=str(payload.get("schema", "weauto_visible_messages_v1")),
+            window_id=int(payload.get("window_id", 0) or 0),
+            title=str(payload.get("title", "") or ""),
+            captured_at=float(payload.get("captured_at", 0.0) or 0.0),
+            source=str(payload.get("source", "ocr_worker") or "ocr_worker"),
+            image_size=dict(payload.get("image_size") or {"width": 0, "height": 0}),
+            messages=[dict(m) for m in messages if isinstance(m, dict)],
+            latest_message=dict(latest) if isinstance(latest, dict) else None,
+            debug=dict(debug) if isinstance(debug, dict) else None,
+        )
+
+    def close(self) -> None:
+        self._terminate()
+
+
 class WeChatGuiRpaBot:
     def __init__(self, cfg: AppConfig) -> None:
         self.cfg = cfg
-        self.ocr_engine = OcrEngine(cfg.ocr, log_fn=print)
+        self.ocr_worker_enabled = bool(getattr(cfg, "ocr_worker_enabled", False))
+        self._strict_detached_worker = bool(
+            self.ocr_worker_enabled
+            and getattr(cfg, "receiver_mode", "detached_windows") == "detached_windows"
+        )
+        self.ocr_engine: OcrEngine | None = None
+        self.visible_message_parser: VisibleMessageParser | None = None
+        if not self._strict_detached_worker:
+            self.ocr_engine = OcrEngine(cfg.ocr, log_fn=print)
+            self.visible_message_parser = VisibleMessageParser(self.ocr_engine)
         self.llm_reply = LlmReplyGenerator(cfg.llm_reply, cfg.vision)
         self.llm_decision = LlmReplyGenerator(cfg.llm_decision, cfg.vision)
         self.llm_planner = LlmReplyGenerator(cfg.llm_planner, cfg.vision)
@@ -210,9 +550,15 @@ class WeChatGuiRpaBot:
         self.heartbeat = None
         self.action_processor = ActionProcessor(self)
         self.message_handler = MessageHandler(self)
-        self.visible_message_parser = VisibleMessageParser(self.ocr_engine)
+        # Recycled capture+OCR subprocess for the high-frequency detached-window
+        # path. In strict detached mode the main process does not initialize an
+        # OCR engine and never falls back to native capture/OCR.
+        self.ocr_proxy: DetachedOcrProxy | None = None
+        if self.ocr_worker_enabled:
+            self.ocr_proxy = DetachedOcrProxy(cfg, log_fn=print)
         self.visible_message_state = VisibleMessageStateStore()
         self._detached_window_image_hashes: dict[int, str] = {}
+        self._detached_window_text_anchors: dict[int, list[dict]] = {}
         self._detached_bootstrapped = False
         self._detached_watchdog_resume_window_ids: set[int] = set()
         self._state_lock = threading.RLock()
@@ -245,6 +591,10 @@ class WeChatGuiRpaBot:
         self._last_activity_at = 0.0
         self._last_memory_gc_at = 0.0
         self._memory_restart_pending = False
+        self._mach_diag_inprocess_capture = 0
+        self._mach_diag_inprocess_enum = 0
+        self._mach_diag_screenshot_region = 0
+        self._mach_diag_pyautogui = 0
         self._load_runtime_state()
         self._load_persistent_memory()
         self.long_bridge_client.set_outbound_handler(
@@ -268,6 +618,13 @@ class WeChatGuiRpaBot:
                 pil_image.close()
             except Exception:
                 pass
+
+    def _ensure_local_ocr(self) -> tuple[OcrEngine, VisibleMessageParser]:
+        if self.ocr_engine is None:
+            self.ocr_engine = OcrEngine(self.cfg.ocr, log_fn=print)
+        if self.visible_message_parser is None:
+            self.visible_message_parser = VisibleMessageParser(self.ocr_engine)
+        return self.ocr_engine, self.visible_message_parser
 
     @staticmethod
     def _current_rss_mb() -> int:
@@ -328,7 +685,23 @@ class WeChatGuiRpaBot:
         collected = gc.collect()
         rss_mb = self._current_rss_mb()
         if self.cfg.log_verbose and rss_mb:
-            print(f"[memory] rss={rss_mb}MB gc_collected={collected}")
+            worker_diag = ""
+            if self.ocr_proxy is not None:
+                worker_diag = (
+                    f" worker_recycles={self.ocr_proxy._recycle_count}"
+                    f" worker_retries={self.ocr_proxy._retry_count}"
+                    f" worker_skips={self.ocr_proxy._skipped_request_count}"
+                )
+            diag = (
+                f"inproc_capture={getattr(self, '_mach_diag_inprocess_capture', 0)} "
+                f"inproc_enum={getattr(self, '_mach_diag_inprocess_enum', 0)} "
+                f"screenshot_region={getattr(self, '_mach_diag_screenshot_region', 0)} "
+                f"pyautogui_ops={getattr(self, '_mach_diag_pyautogui', 0)}"
+            )
+            print(
+                f"[memory] rss={rss_mb}MB gc_collected={collected} "
+                f"{diag}{worker_diag}"
+            )
         should_restart = max_rss_mb > 0 and rss_mb > max_rss_mb
         if should_restart:
             self._memory_restart_pending = True
@@ -852,10 +1225,12 @@ class WeChatGuiRpaBot:
 
         session_key = self._session_key_for_row(row)
         fingerprint = str(source.get("fingerprint") or "").strip()
-        event_seed = (
-            f"{session_key}|{fingerprint}|{reason}|{time.time_ns()}|"
-            f"{text[:400]}"
-        )
+        if fingerprint:
+            event_seed = f"{session_key}|{fingerprint}|{reason}|{sender}"
+        else:
+            event_seed = (
+                f"{session_key}|{reason}|{sender}|{time.time_ns()}|{text[:400]}"
+            )
         event_id = hashlib.sha256(event_seed.encode("utf-8")).hexdigest()[:32]
         return {
             "event_id": event_id,
@@ -982,6 +1357,8 @@ class WeChatGuiRpaBot:
     def close(self) -> None:
         self.long_bridge_client.close()
         self._msg_executor.shutdown(wait=False, cancel_futures=True)
+        if self.ocr_proxy is not None:
+            self.ocr_proxy.close()
 
     def _canonicalize_sender_pair(self, sender: str) -> tuple[str, str]:
         raw = str(sender or "").strip()
@@ -1043,7 +1420,12 @@ class WeChatGuiRpaBot:
     def _load_session_payload(self, key: str, sess: SessionState) -> None:
         meta = self._session_index.get(key, {})
         dir_name = str(meta.get("dir", key))
-        history_records = self.chat_history.load_all(dir_name)
+        history_limit = max(0, int(self.cfg.memory_history_max_items))
+        history_records = (
+            self.chat_history.read_recent(dir_name, limit=history_limit)
+            if history_limit > 0
+            else self.chat_history.load_all(dir_name)
+        )
         history_items = self._normalize_history_items(history_records)
         if not sess.short and isinstance(meta.get("short", []), list):
             sess.short = [str(x) for x in meta["short"]][-max(4, self.cfg.memory_short_max_items) :]
@@ -1053,11 +1435,7 @@ class WeChatGuiRpaBot:
             sess.titles = set(self._normalize_session_titles(meta.get("titles", [])))
         if not sess.muted:
             sess.muted = bool(meta.get("muted", False))
-        sess.history = (
-            history_items[-max(0, self.cfg.memory_history_max_items) :]
-            if self.cfg.memory_history_max_items > 0
-            else history_items
-        )
+        sess.history = history_items
         sess.loaded = True
         for item in history_items:
             sender = str(item.get("sender", "")).strip()
@@ -2134,7 +2512,8 @@ class WeChatGuiRpaBot:
         # high-res capture here to reduce long-run memory growth.
         shot = screenshot_region(x, y, w, h, high_res=False)
         bgr = self._to_np_rgb(shot)[:, :, ::-1]
-        lines = self.ocr_engine.detect_lines(bgr)
+        ocr_engine, _ = self._ensure_local_ocr()
+        lines = ocr_engine.detect_lines(bgr)
         raw_count = len(lines)
         if not lines:
             return "", raw_count, 0, (x, y, w, h), region
@@ -2207,6 +2586,10 @@ class WeChatGuiRpaBot:
                 return True
         return False
 
+    def _should_handle_admin_command_locally(self, is_admin: bool) -> bool:
+        """Keep slash commands local except when OpenClaw owns the turn."""
+        return bool(is_admin) and self.cfg.processing_mode != "long_bridge"
+
     def _is_immediate_reply_event(self, row: ChatRowState, reason: str) -> bool:
         if reason == "mention":
             return True
@@ -2217,6 +2600,25 @@ class WeChatGuiRpaBot:
 
     def _is_normal_reply_event(self, row: ChatRowState, reason: str) -> bool:
         return (not self._is_immediate_reply_event(row, reason)) and reason == "new_message"
+
+    def _detached_message_excerpt(self, message: dict, *, max_width: int | None = None) -> str:
+        text = re.sub(r"\s+", " ", str(message.get("text", "") or "")).strip()
+        if not text:
+            text = str(message.get("image_hash", "") or "").strip()
+        if not text:
+            text = "-"
+        width = max_width if max_width is not None else max(24, self._term_width() - 96)
+        return self._fit_col(text, width)
+
+    def _detached_message_fields(self, message: dict, *, include_raw: bool = False) -> str:
+        sender = self._fit_col(str(message.get("sender", "") or "-"), 12)
+        content_type = str(message.get("content_type", "") or "-")
+        parts = [f"sender={sender}", f"type={content_type}"]
+        if include_raw:
+            raw = self._fit_col(str(message.get("sender_raw", "") or "-"), 12)
+            parts.insert(1, f"raw={raw}")
+        parts.append(f"text={self._detached_message_excerpt(message)}")
+        return " ".join(parts)
 
     def _strip_sender_prefix(self, text: str) -> str:
         raw = (text or "").strip()
@@ -4490,7 +4892,11 @@ class WeChatGuiRpaBot:
         title = (title or "").strip()
         if not title:
             return False
-        return any(keyword and keyword in title for keyword in self.cfg.ignore_title_keywords)
+        if any(keyword and keyword in title for keyword in self.cfg.ignore_title_keywords):
+            return True
+        if any(title == kw for kw in self.cfg.ignore_exact_titles if kw):
+            return True
+        return False
 
     def _should_reply_group(self, row: ChatRowState, reason: str) -> bool:
         if reason == "mention":
@@ -4629,7 +5035,8 @@ class WeChatGuiRpaBot:
             high_res=False,
         )
         shot_rgb = self._to_np_rgb(shot)
-        detected = detect_chat_rows(shot_rgb, bounds, self.cfg, self.ocr_engine)
+        ocr_engine, _ = self._ensure_local_ocr()
+        detected = detect_chat_rows(shot_rgb, bounds, self.cfg, ocr_engine)
         return detected.rows
 
     def _find_row_in_snapshot(
@@ -5780,11 +6187,84 @@ class WeChatGuiRpaBot:
             time.sleep(1.0)
 
     def _detached_windows(self):
-        windows = list_detached_wechat_windows(self.cfg.app_name)
+        windows = self._enumerate_detached_windows()
         filters = [str(x).strip() for x in self.cfg.detached_window_title_filter if str(x).strip()]
         if filters:
             windows = [w for w in windows if any(token in w.title for token in filters)]
         return [w for w in windows if w.title and not self._is_ignored_title_text(w.title)]
+
+    def _enumerate_detached_windows(self) -> list[DetachedWindowInfo]:
+        """Enumerate detached WeChat windows, isolating the Mach-leaking
+        ``CGWindowListCopyWindowInfo`` call in the worker when enabled.
+
+        In worker mode, a failed request skips the current scan cycle. It must
+        not fall back to the main process because each Quartz enumeration can
+        leave unreclaimable Mach-message mappings behind.
+        """
+        if self.ocr_proxy is not None:
+            raw = self.ocr_proxy.list_windows(self.cfg.app_name)
+            if raw is None:
+                return []
+            try:
+                return [
+                    DetachedWindowInfo(
+                        window_id=int(w.get("window_id", 0)),
+                        owner=str(w.get("owner", "") or ""),
+                        title=str(w.get("title", "") or ""),
+                        x=int(w.get("x", 0)),
+                        y=int(w.get("y", 0)),
+                        width=int(w.get("width", 0)),
+                        height=int(w.get("height", 0)),
+                    )
+                    for w in raw
+                ]
+            except (TypeError, ValueError):
+                return []
+        self._mach_diag_inprocess_enum += 1
+        return list_detached_wechat_windows(self.cfg.app_name)
+
+    def _resize_detached_windows_on_start(self) -> None:
+        if not bool(getattr(self.cfg, "detached_window_resize_on_start", False)):
+            return
+        target_w = int(getattr(self.cfg, "detached_window_standard_width", 0) or 0)
+        target_h = int(getattr(self.cfg, "detached_window_standard_height", 0) or 0)
+        if target_w <= 0 or target_h <= 0:
+            print(
+                "[warn] detached window resize skipped: invalid target "
+                f"{target_w}x{target_h}"
+            )
+            return
+        windows = self._detached_windows()
+        changed = 0
+        skipped = 0
+        failed = 0
+        for window in windows:
+            if abs(int(window.width) - target_w) <= 1 and abs(int(window.height) - target_h) <= 1:
+                skipped += 1
+                continue
+            try:
+                ok = set_detached_wechat_window_size(
+                    window,
+                    width=target_w,
+                    height=target_h,
+                )
+            except Exception as exc:
+                failed += 1
+                print(f"[warn] detached window resize failed title={window.title!r}: {exc}")
+                continue
+            if ok:
+                changed += 1
+                print(
+                    f"[resize] detached title={window.title!r} "
+                    f"{window.width}x{window.height} -> {target_w}x{target_h}"
+                )
+            else:
+                failed += 1
+                print(f"[warn] detached window resize target not found title={window.title!r}")
+        print(
+            f"[start] window-resize: size={target_w}x{target_h} "
+            f"changed={changed} skipped={skipped} failed={failed}"
+        )
 
     def _canonicalize_visible_message(self, message: dict) -> dict:
         if not isinstance(message, dict):
@@ -5823,19 +6303,95 @@ class WeChatGuiRpaBot:
 
     @staticmethod
     def _detached_chat_body_hash(image: Image.Image) -> str:
-        width, height = image.size
-        body_y1, body_y2 = VisibleMessageParser._chat_body_bounds(height)
-        body_y1 = max(0, min(height, body_y1))
-        body_y2 = max(body_y1, min(height, body_y2))
-        crop = image.crop((0, body_y1, width, body_y2))
-        try:
-            small = crop.convert("L").resize((96, 160))
+        return VisibleMessageParser.chat_body_hash(image)
+
+    @staticmethod
+    def _detached_stable_chat_body_hash(image: Image.Image) -> str:
+        return VisibleMessageParser.chat_body_hash(image, mask_media=True)
+
+    @staticmethod
+    def _detached_anchor_key(anchor: dict) -> str:
+        return str(anchor.get("key") or anchor.get("text") or "").strip()
+
+    @staticmethod
+    def _detached_unique_anchor_map(anchors: list[dict]) -> dict[str, dict]:
+        counts: dict[str, int] = defaultdict(int)
+        for anchor in anchors:
+            key = WeChatGuiRpaBot._detached_anchor_key(anchor)
+            if key:
+                counts[key] += 1
+        out: dict[str, dict] = {}
+        for anchor in anchors:
+            key = WeChatGuiRpaBot._detached_anchor_key(anchor)
+            if key and counts.get(key) == 1:
+                out[key] = anchor
+        return out
+
+    @staticmethod
+    def _detached_median(values: list[float]) -> float:
+        ordered = sorted(values)
+        if not ordered:
+            return 0.0
+        mid = len(ordered) // 2
+        if len(ordered) % 2:
+            return float(ordered[mid])
+        return (float(ordered[mid - 1]) + float(ordered[mid])) / 2.0
+
+    @classmethod
+    def _detached_text_anchor_changed(
+        cls,
+        previous: list[dict],
+        current: list[dict],
+        *,
+        min_common: int = 3,
+        shift_threshold: float = 40.0,
+        jitter_px: float = 8.0,
+        cluster_px: float = 24.0,
+    ) -> bool | None:
+        prev_map = cls._detached_unique_anchor_map(previous)
+        curr_map = cls._detached_unique_anchor_map(current)
+        if len(prev_map) < min_common or len(curr_map) < min_common:
+            return None
+
+        common = sorted(set(prev_map) & set(curr_map))
+        if len(common) < min_common:
+            return None
+
+        deltas: list[float] = []
+        for key in common:
             try:
-                return hashlib.sha1(small.tobytes()).hexdigest()
-            finally:
-                small.close()
-        finally:
-            crop.close()
+                dy = float(curr_map[key].get("y", 0.0)) - float(prev_map[key].get("y", 0.0))
+            except (TypeError, ValueError):
+                continue
+            if abs(dy) > jitter_px:
+                deltas.append(dy)
+
+        if deltas:
+            median = cls._detached_median(deltas)
+            same_direction = [
+                dy
+                for dy in deltas
+                if (dy > 0 and median > 0) or (dy < 0 and median < 0)
+            ]
+            clustered = [dy for dy in same_direction if abs(dy - median) <= cluster_px]
+            if (
+                abs(median) >= shift_threshold
+                and len(same_direction) >= max(min_common, int(len(common) * 0.65))
+                and len(clustered) >= max(min_common, int(len(same_direction) * 0.70))
+            ):
+                return True
+
+        prev_max_y = max(float(anchor.get("y", 0.0) or 0.0) for anchor in prev_map.values())
+        new_tail = [
+            anchor
+            for key, anchor in curr_map.items()
+            if key not in prev_map
+            and float(anchor.get("y", 0.0) or 0.0) > prev_max_y + shift_threshold
+        ]
+        if new_tail:
+            return True
+
+        return False
 
     @staticmethod
     def _vision_sender_is_self(sender: str) -> bool:
@@ -5874,7 +6430,10 @@ class WeChatGuiRpaBot:
             side = "self" if cls._vision_sender_is_self(sender_raw) else "other"
             sender = "self" if side == "self" else sender_raw
             content_type = cls._vision_content_type(content)
-            fingerprint_base = f"{side}|{content_type}|{sender_raw}|{text}"
+            fingerprint_text = normalize_message_fingerprint_text(text)
+            fingerprint_base = (
+                f"{side}|{content_type}|{sender_raw}|{fingerprint_text}"
+            )
             occurrence = occurrence_counts.get(fingerprint_base, 0)
             occurrence_counts[fingerprint_base] = occurrence + 1
             message: dict = {
@@ -5953,6 +6512,119 @@ class WeChatGuiRpaBot:
             messages=messages,
             latest_message=messages[-1] if messages else None,
             debug=None,
+        )
+
+    def _capture_detached_image(self, window_id: int) -> tuple[Image.Image, str, str, list[dict]] | None:
+        """Capture a detached window and return image, hashes, and text anchors.
+
+        When the recycled capture+OCR worker is enabled, the leaky
+        ``CGWindowListCreateImage`` capture runs in the worker subprocess: the
+        worker persists the PNG to a temp path it owns and returns the path +
+        body hash, and we read the file back with PIL (a plain file read, no
+        CoreGraphics, no Mach growth). The returned image carries a
+        ``_weauto_tmp_path`` attribute the loop deletes after use.
+
+        Otherwise (worker disabled) this does the in-process capture + hash.
+        A worker failure returns ``None`` and skips this scan cycle.
+        """
+        if self.ocr_proxy is not None:
+            result = self.ocr_proxy.capture_only(window_id, include_text_anchors=True)
+            if result is not None:
+                image_path, body_hash, stable_body_hash, _image_size, text_anchors = result
+                try:
+                    image = Image.open(image_path)
+                    image.load()
+                except Exception:
+                    try:
+                        image_path.unlink()
+                    except Exception:
+                        pass
+                    return None
+                # Tag the temp path so the loop can delete it after use.
+                try:
+                    image._weauto_tmp_path = image_path  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+                return image, body_hash, stable_body_hash, text_anchors
+            return None
+        self._mach_diag_inprocess_capture += 1
+        image = capture_window_by_id(
+            window_id,
+            backend=self.cfg.detached_window_capture_backend,
+        )
+        try:
+            body_hash = self._detached_chat_body_hash(image)
+            stable_body_hash = self._detached_stable_chat_body_hash(image)
+            text_anchors = (
+                VisibleMessageParser.text_anchors(image, self.ocr_engine)
+                if self.ocr_engine is not None
+                else []
+            )
+        except Exception:
+            body_hash = ""
+            stable_body_hash = body_hash
+            text_anchors = []
+        return image, body_hash, stable_body_hash, text_anchors
+
+    @staticmethod
+    def _close_detached_image(image) -> None:
+        """Close a detached capture image and delete its worker temp file.
+
+        When the capture ran through the worker, the PIL image is backed by a
+        temp PNG on disk; closing the image alone would leave that file behind,
+        so unlink it too. No-op for in-process captures (no temp path).
+        """
+        if image is None:
+            return
+        tmp_path = getattr(image, "_weauto_tmp_path", None)
+        try:
+            image.close()
+        except Exception:
+            pass
+        if tmp_path is not None:
+            try:
+                Path(str(tmp_path)).unlink()
+            except Exception:
+                pass
+
+    def _parse_detached_snapshot_ocr(
+        self,
+        image,
+        *,
+        window_id: int,
+        title: str,
+        title_slug: str = "",
+        image_output_dir: Path | None = None,
+        include_debug: bool = False,
+    ) -> VisibleChatSnapshot:
+        """Run the new-message OCR parse for a detached window.
+
+        When the recycled capture+OCR worker is enabled, this dispatches to it
+        (the worker captures by window_id and returns a JSON snapshot, so the
+        ``image`` argument is unused on that branch — its native memory stays
+        isolated in the worker). Otherwise it uses the in-process parser.
+        A worker failure raises so the detached loop closes the image and skips
+        the current window without contaminating the main process.
+        """
+        if self.ocr_proxy is not None:
+            snapshot = self.ocr_proxy.parse(
+                window_id,
+                title=title,
+                image_output_dir=image_output_dir,
+                include_debug=include_debug,
+            )
+            if snapshot is not None:
+                return snapshot
+            raise RuntimeError(
+                f"ocr worker unavailable after retry: window_id={window_id}"
+            )
+        _, parser = self._ensure_local_ocr()
+        return parser.parse(
+            image,
+            window_id=window_id,
+            title=title,
+            image_output_dir=image_output_dir,
+            include_debug=include_debug,
         )
 
     def _detached_local_snapshot_has_unseen_content(
@@ -6089,38 +6761,60 @@ class WeChatGuiRpaBot:
         title: str,
         new_messages: list[dict],
         now: float,
-    ) -> list[dict]:
-        immediate: list[tuple[int, dict]] = []
+    ) -> list[tuple[dict, bool]]:
+        immediate: list[tuple[int, dict, bool]] = []
         normal_group: list[tuple[int, dict]] = []
+        incoming_count = 0
+        skipped: defaultdict[str, int] = defaultdict(int)
+        log_verbose = bool(getattr(self.cfg, "log_verbose", False))
         for idx, message in enumerate(new_messages):
             if not self.visible_message_state.is_incoming(message):
                 continue
+            incoming_count += 1
             row = self._detached_row_for_message(window_id=window_id, title=title, message=message)
             if self._is_ignored_title(row):
-                if self.cfg.log_verbose:
-                    print(f"[batch-skip] ignored title={title!r}")
+                skipped["ignored_title"] += 1
+                if log_verbose:
+                    print(
+                        f"[batch-skip] detached title={title!r} reason=ignored_title "
+                        f"{self._detached_message_fields(message)}"
+                    )
                 continue
             is_admin = self._is_admin_session(row)
             if (not is_admin) and self._is_row_muted(row):
-                if self.cfg.log_verbose:
-                    print(f"[batch-skip] muted title={title!r}")
+                skipped["muted"] += 1
+                if log_verbose:
+                    print(
+                        f"[batch-skip] detached title={title!r} reason=muted "
+                        f"{self._detached_message_fields(message)}"
+                    )
                 continue
 
             content_type = str(message.get("content_type", "text")).strip().lower()
             if content_type == "image" and not self.cfg.detached_reply_on_image:
+                skipped["image_disabled"] += 1
+                if log_verbose:
+                    print(
+                        f"[batch-skip] detached title={title!r} reason=image_disabled "
+                        f"{self._detached_message_fields(message)}"
+                    )
                 continue
 
             reason = "mention" if row.has_mention else "new_message"
             is_group = self._is_group_chat(row)
             if is_group and not self._should_reply_group(row, reason):
-                if self.cfg.log_verbose:
-                    print(f"[batch-skip] group rule title={title!r} reason={reason}")
+                skipped["group_rule"] += 1
+                if log_verbose:
+                    print(
+                        f"[batch-skip] detached title={title!r} reason=group_rule "
+                        f"event={reason} preview={self._fit_col(row.preview or '-', max(24, self._term_width() - 78))}"
+                    )
                 continue
 
             if self._is_normal_reply_event(row, reason):
                 normal_group.append((idx, message))
             else:
-                immediate.append((idx, message))
+                immediate.append((idx, message, False))
 
         selected = list(immediate)
         if normal_group:
@@ -6131,9 +6825,41 @@ class WeChatGuiRpaBot:
             if not normal_cooldown_active:
                 # For ordinary group chatter, answer only the newest message in
                 # the batch. Mentions/private/admin messages above are all kept.
-                selected.append(max(normal_group, key=lambda item: item[0]))
+                latest_normal = max(normal_group, key=lambda item: item[0])
+                selected.append((latest_normal[0], latest_normal[1], True))
+                self._mark_normal_reply_at(now)
+                if log_verbose:
+                    print(
+                        f"[batch-select] detached title={title!r} policy=latest_normal "
+                        f"incoming={incoming_count} immediate={len(immediate)} normal={len(normal_group)} "
+                        f"selected={len(selected)} {self._detached_message_fields(latest_normal[1])}"
+                    )
+            elif log_verbose:
+                remain = self.cfg.normal_reply_interval_sec - (now - self._last_normal_reply_at)
+                latest_normal = max(normal_group, key=lambda item: item[0])
+                skipped["normal_cooldown"] += len(normal_group)
+                print(
+                    f"[cooldown] detached title={title!r} reason=normal_reply_interval "
+                    f"drop={len(normal_group)} remain={max(0.0, remain):.1f}s "
+                    f"last_normal={self._last_normal_reply_at:.0f} {self._detached_message_fields(latest_normal[1])}"
+                )
+        elif log_verbose and immediate:
+            print(
+                f"[batch-select] detached title={title!r} policy=immediate_only "
+                f"incoming={incoming_count} immediate={len(immediate)} normal=0 selected={len(selected)}"
+            )
 
-        return [message for _, message in sorted(selected, key=lambda item: item[0])]
+        if log_verbose and incoming_count and not selected:
+            skipped_text = ",".join(f"{key}:{value}" for key, value in sorted(skipped.items())) or "-"
+            print(
+                f"[batch-result] detached title={title!r} incoming={incoming_count} selected=0 "
+                f"skipped={skipped_text}"
+            )
+
+        return [
+            (message, allow_normal_cooldown_pass)
+            for _, message, allow_normal_cooldown_pass in sorted(selected, key=lambda item: item[0])
+        ]
 
     def _handle_detached_new_message(
         self,
@@ -6143,16 +6869,25 @@ class WeChatGuiRpaBot:
         messages: list[dict],
         message: dict,
         now: float,
+        allow_normal_cooldown_pass: bool = False,
     ) -> None:
         row = self._detached_row_for_message(window_id=window_id, title=title, message=message)
         if not self.visible_message_state.is_incoming(message):
             return
         if self._is_ignored_title(row):
+            if self.cfg.log_verbose:
+                print(
+                    f"[skip-rule] detached title={title!r} reason=ignored_title "
+                    f"{self._detached_message_fields(message)}"
+                )
             return
         is_admin = self._is_admin_session(row)
         if (not is_admin) and self._is_row_muted(row):
             if self.cfg.log_verbose:
-                print(f"[skip-muted] detached title={title!r}")
+                print(
+                    f"[skip-muted] detached title={title!r} reason=muted "
+                    f"{self._detached_message_fields(message)}"
+                )
             return
 
         latest_text = re.sub(r"\s+", " ", str(message.get("text", "") or "")).strip()
@@ -6163,7 +6898,10 @@ class WeChatGuiRpaBot:
                 self._remember_latest_image_for_row(row, image_path)
         if content_type == "image" and not self.cfg.detached_reply_on_image:
             if self.cfg.log_verbose:
-                print(f"[skip-image] detached title={title!r} hash={message.get('image_hash', '')}")
+                print(
+                    f"[skip-image] detached title={title!r} reason=image_disabled "
+                    f"{self._detached_message_fields(message)}"
+                )
             return
         if content_type == "image":
             image_desc = self._analyze_detached_image_message(message)
@@ -6174,16 +6912,24 @@ class WeChatGuiRpaBot:
         is_group = self._is_group_chat(row)
         if is_group and not self._should_reply_group(row, reason):
             if self.cfg.log_verbose:
-                print(f"[skip-rule] detached group title={title!r} preview={row.preview!r}")
+                print(
+                    f"[skip-rule] detached title={title!r} reason=group_rule event={reason} "
+                    f"preview={row.preview!r}"
+                )
             return
         if (
             self._is_normal_reply_event(row, reason)
             and self._normal_reply_interval_active()
             and (now - self._last_normal_reply_at) < self.cfg.normal_reply_interval_sec
+            and not allow_normal_cooldown_pass
         ):
             if self.cfg.log_verbose:
                 remain = self.cfg.normal_reply_interval_sec - (now - self._last_normal_reply_at)
-                print(f"[skip-normal-interval] detached title={title!r} remain={max(0.0, remain):.1f}s")
+                print(
+                    f"[cooldown] detached title={title!r} reason=normal_reply_interval "
+                    f"drop=1 remain={max(0.0, remain):.1f}s "
+                    f"{self._detached_message_fields(message)}"
+                )
             return
 
         image_followup_context = self._image_followup_context_for_text(row, latest_text)
@@ -6202,7 +6948,7 @@ class WeChatGuiRpaBot:
             is_admin=is_admin,
         )
 
-        if is_admin:
+        if self._should_handle_admin_command_locally(is_admin):
             cmd_line = self._extract_admin_command_text(row, self._detached_context_snapshot(row.preview))
             if cmd_line:
                 self._append_session_item(row, "U", cmd_line)
@@ -6241,8 +6987,20 @@ class WeChatGuiRpaBot:
             )
         )
         if not should_reply:
+            if self.cfg.log_verbose:
+                print(
+                    f"[decision] detached title={title!r} decision=skip reason={reason} "
+                    f"{self._detached_message_fields(message)}"
+                )
             self._save_persistent_memory()
             return
+        if self.cfg.log_verbose:
+            route = "long_bridge" if self.cfg.processing_mode == "long_bridge" else "native"
+            print(
+                f"[decision] detached title={title!r} decision=reply route={route} "
+                f"reason={reason} group={self._yn(is_group)} admin={self._yn(is_admin)} "
+                f"{self._detached_message_fields(message)}"
+            )
 
         mention_reply_to = (
             (message.get("sender") or "").strip()
@@ -6365,12 +7123,18 @@ class WeChatGuiRpaBot:
         if q is None:
             return
         while not q.empty():
-            title, messages, message, now = q.get_nowait()
+            item = q.get_nowait()
+            if len(item) >= 5:
+                title, messages, message, now, allow_normal_cooldown_pass = item[:5]
+            else:
+                title, messages, message, now = item
+                allow_normal_cooldown_pass = False
             try:
                 if self.visible_message_state.is_incoming(message):
                     self._handle_detached_new_message(
                         window_id=window_id, title=title,
                         messages=messages, message=message, now=now,
+                        allow_normal_cooldown_pass=allow_normal_cooldown_pass,
                     )
             except Exception as exc:
                 print(f"[warn] detached msg queue error window={window_id}: {exc}")
@@ -6410,9 +7174,29 @@ class WeChatGuiRpaBot:
     def run_detached_window_forever(self) -> None:
         self._ensure_start_activity_at(time.time())
         image_root = Path(self.cfg.detached_window_output_dir).expanduser()
+        screen_capture_access = (
+            "delegated-to-worker"
+            if self.ocr_worker_enabled
+            else screen_capture_access_granted()
+        )
         print("[start] WeChat detached-window receiver started")
         print(f"[start] receiver=detached_windows poll={self.cfg.poll_interval_sec:.1f}s dry_run={self.cfg.dry_run}")
         print(f"[start] capture-backend={self.cfg.detached_window_capture_backend}")
+        if self.ocr_worker_enabled:
+            print(
+                f"[start] ocr-worker: enabled (isolated capture+OCR subprocess, "
+                f"recycle at {self.cfg.ocr_worker_max_rss_mb}MB)"
+            )
+        else:
+            print("[start] ocr-worker: disabled (in-process capture+OCR)")
+        print(f"[start] screen-capture-access={screen_capture_access}")
+        if (not self.ocr_worker_enabled) and screen_capture_access is False:
+            requested_access = request_screen_capture_access()
+            print(
+                "[warn] Screen Recording permission is missing for this launcher "
+                f"(request_result={requested_access}). Grant WeAuto access in System Settings, "
+                "then quit and reopen WeAuto."
+            )
         print(
             f"[start] mention-send: enabled={self.cfg.mention_send_enabled} "
             f"source={self._mention_mapping_source_text()} "
@@ -6423,6 +7207,8 @@ class WeChatGuiRpaBot:
         print(f"[start] image-gen: {self._image_generation_status_text()}")
         print(f"[start] image-edit: {self._image_editing_status_text()}")
         print(f"[start] memory-sqlite: disabled (archived)")
+        self._resize_detached_windows_on_start()
+        empty_window_diagnostic_logged = False
         while True:
             self._cycle += 1
             now = time.time()
@@ -6433,6 +7219,21 @@ class WeChatGuiRpaBot:
                 time.sleep(0.2)
                 continue
             windows = self._detached_windows()
+            if windows:
+                empty_window_diagnostic_logged = False
+            elif not empty_window_diagnostic_logged:
+                empty_window_diagnostic_logged = True
+                if self.ocr_worker_enabled:
+                    print(
+                        "[warn] detached window enumeration returned 0; "
+                        "worker request failed or no matching windows"
+                    )
+                else:
+                    print(
+                        "[warn] detached window enumeration returned 0: "
+                        f"screen_capture_access={screen_capture_access_granted()} "
+                        f"visible_layer0_owners={visible_window_owner_summary()}"
+                    )
             if self.cfg.log_verbose:
                 names = ", ".join([w.title for w in windows]) or "-"
                 print(f"[cycle] id={self._cycle:>4} detached_windows={len(windows)} {self._fit_col(names, max(24, self._term_width() - 34))}")
@@ -6448,22 +7249,23 @@ class WeChatGuiRpaBot:
                             window_id=window.window_id,
                             title=window.title,
                         )
-                    image = capture_window_by_id(
-                        window.window_id,
-                        backend=self.cfg.detached_window_capture_backend,
-                    )
+                    capture_result = self._capture_detached_image(window.window_id)
+                    if capture_result is None:
+                        raise RuntimeError(f"window capture failed: window_id={window.window_id}")
+                    image, _captured_body_hash, captured_stable_body_hash, captured_text_anchors = capture_result
                     image_hash = ""
                     if resume_snapshot is not None:
                         try:
-                            image_hash = f"{window.title}|{self._detached_chat_body_hash(image)}"
+                            image_hash = f"{window.title}|{captured_stable_body_hash}"
                             self._detached_window_image_hashes[window.window_id] = image_hash
                         except Exception:
                             image_hash = ""
                         try:
-                            local_snapshot = self.visible_message_parser.parse(
+                            local_snapshot = self._parse_detached_snapshot_ocr(
                                 image,
                                 window_id=window.window_id,
                                 title=window.title,
+                                title_slug=title_slug,
                                 image_output_dir=image_root / title_slug / "images",
                                 include_debug=False,
                             )
@@ -6496,14 +7298,30 @@ class WeChatGuiRpaBot:
                         self._detached_watchdog_resume_window_ids.discard(int(window.window_id))
                     if self.cfg.detached_vision_parse_enabled and self.llm.is_vision_enabled():
                         if snapshot is None:
-                            image_hash = f"{window.title}|{self._detached_chat_body_hash(image)}"
-                            old_hash = self._detached_window_image_hashes.get(window.window_id, "")
-                            if old_hash and old_hash == image_hash:
+                            previous_anchors = self._detached_window_text_anchors.get(window.window_id, [])
+                            anchor_changed = (
+                                self._detached_text_anchor_changed(previous_anchors, captured_text_anchors)
+                                if previous_anchors and captured_text_anchors
+                                else None
+                            )
+                            if captured_text_anchors:
+                                self._detached_window_text_anchors[window.window_id] = captured_text_anchors
+                            if anchor_changed is False:
+                                if self.cfg.log_verbose:
+                                    print(
+                                        f"[skip-anchor-stable] detached title={window.title!r} "
+                                        f"anchors={len(captured_text_anchors)}"
+                                    )
                                 if image is not None:
-                                    try:
-                                        image.close()
-                                    except Exception:
-                                        pass
+                                    self._close_detached_image(image)
+                                    image = None
+                                continue
+                            image_hash = f"{window.title}|{captured_stable_body_hash}"
+                            old_hash = self._detached_window_image_hashes.get(window.window_id, "")
+                            if anchor_changed is None and old_hash and old_hash == image_hash:
+                                if image is not None:
+                                    self._close_detached_image(image)
+                                    image = None
                                 continue
                             try:
                                 snapshot = self._parse_detached_snapshot_with_vision(
@@ -6521,18 +7339,16 @@ class WeChatGuiRpaBot:
                             except Exception as exc:
                                 print(f"[warn] detached vision parse failed title={window.title!r}: {exc}")
                                 if not self.cfg.vision.fail_open:
-                                    if image is not None:
-                                        try:
-                                            image.close()
-                                        except Exception:
-                                            pass
+                                    self._close_detached_image(image)
+                                    image = None
                                     continue
                                 print("[vision] fail-open: fallback to local OCR parser")
                     if snapshot is None:
-                        snapshot = self.visible_message_parser.parse(
+                        snapshot = self._parse_detached_snapshot_ocr(
                             image,
                             window_id=window.window_id,
                             title=window.title,
+                            title_slug=title_slug,
                             image_output_dir=image_root / title_slug / "images",
                             include_debug=self.cfg.detached_debug_save,
                         )
@@ -6545,11 +7361,8 @@ class WeChatGuiRpaBot:
                     snapshot.latest_message = snapshot.messages[-1] if snapshot.messages else None
                 except Exception as exc:
                     print(f"[warn] detached capture/parse failed title={window.title!r}: {exc}")
-                    if image is not None:
-                        try:
-                            image.close()
-                        except Exception:
-                            pass
+                    self._close_detached_image(image)
+                    image = None
                     continue
 
                 if self.cfg.detached_debug_save and image is not None:
@@ -6560,11 +7373,8 @@ class WeChatGuiRpaBot:
                         json.dumps(snapshot.messages, ensure_ascii=False, indent=2),
                         encoding="utf-8",
                     )
-                if image is not None:
-                    try:
-                        image.close()
-                    except Exception:
-                        pass
+                self._close_detached_image(image)
+                image = None
 
                 row_for_merge = ChatRowState(
                     row_idx=int(window.window_id),
@@ -6595,11 +7405,8 @@ class WeChatGuiRpaBot:
                     if self.visible_message_state.is_incoming(message):
                         any_new = True
                         print(
-                            f"[event] detached title={self._fit_col(window.title, 14)} "
-                            f"sender={self._fit_col(str(message.get('sender', '') or '-'), 12)} "
-                            f"raw={self._fit_col(str(message.get('sender_raw', '') or '-'), 12)} "
-                            f"type={message.get('content_type')} "
-                            f"text={self._fit_col(str(message.get('text') or message.get('image_hash', '')), max(24, self._term_width() - 69))}"
+                            f"[msg-new] detached title={self._fit_col(window.title, 14)} "
+                            f"{self._detached_message_fields(message, include_raw=True)}"
                         )
                 messages_to_handle = self._select_detached_messages_to_handle(
                     window_id=window.window_id,
@@ -6607,18 +7414,18 @@ class WeChatGuiRpaBot:
                     new_messages=new_messages,
                     now=now,
                 )
-                if self.cfg.log_verbose and len(messages_to_handle) < len(
-                    [m for m in new_messages if self.visible_message_state.is_incoming(m)]
-                ):
-                    picked = messages_to_handle[0] if messages_to_handle else {}
-                    picked_text = str(picked.get("text") or picked.get("image_hash") or "-")
+                incoming_new_count = sum(
+                    1 for m in new_messages if self.visible_message_state.is_incoming(m)
+                )
+                if self.cfg.log_verbose and incoming_new_count:
                     print(
-                        f"[batch] detached title={self._fit_col(window.title, 14)} "
-                        f"handle={self._fit_col(picked_text, max(24, self._term_width() - 40))}"
+                        f"[route] detached title={self._fit_col(window.title, 14)} "
+                        f"incoming={incoming_new_count} enqueue={len(messages_to_handle)} "
+                        f"queue_before={self._session_queues.get(window.window_id).qsize() if window.window_id in self._session_queues else 0}"
                     )
                 q = self._session_queues.setdefault(window.window_id, queue.Queue())
-                for message in messages_to_handle:
-                    q.put((window.title, snapshot.messages, message, now))
+                for message, allow_normal_cooldown_pass in messages_to_handle:
+                    q.put((window.title, snapshot.messages, message, now, allow_normal_cooldown_pass))
                 if self._session_busy.get(window.window_id):
                     if self.cfg.log_verbose and messages_to_handle:
                         print(f"[queue] window={window.window_id} busy, {q.qsize()} queued")
@@ -7257,7 +8064,8 @@ class WeChatGuiRpaBot:
             )
             shot_rgb = self._to_np_rgb(shot)
 
-            detected = detect_chat_rows(shot_rgb, bounds, self.cfg, self.ocr_engine)
+            ocr_engine, _ = self._ensure_local_ocr()
+            detected = detect_chat_rows(shot_rgb, bounds, self.cfg, ocr_engine)
             self._log_cycle_snapshot(detected.rows, now)
             if not self._baseline:
                 self._set_baseline(detected.rows, now)

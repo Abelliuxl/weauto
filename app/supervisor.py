@@ -388,10 +388,11 @@ class BotSupervisor:
             self._bridge_mode = mode
             self._bridge_state = status
             return
-        if "long bridge failed" in line.lower() or "long-bridge failed" in line.lower():
+        lower = line.lower()
+        if "long bridge failed" in lower or "long-bridge failed" in lower:
             self._bridge_state = "failed"
             return
-        if "long bridge" in line.lower() and "connected" in line.lower():
+        if ("long bridge" in lower or "long-bridge" in lower) and "connected" in lower:
             self._bridge_state = "connected"
 
     def _write_log(self, text: str) -> None:

@@ -315,21 +315,45 @@ class ChatHistoryStore:
             pass
         return records
 
+    @staticmethod
+    def _iter_lines_reverse(path: Path, *, chunk_size: int = 65536):
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            position = f.tell()
+            remainder = b""
+            while position > 0:
+                read_size = min(chunk_size, position)
+                position -= read_size
+                f.seek(position)
+                block = f.read(read_size) + remainder
+                lines = block.split(b"\n")
+                remainder = lines[0]
+                for line in reversed(lines[1:]):
+                    yield line.decode("utf-8", errors="replace")
+            if remainder:
+                yield remainder.decode("utf-8", errors="replace")
+
     def read_recent(self, chat_name: str, limit: int = 50) -> list[dict]:
+        limit = max(0, int(limit))
+        if limit == 0:
+            return []
         date_files = self._list_date_files(chat_name)
         records: list[dict] = []
         for fpath in reversed(date_files):
             date_str = fpath.stem
             try:
-                lines = fpath.read_text(encoding="utf-8", errors="replace").splitlines()
+                lines = self._iter_lines_reverse(fpath)
             except OSError:
                 continue
-            for line in reversed(lines):
-                rec = self._parse_line(line.strip(), date_str)
-                if rec:
-                    records.append(rec)
-                    if len(records) >= limit:
-                        break
+            try:
+                for line in lines:
+                    rec = self._parse_line(line.strip(), date_str)
+                    if rec:
+                        records.append(rec)
+                        if len(records) >= limit:
+                            break
+            except OSError:
+                continue
             if len(records) >= limit:
                 break
         records.reverse()

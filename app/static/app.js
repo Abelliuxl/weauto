@@ -290,7 +290,7 @@ let logEs = null;
 let logPaused = false;
 let logBuffer = [];      // accumulated lines (capped)
 const LOG_CAP = 4000;
-let logTagFilter = "";
+let logQuery = "";
 let logHistoryLoaded = false;
 
 function tagOf(line) {
@@ -301,24 +301,53 @@ function tagOf(line) {
 function classForTag(t) {
   if (t.startsWith("warn")) return "warn";
   if (t.startsWith("error")) return "error";
+  if (t.startsWith("fatal")) return "error";
+  if (t.startsWith("cooldown")) return "cooldown";
   if (t.startsWith("skip")) return "skip";
+  if (t.startsWith("batch")) return "batch";
+  if (t.startsWith("route")) return "route";
+  if (t.startsWith("queue")) return "queue";
+  if (t.startsWith("msg")) return "msg";
   if (t.startsWith("cycle")) return "cycle";
   if (t.startsWith("event")) return "event";
+  if (t.startsWith("decision")) return "decision";
+  if (t.startsWith("long-bridge")) return "bridge";
+  if (t.startsWith("vision")) return "vision";
+  if (t.startsWith("ocr")) return "worker";
+  if (t.startsWith("memory")) return "memory";
+  if (t.startsWith("action") || t.startsWith("sent")) return "sent";
   if (t.startsWith("supervisor")) return "supervisor";
   return "";
+}
+function cleanTagQuery(raw) {
+  return raw.replace(/^tag:/, "").replace(/^#/, "").replace(/^\[/, "").replace(/\]$/, "").trim();
+}
+function logLineMatches(line) {
+  const q = logQuery.trim().toLowerCase();
+  if (!q) return true;
+  if (q.startsWith("tag:") || q.startsWith("#")) {
+    const wanted = cleanTagQuery(q);
+    const t = tagOf(line);
+    return !wanted || t === wanted || t.startsWith(wanted);
+  }
+  return line.toLowerCase().includes(q);
+}
+function renderLogLine(line) {
+  const t = tagOf(line);
+  const box = document.getElementById("log-box");
+  const span = document.createElement("span");
+  span.className = `log-line ${classForTag(t)}`;
+  span.textContent = line + "\n";
+  box.appendChild(span);
+  return box;
 }
 function appendLogLine(text) {
   logBuffer.push(text);
   if (logBuffer.length > LOG_CAP) {
     logBuffer.splice(0, logBuffer.length - LOG_CAP);
   }
-  const t = tagOf(text);
-  if (logTagFilter && t !== logTagFilter && !t.startsWith(logTagFilter)) return;
-  const box = document.getElementById("log-box");
-  const span = document.createElement("span");
-  span.className = `log-line ${classForTag(t)}`;
-  span.textContent = text + "\n";
-  box.appendChild(span);
+  if (!logLineMatches(text)) return;
+  const box = renderLogLine(text);
   // Trim DOM nodes to avoid runaway growth
   while (box.childNodes.length > LOG_CAP) {
     box.removeChild(box.firstChild);
@@ -367,17 +396,13 @@ document.getElementById("log-pause").addEventListener("change", (e) => {
   logPaused = e.target.checked;
 });
 document.getElementById("log-tag").addEventListener("input", (e) => {
-  logTagFilter = (e.target.value || "").trim().toLowerCase();
-  // re-render from buffer with the new filter
+  logQuery = (e.target.value || "").trim().toLowerCase();
+  // re-render from buffer with the new search
   const box = document.getElementById("log-box");
   box.innerHTML = "";
   for (const line of logBuffer) {
-    const t = tagOf(line);
-    if (logTagFilter && t !== logTagFilter && !t.startsWith(logTagFilter)) continue;
-    const span = document.createElement("span");
-    span.className = `log-line ${classForTag(t)}`;
-    span.textContent = line + "\n";
-    box.appendChild(span);
+    if (!logLineMatches(line)) continue;
+    renderLogLine(line);
   }
   box.scrollTop = box.scrollHeight;
 });

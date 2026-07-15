@@ -196,6 +196,18 @@ class AppConfig:
     # quartz: faster in-process CoreGraphics capture, but may grow Mach memory over time.
     detached_window_capture_backend: str = "screencapture"
     detached_debug_save: bool = False
+    detached_window_resize_on_start: bool = False
+    detached_window_standard_width: int = 852
+    detached_window_standard_height: int = 970
+    # When enabled, the high-frequency detached-window capture+OCR pipeline
+    # runs in a dedicated child process that the main bot auto-recycles when
+    # its RSS exceeds ocr_worker_max_rss_mb. This isolates the native (Mach /
+    # CoreGraphics / cv2 / onnxruntime) memory growth that cannot be reclaimed
+    # by gc.collect(), so the main bot process never needs to restart.
+    ocr_worker_enabled: bool = False
+    ocr_worker_max_rss_mb: int = 2048
+    ocr_worker_request_timeout_sec: float = 20.0
+    ocr_worker_ready_timeout_sec: float = 15.0
     detached_reply_on_image: bool = False
     detached_process_existing_on_start: bool = False
     # When enabled, changed detached chat windows are parsed by the vision LLM
@@ -203,7 +215,7 @@ class AppConfig:
     detached_vision_parse_enabled: bool = False
     poll_interval_sec: float = 2.0
     action_cooldown_sec: float = 8.0
-    normal_reply_interval_sec: float = 60.0
+    normal_reply_interval_sec: float = 300.0
     dry_run: bool = True
     activate_wait_sec: float = 0.6
     click_move_duration_sec: float = 0.18
@@ -271,6 +283,7 @@ class AppConfig:
     long_bridge_reconnect_max_sec: float = 30.0
     long_bridge_heartbeat_sec: float = 20.0
     long_bridge_attachment_max_mb: int = 20
+    long_bridge_inbound_dedupe_sec: float = 120.0
     long_bridge_fail_open: bool = True
     agent_actions_enabled: bool = True
     agent_actions_max_per_turn: int = 2
@@ -353,6 +366,7 @@ class AppConfig:
         default_factory=lambda: ["@助手", "@机器人", "机器人", "bot", "小助手", "@萨比", "萨比"]
     )
     ignore_title_keywords: list[str] = field(default_factory=lambda: ["折叠的聊天"])
+    ignore_exact_titles: list[str] = field(default_factory=lambda: ["微信"])
     use_manual_row_boxes: bool = False
     manual_row_boxes_path: str = "data/manual_row_boxes.json"
     row_title_region_enabled: bool = False
@@ -609,6 +623,36 @@ def load_config(path: str | Path | None) -> AppConfig:
         capture_backend if capture_backend in {"screencapture", "quartz"} else "screencapture"
     )
     cfg.detached_debug_save = bool(data.get("detached_debug_save", cfg.detached_debug_save))
+    cfg.detached_window_resize_on_start = bool(
+        data.get("detached_window_resize_on_start", cfg.detached_window_resize_on_start)
+    )
+    try:
+        cfg.detached_window_standard_width = max(
+            0,
+            int(data.get("detached_window_standard_width", cfg.detached_window_standard_width)),
+        )
+    except (TypeError, ValueError):
+        pass
+    try:
+        cfg.detached_window_standard_height = max(
+            0,
+            int(data.get("detached_window_standard_height", cfg.detached_window_standard_height)),
+        )
+    except (TypeError, ValueError):
+        pass
+    cfg.ocr_worker_enabled = bool(data.get("ocr_worker_enabled", cfg.ocr_worker_enabled))
+    cfg.ocr_worker_max_rss_mb = max(
+        256,
+        int(data.get("ocr_worker_max_rss_mb", cfg.ocr_worker_max_rss_mb)),
+    )
+    cfg.ocr_worker_request_timeout_sec = max(
+        2.0,
+        float(data.get("ocr_worker_request_timeout_sec", cfg.ocr_worker_request_timeout_sec)),
+    )
+    cfg.ocr_worker_ready_timeout_sec = max(
+        2.0,
+        float(data.get("ocr_worker_ready_timeout_sec", cfg.ocr_worker_ready_timeout_sec)),
+    )
     cfg.detached_reply_on_image = bool(
         data.get("detached_reply_on_image", cfg.detached_reply_on_image)
     )
@@ -824,6 +868,15 @@ def load_config(path: str | Path | None) -> AppConfig:
             )
         ),
     )
+    cfg.long_bridge_inbound_dedupe_sec = max(
+        0.0,
+        float(
+            data.get(
+                "long_bridge_inbound_dedupe_sec",
+                cfg.long_bridge_inbound_dedupe_sec,
+            )
+        ),
+    )
     cfg.long_bridge_fail_open = bool(
         data.get("long_bridge_fail_open", cfg.long_bridge_fail_open)
     )
@@ -1019,6 +1072,9 @@ def load_config(path: str | Path | None) -> AppConfig:
     ignore_title_keywords = data.get("ignore_title_keywords", cfg.ignore_title_keywords)
     if isinstance(ignore_title_keywords, list):
         cfg.ignore_title_keywords = [str(x) for x in ignore_title_keywords]
+    ignore_exact_titles = data.get("ignore_exact_titles", cfg.ignore_exact_titles)
+    if isinstance(ignore_exact_titles, list):
+        cfg.ignore_exact_titles = [str(x) for x in ignore_exact_titles]
     cfg.use_manual_row_boxes = bool(
         data.get("use_manual_row_boxes", cfg.use_manual_row_boxes)
     )

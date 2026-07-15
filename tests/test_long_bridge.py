@@ -6,6 +6,7 @@ from pathlib import Path
 import threading
 from types import SimpleNamespace
 
+from wechat_rpa.bot import WeChatGuiRpaBot
 from wechat_rpa.config import load_config
 from wechat_rpa.long_bridge import LongBridgeClient, _PendingTurn
 
@@ -21,6 +22,7 @@ def _cfg(tmp_path: Path):
         long_bridge_reconnect_max_sec=1.0,
         long_bridge_heartbeat_sec=20.0,
         long_bridge_attachment_max_mb=2,
+        long_bridge_inbound_dedupe_sec=120.0,
     )
 
 
@@ -164,3 +166,65 @@ long_bridge_account_id = "work"
     assert cfg.long_bridge_url == "ws://remote:18789/weauto/channel"
     assert cfg.long_bridge_token == "token"
     assert cfg.long_bridge_account_id == "work"
+
+
+def test_completed_request_is_suppressed_during_dedupe_window(tmp_path: Path) -> None:
+    client = LongBridgeClient(_cfg(tmp_path))
+    client.start = lambda: None
+    client._recent_completed["same-event"] = 1.0e12
+
+    result = client.request_reply(
+        {"event_id": "same-event", "message": {"text": "duplicate"}}
+    )
+
+    assert result.send is False
+    assert client._pending == {}
+
+
+def test_inflight_request_is_not_replaced_by_duplicate(tmp_path: Path) -> None:
+    client = LongBridgeClient(_cfg(tmp_path))
+    client.start = lambda: None
+    original = _PendingTurn(request_id="same-event", frame={})
+    client._pending["same-event"] = original
+
+    result = client.request_reply(
+        {"event_id": "same-event", "message": {"text": "duplicate"}}
+    )
+
+    assert result.send is False
+    assert client._pending["same-event"] is original
+
+
+def test_long_bridge_event_id_is_stable_for_the_same_position_fingerprint() -> None:
+    bot = object.__new__(WeChatGuiRpaBot)
+    bot.cfg = SimpleNamespace(receiver_mode="detached_windows")
+    bot.long_bridge_client = SimpleNamespace(build_attachment=lambda _path: None)
+    bot._session_key_for_row = lambda _row: "wechat:group:测试群"
+    bot._sender_from_prefixed_text = lambda _text: ""
+    row = SimpleNamespace(title="测试群", preview="叫我帅亮", text="叫我帅亮")
+    source = {
+        "sender": "刘晓亮",
+        "text": "叫我帅亮",
+        "content_type": "text",
+        "fingerprint": "vision|other|text|刘晓亮|叫我帅亮|0",
+    }
+
+    first = bot._long_bridge_event_payload(
+        row,
+        reason="mention",
+        is_group=True,
+        is_admin=False,
+        latest_message="叫我帅亮",
+        source_message=source,
+    )
+    second = bot._long_bridge_event_payload(
+        row,
+        reason="mention",
+        is_group=True,
+        is_admin=False,
+        latest_message="叫我帅亮",
+        source_message=source,
+    )
+
+    assert first["event_id"] == second["event_id"]
+    assert first["message"]["text"] == "叫我帅亮"

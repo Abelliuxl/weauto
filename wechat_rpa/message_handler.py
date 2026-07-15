@@ -195,7 +195,7 @@ class MessageHandler:
             bot._save_persistent_memory()
             return
 
-        if is_admin:
+        if bot._should_handle_admin_command_locally(is_admin):
             cmd_line = bot._extract_admin_command_text(row, context_snapshot)
             if cmd_line:
                 bot._append_session_item(row, "U", cmd_line)

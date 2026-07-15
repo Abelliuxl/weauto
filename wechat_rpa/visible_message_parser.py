@@ -6,6 +6,7 @@ from pathlib import Path
 import re
 import time
 from typing import Any
+import unicodedata
 
 import cv2
 import numpy as np
@@ -53,6 +54,12 @@ def _normalize_text(text: str) -> str:
     clean = re.sub(r"\s+", " ", str(text or "")).strip()
     # Common RapidOCR case drift for CLI names in the chat UI.
     return clean.replace("wX-", "wx-").replace("WX-", "wx-")
+
+
+def normalize_message_fingerprint_text(text: str) -> str:
+    """Normalize OCR-only drift without changing the message shown to the agent."""
+    normalized = unicodedata.normalize("NFKC", str(text or ""))
+    return re.sub(r"\s+", "", normalized).strip()
 
 
 def _contains(box: list[int], x: float, y: float, *, pad: int = 0) -> bool:
@@ -159,7 +166,10 @@ class VisibleMessageParser:
                     text=text,
                     mentions=mentions,
                     bbox=block.bbox,
-                    fingerprint=f"{block.side}|text|{sender}|{text}",
+                    fingerprint=(
+                        f"{block.side}|text|{sender}|"
+                        f"{normalize_message_fingerprint_text(text)}"
+                    ),
                 )
             )
 
@@ -202,7 +212,69 @@ class VisibleMessageParser:
         # bounds skip the title/header and the input toolbar.
         return 190, min(height - 210, 1720)
 
-    def _detect_blocks(self, img_bgr: np.ndarray, *, body_y1: int, body_y2: int) -> list[MessageBlock]:
+    @staticmethod
+    def text_anchors(image: Image.Image | np.ndarray, ocr_engine: OcrEngine, *, limit: int = 18) -> list[dict[str, Any]]:
+        img_bgr = VisibleMessageParser._to_bgr(image)
+        height = img_bgr.shape[0]
+        body_y1, body_y2 = VisibleMessageParser._chat_body_bounds(height)
+        body_y1 = max(0, min(height, body_y1))
+        body_y2 = max(body_y1, min(height, body_y2))
+        anchors: list[dict[str, Any]] = []
+        for line in ocr_engine.detect_lines(img_bgr[body_y1:body_y2, :]):
+            text = _normalize_text(line.text)
+            key = VisibleMessageParser._anchor_text_key(text)
+            if not key:
+                continue
+            anchors.append(
+                {
+                    "text": text[:120],
+                    "key": key,
+                    "x": round(float(line.x_center), 1),
+                    "y": round(float(line.y_center + body_y1), 1),
+                    "score": round(float(line.score), 4),
+                }
+            )
+        anchors.sort(key=lambda item: (float(item["y"]), float(item["x"])))
+        return anchors[-max(1, int(limit)) :]
+
+    @staticmethod
+    def _anchor_text_key(text: str) -> str:
+        clean = _normalize_text(text)
+        clean = re.sub(r"\s+", "", clean)
+        if not clean or _TIME_RE.match(clean):
+            return ""
+        if len(clean) < 4:
+            return ""
+        if not re.search(r"[\w\u4e00-\u9fff]", clean):
+            return ""
+        return clean[:80]
+
+    @staticmethod
+    def chat_body_hash(image: Image.Image | np.ndarray, *, mask_media: bool = False) -> str:
+        img_bgr = VisibleMessageParser._to_bgr(image)
+        height, width = img_bgr.shape[:2]
+        body_y1, body_y2 = VisibleMessageParser._chat_body_bounds(height)
+        body_y1 = max(0, min(height, body_y1))
+        body_y2 = max(body_y1, min(height, body_y2))
+        if mask_media:
+            img_bgr = img_bgr.copy()
+            blocks = VisibleMessageParser._detect_blocks(img_bgr, body_y1=body_y1, body_y2=body_y2)
+            for block in blocks:
+                if block.kind != "image":
+                    continue
+                x1, y1, x2, y2 = [int(v) for v in block.bbox]
+                x1 = max(0, min(width, x1))
+                x2 = max(0, min(width, x2))
+                y1 = max(body_y1, min(body_y2, y1))
+                y2 = max(body_y1, min(body_y2, y2))
+                if x2 > x1 and y2 > y1:
+                    img_bgr[y1:y2, x1:x2] = (235, 235, 235)
+        crop = img_bgr[body_y1:body_y2, :]
+        small = cv2.resize(cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY), (96, 160))
+        return hashlib.sha1(small.tobytes()).hexdigest()
+
+    @staticmethod
+    def _detect_blocks(img_bgr: np.ndarray, *, body_y1: int, body_y2: int) -> list[MessageBlock]:
         height, width = img_bgr.shape[:2]
         b, g, r = cv2.split(img_bgr)
         body = np.zeros((height, width), dtype=np.uint8)
@@ -237,21 +309,24 @@ class VisibleMessageParser:
             )
             > 28
         )
-        avatars = self._detect_avatar_boxes(non_background & (body > 0), width)
+        avatars = VisibleMessageParser._detect_avatar_boxes(non_background & (body > 0), width)
 
         blocks: list[MessageBlock] = []
-        for box in self._mask_boxes(non_background & (body > 0)):
+        for box in VisibleMessageParser._mask_boxes(non_background & (body > 0)):
             x, y, bw, bh = box
-            if x < width * 0.15:
+            bbox = [x, y, x + bw, y + bh]
+            if x < max(90, int(width * 0.055)):
                 continue
-            if bw >= 150 and bh >= 120:
-                if self._bubble_fill_ratio(green | gray_bubble, [x, y, x + bw, y + bh]) >= 0.45:
+            if any(VisibleMessageParser._boxes_overlap(bbox, avatar_box, min_ratio=0.45) for _, avatar_box in avatars):
+                continue
+            if bw >= 80 and bh >= 80 and bw * bh >= 6000:
+                if VisibleMessageParser._bubble_fill_ratio(green | gray_bubble, bbox) >= 0.45:
                     continue
-                side = self._infer_block_side([x, y, x + bw, y + bh], width, avatars)
-                blocks.append(MessageBlock(kind="image", side=side, bbox=[x, y, x + bw, y + bh]))
+                side = VisibleMessageParser._infer_block_side(bbox, width, avatars)
+                blocks.append(MessageBlock(kind="image", side=side, bbox=bbox))
 
         for kind, mask in (("self_text", green), ("other_text", gray_bubble)):
-            boxes = self._mask_boxes(mask & (body > 0))
+            boxes = VisibleMessageParser._mask_boxes(mask & (body > 0))
             for x, y, bw, bh in _merge_boxes(boxes):
                 if kind == "self_text":
                     if bh >= 35:
@@ -261,9 +336,9 @@ class VisibleMessageParser:
                     continue
                 if bw <= 120 or bh < 42:
                     continue
-                if any(self._boxes_overlap([x, y, x + bw, y + bh], image.bbox, min_ratio=0.45) for image in blocks if image.kind == "image"):
+                if any(VisibleMessageParser._boxes_overlap([x, y, x + bw, y + bh], image.bbox, min_ratio=0.45) for image in blocks if image.kind == "image"):
                     continue
-                side = self._infer_block_side([x, y, x + bw, y + bh], width, avatars)
+                side = VisibleMessageParser._infer_block_side([x, y, x + bw, y + bh], width, avatars)
                 blocks.append(MessageBlock(kind="text", side=side, bbox=[x, y, x + bw, y + bh]))
         return sorted(blocks, key=lambda block: (block.bbox[1], block.bbox[0]))
 

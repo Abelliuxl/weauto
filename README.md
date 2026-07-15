@@ -60,7 +60,8 @@ receiver_mode = "detached_windows"
 ./start_app.sh
 ```
 
-脚本会创建 `.venv312`、同步依赖、安装 Playwright Chromium，并启动菜单栏控制面板。
+脚本使用独立 UV 和 UV 托管的 Python 3.12 创建 `.venv312`、同步依赖、安装
+Playwright Chromium，并启动菜单栏控制面板；不依赖 Homebrew Python。
 确认检测和日志正常后，再把 `dry_run` 改为 `false`。
 
 ### 5. 日常启动

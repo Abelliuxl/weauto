@@ -10,6 +10,9 @@ detached_window_output_dir = "data/detached_window_images"
 # screencapture: memory-stable but slower; quartz: faster but may grow Mach memory, use watchdog.
 detached_window_capture_backend = "screencapture"
 detached_debug_save = false
+detached_window_resize_on_start = false
+detached_window_standard_width = 852
+detached_window_standard_height = 970
 detached_reply_on_image = false
 detached_process_existing_on_start = false
 detached_vision_parse_enabled = false
@@ -19,7 +22,7 @@ detached_vision_parse_enabled = false
 # ============================================================
 poll_interval_sec = 1.0
 action_cooldown_sec = 8.0
-normal_reply_interval_sec = 60.0
+normal_reply_interval_sec = 300.0
 dry_run = true
 activate_wait_sec = 0.6
 click_move_duration_sec = 0.18
@@ -34,7 +37,7 @@ log_verbose = true
 debug_scan = false
 skip_first_action_on_start = true
 memory_gc_interval_sec = 60.0
-memory_watchdog_max_rss_mb = 8192
+memory_watchdog_max_rss_mb = 1536
 
 # ============================================================
 # Session Memory
@@ -108,6 +111,8 @@ long_bridge_reconnect_min_sec = 1.0
 long_bridge_reconnect_max_sec = 30.0
 long_bridge_heartbeat_sec = 20.0
 long_bridge_attachment_max_mb = 20
+# Suppress the same stable inbound event briefly without changing position rules.
+long_bridge_inbound_dedupe_sec = 120.0
 long_bridge_fail_open = true
 
 # ============================================================
@@ -203,6 +208,7 @@ group_only_reply_when_mentioned = false
 group_allow_llm_no_reply = false
 group_reply_keywords = ["@助手", "@机器人", "机器人", "bot", "小助手", "@萨比", "萨比"]
 ignore_title_keywords = ["折叠的聊天"]
+ignore_exact_titles = ["微信"]
 
 # ============================================================
 # Legacy List Mode Geometry

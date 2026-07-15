@@ -20,6 +20,8 @@
     <string>APPL</string>
     <key>LSMinimumSystemVersion</key>
     <string>12.0</string>
+    <key>NSScreenCaptureUsageDescription</key>
+    <string>WeAuto needs screen recording access to find and capture detached WeChat chat windows.</string>
     <!-- Run as a background agent: menu-bar icon only, no Dock icon, no app menu bar. -->
     <key>LSUIElement</key>
     <true/>
