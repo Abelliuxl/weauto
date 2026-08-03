@@ -47,6 +47,10 @@ Windows 先在 PowerShell 运行 `.\start_app.ps1` 查看错误。重点检查�
 
 App 设置了 `LSUIElement`，没有普通 Dock 窗口是预期行为。
 
+如果菜单可以展开但启动、停止或重启没有反应，先查看 `logs/app_launcher.log`。macOS
+桌面通知是可选能力；UV 托管的 standalone Python 可能没有主 bundle identifier，通知失败
+不应阻断 supervisor 操作。
+
 ## 4. Web UI 无法访问
 
 ```bash

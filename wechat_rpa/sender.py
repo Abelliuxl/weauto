@@ -54,7 +54,7 @@ class WeChatGuiSender:
             from .win32 import activate_app
 
             target = activate_app(self.cfg.app_name, clean_title)
-            if target is None:
+            if target is None or target.title.strip().casefold() != clean_title.casefold():
                 self.activate()
                 return False
             time.sleep(max(0.05, self.cfg.activate_wait_sec))
@@ -75,7 +75,7 @@ tell application "System Events"
     set frontmost to true
     repeat with w in windows
       try
-        if (name of w) contains "{quoted_title}" then
+        if (name of w) is "{quoted_title}" then
           perform action "AXRaise" of w
           return "ok"
         end if
@@ -122,7 +122,7 @@ return "not_found"
             from .win32 import activate_app
 
             target = activate_app(self.cfg.app_name, clean_title)
-            if target is None:
+            if target is None or target.title.strip().casefold() != clean_title.casefold():
                 return False
             time.sleep(max(0.05, self.cfg.activate_wait_sec))
             point = getattr(self.cfg, "input_point", None)
@@ -149,7 +149,7 @@ tell application "System Events"
     set frontmost to true
     repeat with w in windows
       try
-        if (name of w) contains "{quoted_title}" then
+        if (name of w) is "{quoted_title}" then
           perform action "AXRaise" of w
           set p to position of w
           set s to size of w
@@ -302,19 +302,19 @@ return "not_found"
 
     def paste_and_send_to_window(self, title: str, message: str) -> bool:
         raised = self.activate_chat_window(title)
-        if IS_WINDOWS and not raised:
+        if not raised:
             return False
         self.paste_and_send(message)
-        return raised
+        return True
 
     def mention_and_send_to_window(self, title: str, mention_name: str, message: str) -> bool:
         raised = self.activate_chat_window(title) if IS_WINDOWS else self.click_chat_input_for_window(title)
         if (not IS_WINDOWS) and not raised:
             raised = self.activate_chat_window(title)
-        if IS_WINDOWS and not raised:
+        if not raised:
             return False
         self.mention_and_send(mention_name, message)
-        return raised
+        return True
 
     def paste_file_and_send(self, file_path: Path) -> bool:
         import pyautogui
@@ -377,7 +377,7 @@ return "not_found"
 
     def paste_file_and_send_to_window(self, title: str, file_path: Path) -> bool:
         raised = self.activate_chat_window(title)
-        if IS_WINDOWS and not raised:
+        if not raised:
             return False
         sent = self.paste_file_and_send(file_path)
-        return bool(raised and sent)
+        return bool(sent)

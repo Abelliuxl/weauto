@@ -1,6 +1,18 @@
 from types import SimpleNamespace
 
+import pytest
+
 from wechat_rpa.bot import WeChatGuiRpaBot
+
+
+@pytest.fixture(autouse=True)
+def _isolate_runtime_state_writes(monkeypatch):
+    """Selection tests must never overwrite the live bot's runtime state."""
+    monkeypatch.setattr(
+        WeChatGuiRpaBot,
+        "_save_runtime_state",
+        lambda self, **kwargs: None,
+    )
 
 
 def _msg(text: str, side: str = "other"):

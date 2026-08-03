@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from difflib import SequenceMatcher
 import re
-import shutil
 import time
 import urllib.parse
 from typing import TYPE_CHECKING
@@ -959,27 +958,6 @@ class ActionProcessor:
             traces.append(trace)
             if obs:
                 observations.append(obs)
-            heartbeat_internal_tool = (
-                (row.row_idx < 0 or row.title == "__heartbeat__")
-                and tool in {
-                    "read_memory",
-                    "recall_memory",
-                    "remember_fact",
-                    "read_impression",
-                    "update_impression",
-                    "write_impression",
-                    "write_memory",
-                    "read_skill",
-                    "update_skill",
-                    "write_skill",
-                    "delete_skill",
-                    "list_skills",
-                    "read_chat_history",
-                    "read_chat_history_by_date",
-                    "summarize_chat_history",
-                    "search_chat_history",
-                }
-            )
             session_memory_tools = {
                 "read_memory",
                 "recall_memory",

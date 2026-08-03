@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from wechat_rpa.action_processor import _normalize_managed_heading
+from wechat_rpa.action_processor import _normalize_managed_heading  # noqa: E402
 
 
 def _backup_file(path: Path, *, backup_root: Path) -> Path:

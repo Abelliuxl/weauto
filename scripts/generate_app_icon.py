@@ -9,7 +9,6 @@ Requires Pillow (already a project dependency) and iconutil (built into macOS).
 """
 from __future__ import annotations
 
-import os
 import shutil
 import subprocess
 from pathlib import Path

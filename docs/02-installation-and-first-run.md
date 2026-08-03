@@ -113,6 +113,8 @@ Windows：
 
 首次依赖安装可能需要网络。
 
+QWeather JWT 使用项目内 `cryptography` 完成 Ed25519 签名，不依赖 Homebrew OpenSSL。
+
 ## 6. 首次验证
 
 保持：

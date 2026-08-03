@@ -2690,8 +2690,6 @@ class LlmReplyGenerator:
                 },
                 "required": ["prompt"],
             },
-            "mute_session": {                "required": ["note"],
-            },
             "maintain_memory": {
                 "description": "Admin only: consolidate recent memory into MEMORY.md.",
                 "properties": {"days": {"type": "integer", "minimum": 1, "maximum": 14}},

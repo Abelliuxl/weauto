@@ -7,11 +7,13 @@ import { WebSocket, WebSocketServer } from "ws";
 
 const CHANNEL_ID = "weauto";
 const ROUTE_PATH = "/weauto/channel";
-const PROTOCOL_VERSION = 1;
+const PROTOCOL_VERSION = 2;
 const DEFAULT_ACCOUNT_ID = "default";
 const accountStates = new Map();
 const conversationDirectory = new Map();
+const pendingDeliveries = new Map();
 const turnCache = new Map();
+const DELIVERY_TIMEOUT_MS = 30_000;
 const wss = new WebSocketServer({
   noServer: true,
   maxPayload: 64 * 1024 * 1024,
@@ -97,6 +99,54 @@ function rememberConversation(accountId, conversation) {
   });
 }
 
+export function syncConversationDirectory(accountId, conversations) {
+  const resolvedAccountId = String(accountId || DEFAULT_ACCOUNT_ID);
+  const prefix = `${resolvedAccountId}:`;
+  for (const key of conversationDirectory.keys()) {
+    if (key.startsWith(prefix)) conversationDirectory.delete(key);
+  }
+  let count = 0;
+  for (const conversation of Array.isArray(conversations) ? conversations : []) {
+    const id = String(conversation?.id || "").trim();
+    const title = String(conversation?.title || "").trim();
+    if (!id || !title) continue;
+    rememberConversation(resolvedAccountId, {
+      id,
+      title,
+      kind: conversation?.kind === "group" ? "group" : "direct",
+    });
+    count += 1;
+  }
+  return count;
+}
+
+export function listConversationDirectory({ accountId, kind, query, limit }) {
+  const resolvedAccountId = String(accountId || DEFAULT_ACCOUNT_ID);
+  const prefix = `${resolvedAccountId}:`;
+  const needle = String(query || "").trim().toLocaleLowerCase();
+  const entries = [...conversationDirectory.entries()]
+    .filter(
+      ([key, conversation]) =>
+        key.startsWith(prefix) && conversation.kind === kind,
+    )
+    .map(([, conversation]) => ({
+      id: conversation.id,
+      name: conversation.title,
+      kind: kind === "group" ? "group" : "user",
+    }))
+    .filter(
+      (entry) =>
+        !needle ||
+        entry.id.toLocaleLowerCase().includes(needle) ||
+        entry.name.toLocaleLowerCase().includes(needle),
+    )
+    .sort((left, right) => left.name.localeCompare(right.name));
+  const resolvedLimit = Number(limit);
+  return Number.isFinite(resolvedLimit) && resolvedLimit > 0
+    ? entries.slice(0, resolvedLimit)
+    : entries;
+}
+
 function emitTurnFrame(entry, frame) {
   entry.frames.push(frame);
   for (const ws of entry.waiters) sendJson(ws, frame);
@@ -169,13 +219,35 @@ async function encodeOutboundAttachment(account, mediaUrl) {
   };
 }
 
-function outboundFrame({ accountId, to, text, attachments = [], requestId }) {
+export function stripTargetKindPrefix(raw) {
+  return String(raw || "")
+    .replace(/^(user|channel|group|conversation|room|dm):/i, "")
+    .trim();
+}
+
+export function outboundFrame({ accountId, to, text, attachments = [], requestId }) {
+  const raw = String(to || "").trim();
+  const kindHint = /^group:/i.test(raw)
+    ? "group"
+    : /^(user|dm):/i.test(raw)
+      ? "direct"
+      : undefined;
+  const lookupId = stripTargetKindPrefix(raw);
+  if (!lookupId) throw new Error("weauto target is empty");
   const conversation =
-    conversationDirectory.get(conversationKey(accountId, to)) || {
-      id: to,
-      title: to,
-      kind: "direct",
-    };
+    conversationDirectory.get(conversationKey(accountId, lookupId)) ||
+    conversationDirectory.get(conversationKey(accountId, raw));
+  if (!conversation) {
+    throw new Error(
+      `Unknown or unsynchronized target "${lookupId}" for weauto`,
+    );
+  }
+  if (kindHint && conversation.kind !== kindHint) {
+    throw new Error(
+      `weauto target kind mismatch for "${lookupId}": ` +
+        `expected ${kindHint}, got ${conversation.kind}`,
+    );
+  }
   return {
     type: "message.send",
     version: PROTOCOL_VERSION,
@@ -185,6 +257,48 @@ function outboundFrame({ accountId, to, text, attachments = [], requestId }) {
     text: String(text || ""),
     attachments,
   };
+}
+
+export function settleDeliveryReceipt(ws, frame) {
+  const messageId = String(frame?.message_id || "");
+  const pending = pendingDeliveries.get(messageId);
+  if (!pending || pending.ws !== ws) return false;
+  pendingDeliveries.delete(messageId);
+  clearTimeout(pending.timer);
+  if (frame.ok === true) {
+    pending.resolve();
+  } else {
+    pending.reject(
+      new Error(String(frame.error || "weauto client failed to deliver message")),
+    );
+  }
+  return true;
+}
+
+function rejectSocketDeliveries(ws, reason) {
+  for (const [messageId, pending] of pendingDeliveries) {
+    if (pending.ws !== ws) continue;
+    pendingDeliveries.delete(messageId);
+    clearTimeout(pending.timer);
+    pending.reject(new Error(reason));
+  }
+}
+
+export function sendWithDeliveryReceipt(ws, frame, timeoutMs = DELIVERY_TIMEOUT_MS) {
+  const messageId = String(frame?.message_id || "");
+  if (!messageId) return Promise.reject(new Error("message_id is required"));
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      pendingDeliveries.delete(messageId);
+      reject(new Error(`weauto delivery timeout for message ${messageId}`));
+    }, Math.max(1, Number(timeoutMs) || DELIVERY_TIMEOUT_MS));
+    pendingDeliveries.set(messageId, { ws, resolve, reject, timer });
+    if (!sendJson(ws, frame)) {
+      pendingDeliveries.delete(messageId);
+      clearTimeout(timer);
+      reject(new Error("weauto client disconnected before send"));
+    }
+  });
 }
 
 export function shouldDeliverReply(payload, info) {
@@ -358,7 +472,13 @@ async function dispatchInbound(state, ws, frame) {
 
 function installSocket(ws, req, state) {
   state.connections.add(ws);
-  ws.on("close", () => state.connections.delete(ws));
+  ws.on("close", () => {
+    state.connections.delete(ws);
+    rejectSocketDeliveries(
+      ws,
+      "weauto client disconnected before delivery confirmation",
+    );
+  });
   ws.on("error", (error) =>
     state.log?.error?.(`weauto websocket: ${String(error)}`),
   );
@@ -380,6 +500,29 @@ function installSocket(ws, req, state) {
         }
         if (frame.type === "ping") {
           sendJson(ws, { type: "pong", timestamp_ms: Date.now() });
+          return;
+        }
+        if (frame.type === "conversation.sync") {
+          if (Number(frame.version) !== PROTOCOL_VERSION) {
+            throw new Error(`unsupported protocol version: ${frame.version}`);
+          }
+          const count = syncConversationDirectory(
+            state.account.accountId,
+            frame.conversations,
+          );
+          state.log?.info?.(
+            `weauto conversation directory synchronized ` +
+              `account=${state.account.accountId} count=${count}`,
+          );
+          sendJson(ws, {
+            type: "conversation.synced",
+            revision: Number(frame.revision || 0),
+            count,
+          });
+          return;
+        }
+        if (frame.type === "message.delivered") {
+          settleDeliveryReceipt(ws, frame);
           return;
         }
         if (frame.type === "message.received" || frame.type === "pong") return;
@@ -435,7 +578,7 @@ async function sendProactive({ cfg, accountId, to, text, mediaUrl }) {
     text,
     attachments: attachment ? [attachment] : [],
   });
-  sendJson(ws, frame);
+  await sendWithDeliveryReceipt(ws, frame);
   return { channel: CHANNEL_ID, messageId: frame.message_id };
 }
 
@@ -479,6 +622,23 @@ const weautoChannel = {
     chatTypes: ["direct", "group"],
     media: true,
     blockStreaming: true,
+  },
+  directory: {
+    self: async () => null,
+    listPeers: async ({ accountId, query, limit }) =>
+      listConversationDirectory({
+        accountId,
+        kind: "direct",
+        query,
+        limit,
+      }),
+    listGroups: async ({ accountId, query, limit }) =>
+      listConversationDirectory({
+        accountId,
+        kind: "group",
+        query,
+        limit,
+      }),
   },
   reload: { configPrefixes: ["channels.weauto"] },
   config: {

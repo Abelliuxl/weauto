@@ -7,12 +7,13 @@ import gzip
 import json
 from pathlib import Path
 import ssl
-import subprocess
-import tempfile
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 
 class QWeatherError(RuntimeError):
@@ -50,28 +51,17 @@ def build_qweather_jwt(
     header = _json_b64url({"alg": "EdDSA", "kid": kid})
     payload = _json_b64url({"sub": sub, "iat": now, "exp": now + ttl})
     signing_input = f"{header}.{payload}"
-
-    with tempfile.NamedTemporaryFile("wb", delete=True) as fp:
-        fp.write(signing_input.encode("ascii"))
-        fp.flush()
-        proc = subprocess.run(
-            [
-                "openssl",
-                "pkeyutl",
-                "-sign",
-                "-inkey",
-                str(key_path),
-                "-rawin",
-                "-in",
-                fp.name,
-            ],
-            check=False,
-            capture_output=True,
+    try:
+        private_key = serialization.load_pem_private_key(
+            key_path.read_bytes(),
+            password=None,
         )
-    if proc.returncode != 0:
-        detail = proc.stderr.decode("utf-8", errors="replace").strip()
-        raise QWeatherError(f"qweather jwt signing failed: {detail or proc.returncode}")
-    return f"{signing_input}.{_b64url(proc.stdout)}"
+        if not isinstance(private_key, Ed25519PrivateKey):
+            raise TypeError("private key is not Ed25519")
+        signature = private_key.sign(signing_input.encode("ascii"))
+    except (OSError, TypeError, ValueError) as exc:
+        raise QWeatherError(f"qweather jwt signing failed: {exc}") from exc
+    return f"{signing_input}.{_b64url(signature)}"
 
 
 class QWeatherClient:

@@ -482,7 +482,6 @@ def test_run_worker_emits_ready_then_snapshots(monkeypatch):
             pass
 
     import wechat_rpa.detached_window_receiver as dwr
-    import wechat_rpa.visible_message_parser as vmp
 
     monkeypatch.setattr(dwr, "capture_window_by_id", _fake_capture)
     # run_worker imports capture_window_by_id locally from the module above, so
@@ -559,7 +558,6 @@ def test_run_worker_exits_on_rss_limit_before_capture(monkeypatch):
             )
 
     import wechat_rpa.detached_window_receiver as dwr
-    import wechat_rpa.visible_message_parser as vmp
     import wechat_rpa.ocr as ocr_mod
 
     monkeypatch.setattr(dwr, "capture_window_by_id", _fake_capture)

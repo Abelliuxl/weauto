@@ -13,6 +13,17 @@ BUNDLE_ROOT="$(cd "$APP_ROOT/.." && pwd)"           # .../WeAuto.app
 PROJECT_ROOT="$(cd "$BUNDLE_ROOT/.." && pwd)"       # <repo root>
 cd "$PROJECT_ROOT"
 
+# LaunchServices normally connects stdout/stderr to /dev/null.  Keep a small
+# control-panel log so menu callback and supervisor errors remain diagnosable.
+LOG_DIR="$PROJECT_ROOT/logs"
+APP_LOG="$LOG_DIR/app_launcher.log"
+mkdir -p "$LOG_DIR"
+if [[ -f "$APP_LOG" ]] && [[ "$(stat -f%z "$APP_LOG" 2>/dev/null || echo 0)" -gt 5242880 ]]; then
+  mv -f "$APP_LOG" "$APP_LOG.1"
+fi
+exec >> "$APP_LOG" 2>&1
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] [launcher] starting WeAuto.app"
+
 # Load optional env files (same as start_app.sh).
 for env_file in "$PROJECT_ROOT/.env.weauto" "$PROJECT_ROOT/.env"; do
   if [[ -f "$env_file" ]]; then
@@ -29,7 +40,7 @@ export WEAUTO_LOG_WIDTH="${WEAUTO_LOG_WIDTH:-140}"
 PYTHON="$PROJECT_ROOT/.venv312/bin/python"
 if [[ ! -x "$PYTHON" ]]; then
   # No venv yet — can't show a GUI dialog easily from a background agent, so
-  # write to stderr (visible in Console.app) and bail out.
+  # leave a durable diagnostic in app_launcher.log and bail out.
   echo "[WeAuto] venv not found at $PYTHON" >&2
   echo "[WeAuto] Run once in Terminal: cd $PROJECT_ROOT && ./start_app.sh --headless --no-bot" >&2
   exit 1
