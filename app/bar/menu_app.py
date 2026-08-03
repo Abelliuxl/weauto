@@ -10,15 +10,19 @@ the need to ship image assets. A real template icon could be added later.
 """
 from __future__ import annotations
 
+import logging
 import threading
 import time
 import webbrowser
+from collections.abc import Callable
 from typing import Any
 
 import rumps
 
 from ..config import WebUIConfig
 from ..supervisor import BotSupervisor
+
+LOG = logging.getLogger("weauto.app.menu")
 
 
 class ControlBarApp(rumps.App):
@@ -120,31 +124,59 @@ class ControlBarApp(rumps.App):
     # ------------------------------------------------------------------ #
     # Menu callbacks
     # ------------------------------------------------------------------ #
+    @staticmethod
+    def _notify(subtitle: str, message: str) -> None:
+        """Best-effort notification that can never block a menu action.
+
+        UV-managed standalone Python builds do not expose a macOS main-bundle
+        identifier.  On those interpreters rumps cannot create an
+        NSUserNotificationCenter and raises RuntimeError.  Menu controls must
+        remain functional even when notifications are unavailable.
+        """
+        try:
+            rumps.notification("WeAuto", subtitle, message)
+        except Exception as exc:  # noqa: BLE001 - optional desktop integration
+            LOG.warning("notification unavailable: %s", exc)
+
+    @staticmethod
+    def _run_action(name: str, action: Callable[[], None]) -> None:
+        """Run a supervisor action off the AppKit thread and log failures."""
+
+        def target() -> None:
+            try:
+                action()
+            except Exception:  # noqa: BLE001 - keep the menu process alive
+                LOG.exception("menu action failed: %s", name)
+
+        threading.Thread(
+            target=target,
+            name=f"weauto-menu-{name}",
+            daemon=True,
+        ).start()
+
     def on_open(self, _sender: Any) -> None:
         try:
             webbrowser.open(self._web_url)
         except Exception:
-            rumps.notification("WeAuto", "无法打开浏览器", self._web_url)
+            self._notify("无法打开浏览器", self._web_url)
 
     def on_restart(self, _sender: Any) -> None:
-        rumps.notification("WeAuto", "重启 Bot", "正在重启子进程…")
-        threading.Thread(target=self.sup.restart_bot, daemon=True).start()
+        self._run_action("restart", self.sup.restart_bot)
+        self._notify("重启 Bot", "正在重启子进程…")
 
     def on_stop(self, _sender: Any) -> None:
-        rumps.notification("WeAuto", "停止 Bot", "已请求停止（不会自动重启）")
-        threading.Thread(target=self.sup.stop_bot, daemon=True).start()
+        self._run_action("stop", self.sup.stop_bot)
+        self._notify("停止 Bot", "已请求停止（不会自动重启）")
 
     def on_start(self, _sender: Any) -> None:
-        rumps.notification("WeAuto", "启动 Bot", "正在拉起子进程…")
-        threading.Thread(target=self.sup.start_bot, daemon=True).start()
+        self._run_action("start", self.sup.start_bot)
+        self._notify("启动 Bot", "正在拉起子进程…")
 
     def on_toggle_auto(self, sender: rumps.MenuItem) -> None:
         new_state = not sender.state
         sender.state = new_state
         self.sup.set_auto_restart(new_state)
-        rumps.notification(
-            "WeAuto", "自动重启", "已开启" if new_state else "已关闭"
-        )
+        self._notify("自动重启", "已开启" if new_state else "已关闭")
 
     def on_about(self, _sender: Any) -> None:
         rumps.alert(
@@ -159,7 +191,7 @@ class ControlBarApp(rumps.App):
 
     def on_quit(self, _sender: Any) -> None:
         try:
-            rumps.notification("WeAuto", "退出", "正在停止 Bot 并退出…")
+            self._notify("退出", "正在停止 Bot 并退出…")
             self.sup.shutdown()
         finally:
             rumps.quit_application()

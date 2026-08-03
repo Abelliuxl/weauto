@@ -4,7 +4,6 @@ import base64
 from dataclasses import dataclass, field
 import json
 import mimetypes
-import os
 from pathlib import Path
 import re
 import threading
@@ -16,7 +15,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from .config import AppConfig
 
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 
 
 @dataclass
@@ -32,9 +31,16 @@ class LongBridgeResult:
 
 @dataclass
 class LongBridgeOutbound:
+    message_id: str
     conversation_id: str
     conversation_title: str
     result: LongBridgeResult
+
+
+@dataclass(frozen=True)
+class LongBridgeDelivery:
+    ok: bool
+    error: str = ""
 
 
 @dataclass
@@ -58,16 +64,46 @@ class LongBridgeClient:
         self._thread: threading.Thread | None = None
         self._pending: dict[str, _PendingTurn] = {}
         self._pending_lock = threading.Lock()
+        self._websocket_send_lock = threading.Lock()
+        self._conversation_lock = threading.Lock()
+        self._conversations: list[dict[str, str]] = []
+        self._conversation_revision = 0
         self._recent_completed: dict[str, float] = {}
         self._last_error = ""
         self._last_connected_at = 0.0
-        self._outbound_handler: Callable[[LongBridgeOutbound], None] | None = None
+        self._outbound_handler: (
+            Callable[[LongBridgeOutbound], LongBridgeDelivery] | None
+        ) = None
 
     def set_outbound_handler(
         self,
-        handler: Callable[[LongBridgeOutbound], None],
+        handler: Callable[[LongBridgeOutbound], LongBridgeDelivery],
     ) -> None:
         self._outbound_handler = handler
+
+    def sync_conversations(self, conversations: list[dict[str, object]]) -> bool:
+        normalized: list[dict[str, str]] = []
+        seen: set[str] = set()
+        for item in conversations:
+            conversation_id = str(item.get("id") or "").strip()
+            title = str(item.get("title") or "").strip()
+            if not conversation_id or not title or conversation_id in seen:
+                continue
+            seen.add(conversation_id)
+            normalized.append(
+                {
+                    "id": conversation_id,
+                    "title": title,
+                    "kind": "group" if item.get("kind") == "group" else "direct",
+                }
+            )
+        normalized.sort(key=lambda item: (item["kind"], item["id"], item["title"]))
+        with self._conversation_lock:
+            if normalized == self._conversations:
+                return False
+            self._conversations = normalized
+            self._conversation_revision += 1
+        return True
 
     def enabled(self) -> bool:
         return bool(
@@ -215,36 +251,40 @@ class LongBridgeClient:
             self._connected.set()
             self._last_connected_at = time.time()
             self._last_error = ""
-            websocket.send(
-                json.dumps(
-                    {
-                        "type": "hello",
-                        "version": PROTOCOL_VERSION,
-                        "account_id": self.cfg.long_bridge_account_id,
-                        "client": "weauto",
-                        "capabilities": {
-                            "chat_types": ["direct", "group"],
-                            "attachments": True,
-                            "typing": False,
-                        },
+            self._send_json(
+                websocket,
+                {
+                    "type": "hello",
+                    "version": PROTOCOL_VERSION,
+                    "account_id": self.cfg.long_bridge_account_id,
+                    "client": "weauto",
+                    "capabilities": {
+                        "chat_types": ["direct", "group"],
+                        "attachments": True,
+                        "typing": False,
+                        "conversation_sync": True,
+                        "delivery_receipts": True,
                     },
-                    ensure_ascii=False,
-                )
+                },
             )
 
             last_heartbeat = time.monotonic()
             sent_request_ids: set[str] = set()
+            sent_conversation_revision = -1
             while not self._stop.is_set():
                 if self._ready.is_set():
+                    sent_conversation_revision = self._send_conversation_sync(
+                        websocket,
+                        sent_conversation_revision,
+                    )
                     self._send_pending(websocket, sent_request_ids)
                 now = time.monotonic()
                 if now - last_heartbeat >= max(
                     5.0, float(self.cfg.long_bridge_heartbeat_sec)
                 ):
-                    websocket.send(
-                        json.dumps(
-                            {"type": "ping", "timestamp_ms": int(time.time() * 1000)}
-                        )
+                    self._send_json(
+                        websocket,
+                        {"type": "ping", "timestamp_ms": int(time.time() * 1000)},
                     )
                     last_heartbeat = now
                 try:
@@ -265,8 +305,40 @@ class LongBridgeClient:
         for pending in pending_turns:
             if pending.request_id in sent_request_ids:
                 continue
-            websocket.send(json.dumps(pending.frame, ensure_ascii=False))
+            self._send_json(websocket, pending.frame)
             sent_request_ids.add(pending.request_id)
+
+    def _send_conversation_sync(
+        self,
+        websocket: Any,
+        sent_revision: int,
+    ) -> int:
+        with self._conversation_lock:
+            revision = self._conversation_revision
+            conversations = [dict(item) for item in self._conversations]
+        if revision == sent_revision:
+            return sent_revision
+        self._send_json(
+            websocket,
+            {
+                "type": "conversation.sync",
+                "version": PROTOCOL_VERSION,
+                "account_id": self.cfg.long_bridge_account_id,
+                "revision": revision,
+                "conversations": conversations,
+            },
+        )
+        print(
+            f"[long-bridge] conversation-sync count={len(conversations)} "
+            f"revision={revision}",
+            flush=True,
+        )
+        return revision
+
+    def _send_json(self, websocket: Any, frame: dict[str, Any]) -> None:
+        payload = json.dumps(frame, ensure_ascii=False)
+        with self._websocket_send_lock:
+            websocket.send(payload)
 
     def _handle_frame(self, websocket: Any, raw: str | bytes) -> None:
         if isinstance(raw, bytes):
@@ -281,10 +353,9 @@ class LongBridgeClient:
             self._ready.set()
             return
         if frame_type == "ping":
-            websocket.send(
-                json.dumps(
-                    {"type": "pong", "timestamp_ms": int(time.time() * 1000)}
-                )
+            self._send_json(
+                websocket,
+                {"type": "pong", "timestamp_ms": int(time.time() * 1000)},
             )
             return
         if frame_type in {"pong", "ack"}:
@@ -303,15 +374,14 @@ class LongBridgeClient:
                     saved_attachments.append(saved)
             message_id = str(data.get("message_id") or "")
             if message_id:
-                websocket.send(
-                    json.dumps(
-                        {
-                            "type": "message.received",
-                            "message_id": message_id,
-                            "request_id": request_id,
-                            "ok": True,
-                        }
-                    )
+                self._send_json(
+                    websocket,
+                    {
+                        "type": "message.received",
+                        "message_id": message_id,
+                        "request_id": request_id,
+                        "ok": True,
+                    },
                 )
             with self._pending_lock:
                 pending = self._pending.get(request_id)
@@ -321,6 +391,7 @@ class LongBridgeClient:
                 pending.attachments.extend(saved_attachments)
             else:
                 self._dispatch_proactive(
+                    websocket,
                     data,
                     LongBridgeResult(
                         replies=[text] if text else [],
@@ -350,15 +421,15 @@ class LongBridgeClient:
 
     def _dispatch_proactive(
         self,
+        websocket: Any,
         data: dict[str, Any],
         result: LongBridgeResult,
     ) -> None:
-        if not self._outbound_handler or not (result.reply or result.attachments):
-            return
         conversation = data.get("conversation")
         if not isinstance(conversation, dict):
             conversation = {}
         outbound = LongBridgeOutbound(
+            message_id=str(data.get("message_id") or "").strip(),
             conversation_id=str(conversation.get("id") or data.get("to") or "").strip(),
             conversation_title=str(
                 conversation.get("title") or data.get("to") or ""
@@ -366,11 +437,49 @@ class LongBridgeClient:
             result=result,
         )
         threading.Thread(
-            target=self._outbound_handler,
-            args=(outbound,),
+            target=self._deliver_proactive,
+            args=(websocket, outbound),
             name="weauto-long-bridge-outbound",
             daemon=True,
         ).start()
+
+    def _deliver_proactive(
+        self,
+        websocket: Any,
+        outbound: LongBridgeOutbound,
+    ) -> None:
+        delivery = LongBridgeDelivery(False, "outbound_handler_unavailable")
+        try:
+            if not (outbound.result.reply or outbound.result.attachments):
+                delivery = LongBridgeDelivery(False, "empty_outbound_message")
+            elif self._outbound_handler is not None:
+                delivery = self._outbound_handler(outbound)
+                if not isinstance(delivery, LongBridgeDelivery):
+                    delivery = LongBridgeDelivery(False, "invalid_outbound_handler_result")
+        except Exception as exc:
+            delivery = LongBridgeDelivery(False, self._compact_error(exc))
+        if not outbound.message_id:
+            return
+        try:
+            self._send_json(
+                websocket,
+                {
+                    "type": "message.delivered",
+                    "message_id": outbound.message_id,
+                    "ok": delivery.ok,
+                    **({"error": delivery.error} if delivery.error else {}),
+                    "conversation": {
+                        "id": outbound.conversation_id,
+                        "title": outbound.conversation_title,
+                    },
+                },
+            )
+        except Exception as exc:
+            print(
+                f"[warn] long bridge delivery receipt failed: "
+                f"{self._compact_error(exc)}",
+                flush=True,
+            )
 
     def _save_attachment(
         self,

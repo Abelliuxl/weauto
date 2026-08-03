@@ -28,8 +28,8 @@ def _maybe_reexec_with_project_venv() -> None:
 
 _maybe_reexec_with_project_venv()
 
-from wechat_rpa.bot import WeChatGuiRpaBot
-from wechat_rpa.config import load_config
+from wechat_rpa.bot import WeChatGuiRpaBot  # noqa: E402
+from wechat_rpa.config import load_config  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:

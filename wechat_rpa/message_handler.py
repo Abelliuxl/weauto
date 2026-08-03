@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 

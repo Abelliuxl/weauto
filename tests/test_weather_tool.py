@@ -1,7 +1,8 @@
-import shutil
-import subprocess
 import tempfile
 from pathlib import Path
+
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from wechat_rpa.config import LlmConfig
 from wechat_rpa.llm import LlmReplyGenerator
@@ -76,15 +77,15 @@ def test_qweather_forecast_endpoint_days():
 
 
 def test_build_qweather_jwt_shape_with_ed25519_key():
-    if not shutil.which("openssl"):
-        return
-
     with tempfile.TemporaryDirectory() as raw_dir:
         key_path = Path(raw_dir) / "ed25519-private.pem"
-        subprocess.run(
-            ["openssl", "genpkey", "-algorithm", "ED25519", "-out", str(key_path)],
-            check=True,
-            capture_output=True,
+        private_key = Ed25519PrivateKey.generate()
+        key_path.write_bytes(
+            private_key.private_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PrivateFormat.PKCS8,
+                encryption_algorithm=serialization.NoEncryption(),
+            )
         )
 
         token = build_qweather_jwt(

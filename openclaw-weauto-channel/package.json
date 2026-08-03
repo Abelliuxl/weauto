@@ -2,6 +2,11 @@
   "name": "@weauto/openclaw-channel",
   "version": "0.1.0",
   "description": "Persistent WebSocket channel bridge between weauto and OpenClaw.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Abelliuxl/weauto.git",
+    "directory": "openclaw-weauto-channel"
+  },
   "type": "module",
   "scripts": {
     "test": "node --test"

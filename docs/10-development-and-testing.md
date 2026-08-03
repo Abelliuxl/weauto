@@ -5,7 +5,7 @@
 推荐：
 
 ```bash
-UV_PROJECT_ENVIRONMENT=.venv312 uv sync --python python3.12
+UV_PROJECT_ENVIRONMENT=.venv312 uv sync --extra dev --python 3.12.13
 source .venv312/bin/activate
 ```
 
@@ -19,10 +19,10 @@ source .venv312/bin/activate
 
 ## 2. 运行测试
 
-`pytest` 当前没有列入运行时依赖。首次运行测试前，需要单独安装到开发环境：
+`pytest` 和 `ruff` 位于 `dev` extra，不会进入日常运行环境。首次运行测试前同步开发依赖：
 
 ```bash
-.venv312/bin/python -m pip install pytest
+UV_PROJECT_ENVIRONMENT=.venv312 uv sync --extra dev --python 3.12.13
 ```
 
 然后运行：
@@ -30,6 +30,14 @@ source .venv312/bin/activate
 ```bash
 .venv312/bin/python -m pytest
 ```
+
+静态检查：
+
+```bash
+.venv312/bin/ruff check .
+```
+
+`archive/` 是只读历史快照，默认不参与 Ruff 检查。
 
 运行单文件：
 

@@ -98,6 +98,12 @@ long_bridge_fail_open = true
 - request ID 关联
 - 文本和 base64 附件
 - 远端主动下行消息
+- detached 会话目录同步（稳定 ID + 精确窗口标题）
+- 主动发送的最终投递回执；窗口未确认时 fail-closed
+
+主动发送分为两级确认：`message.received` 只表示帧已到达 WeAuto，
+`message.delivered` 才表示目标窗口已经确认且 GUI 发送动作已经执行。远端插件必须等待
+后者；写入 OpenClaw session 或获得 message ID 不能视为微信投递成功。
 
 收到的远端附件保存到：
 

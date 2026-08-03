@@ -8,7 +8,13 @@ from types import SimpleNamespace
 
 from wechat_rpa.bot import WeChatGuiRpaBot
 from wechat_rpa.config import load_config
-from wechat_rpa.long_bridge import LongBridgeClient, _PendingTurn
+from wechat_rpa.long_bridge import (
+    LongBridgeClient,
+    LongBridgeDelivery,
+    LongBridgeOutbound,
+    LongBridgeResult,
+    _PendingTurn,
+)
 
 
 def _cfg(tmp_path: Path):
@@ -106,17 +112,14 @@ def test_pending_frames_are_sent_once_per_connection(tmp_path: Path) -> None:
     assert json.loads(socket.sent[0])["event_id"] == "req-1"
 
 
-def test_proactive_message_is_dispatched(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.chdir(tmp_path)
+def test_conversation_sync_is_sent_once_per_revision(tmp_path: Path) -> None:
     client = LongBridgeClient(_cfg(tmp_path))
-    delivered = []
-    delivered_event = threading.Event()
-
-    def handle(outbound) -> None:
-        delivered.append(outbound)
-        delivered_event.set()
-
-    client.set_outbound_handler(handle)
+    assert client.sync_conversations(
+        [
+            {"id": "群魔兽", "title": "群-魔兽", "kind": "group"},
+            {"id": "real刘晓亮", "title": "real刘晓亮", "kind": "direct"},
+        ]
+    )
 
     class Socket:
         def __init__(self) -> None:
@@ -124,6 +127,42 @@ def test_proactive_message_is_dispatched(tmp_path: Path, monkeypatch) -> None:
 
         def send(self, value: str) -> None:
             self.sent.append(value)
+
+    socket = Socket()
+    revision = client._send_conversation_sync(socket, -1)
+    assert client._send_conversation_sync(socket, revision) == revision
+
+    assert len(socket.sent) == 1
+    frame = json.loads(socket.sent[0])
+    assert frame["type"] == "conversation.sync"
+    assert frame["conversations"] == [
+        {"id": "real刘晓亮", "title": "real刘晓亮", "kind": "direct"},
+        {"id": "群魔兽", "title": "群-魔兽", "kind": "group"},
+    ]
+
+
+def test_proactive_message_is_dispatched(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    client = LongBridgeClient(_cfg(tmp_path))
+    delivered = []
+    delivered_event = threading.Event()
+
+    def handle(outbound) -> LongBridgeDelivery:
+        delivered.append(outbound)
+        delivered_event.set()
+        return LongBridgeDelivery(True)
+
+    client.set_outbound_handler(handle)
+
+    class Socket:
+        def __init__(self) -> None:
+            self.sent: list[str] = []
+            self.receipt_event = threading.Event()
+
+        def send(self, value: str) -> None:
+            self.sent.append(value)
+            if json.loads(value).get("type") == "message.delivered":
+                self.receipt_event.set()
 
     socket = Socket()
     client._handle_frame(
@@ -145,7 +184,114 @@ def test_proactive_message_is_dispatched(tmp_path: Path, monkeypatch) -> None:
     assert delivered[0].conversation_id == "chat-1"
     assert delivered[0].conversation_title == "测试会话"
     assert delivered[0].result.reply == "scheduled reply"
-    assert '"type": "message.received"' in socket.sent[0]
+    assert socket.receipt_event.wait(timeout=1.0)
+    frames = [json.loads(value) for value in socket.sent]
+    assert [frame["type"] for frame in frames] == [
+        "message.received",
+        "message.delivered",
+    ]
+    assert frames[1]["ok"] is True
+
+
+def test_proactive_delivery_failure_is_reported(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    client = LongBridgeClient(_cfg(tmp_path))
+    client.set_outbound_handler(
+        lambda _outbound: LongBridgeDelivery(False, "target_window_not_confirmed")
+    )
+
+    class Socket:
+        def __init__(self) -> None:
+            self.sent: list[str] = []
+            self.receipt_event = threading.Event()
+
+        def send(self, value: str) -> None:
+            self.sent.append(value)
+            if json.loads(value).get("type") == "message.delivered":
+                self.receipt_event.set()
+
+    socket = Socket()
+    client._handle_frame(
+        socket,
+        json.dumps(
+            {
+                "type": "message.send",
+                "message_id": "proactive-failed",
+                "conversation": {"id": "群魔兽", "title": "群-魔兽"},
+                "text": "must fail closed",
+            }
+        ),
+    )
+
+    assert socket.receipt_event.wait(timeout=1.0)
+    delivered = [
+        frame
+        for frame in map(json.loads, socket.sent)
+        if frame.get("type") == "message.delivered"
+    ][0]
+    assert delivered["ok"] is False
+    assert delivered["error"] == "target_window_not_confirmed"
+
+
+def test_bot_syncs_stable_ids_to_exact_window_titles() -> None:
+    bot = object.__new__(WeChatGuiRpaBot)
+    bot.cfg = SimpleNamespace(group_title_prefixes=["群"])
+    bot._state_lock = threading.RLock()
+    bot._long_bridge_titles_by_id = {}
+    bot._normalize_session_title_display = lambda title: title.strip()
+    bot._canonical_session_key = (
+        lambda title, _row_idx, remember=False: title.replace("-", "")
+    )
+    synced = []
+    bot.long_bridge_client = SimpleNamespace(
+        sync_conversations=lambda conversations: synced.extend(conversations)
+    )
+
+    bot._sync_long_bridge_conversations(
+        [
+            SimpleNamespace(title="群-魔兽"),
+            SimpleNamespace(title="real刘晓亮"),
+        ]
+    )
+
+    assert bot._long_bridge_titles_by_id == {
+        "群魔兽": "群-魔兽",
+        "real刘晓亮": "real刘晓亮",
+    }
+    assert synced == [
+        {"id": "群魔兽", "title": "群-魔兽", "kind": "group"},
+        {"id": "real刘晓亮", "title": "real刘晓亮", "kind": "direct"},
+    ]
+
+
+def test_bot_proactive_send_uses_synchronized_exact_title() -> None:
+    bot = object.__new__(WeChatGuiRpaBot)
+    bot.cfg = SimpleNamespace(dry_run=False, mention_pause_scan_sec=0.0)
+    bot._state_lock = threading.RLock()
+    bot._send_lock = threading.Lock()
+    bot._long_bridge_titles_by_id = {"群魔兽": "群-魔兽"}
+    bot._pause_visual_scan = lambda _seconds: None
+    bot._strip_markdown_formatting = lambda text: text
+    calls = []
+    bot.sender = SimpleNamespace(
+        paste_and_send_to_window=lambda title, message: calls.append(
+            (title, message)
+        )
+        or True,
+        paste_file_and_send_to_window=lambda _title, _path: True,
+    )
+
+    delivery = bot._handle_long_bridge_outbound(
+        LongBridgeOutbound(
+            message_id="message-1",
+            conversation_id="群魔兽",
+            conversation_title="群魔兽",
+            result=LongBridgeResult(replies=["hello"]),
+        )
+    )
+
+    assert delivery == LongBridgeDelivery(True)
+    assert calls == [("群-魔兽", "hello")]
 
 
 def test_load_config_accepts_long_bridge_mode(tmp_path: Path) -> None:

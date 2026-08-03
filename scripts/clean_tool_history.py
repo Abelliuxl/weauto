@@ -6,7 +6,6 @@ removes all history records where source=="tool", and writes back cleaned files.
 Creates a backup of the original files before modifying.
 """
 import json
-import os
 import shutil
 import sys
 import time

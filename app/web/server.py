@@ -65,7 +65,6 @@ def make_server(
             self.send_header("X-Accel-Buffering", "no")
             self.end_headers()
 
-            client_addr = self.client_address
             stop_flag = threading.Event()
 
             def write(data: bytes) -> None:

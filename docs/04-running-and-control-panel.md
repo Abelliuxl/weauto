@@ -36,6 +36,7 @@ WeAuto.app/
 - Finder 显示 WeAuto 图标
 - launcher 使用项目内 `.venv312/bin/python`
 - 通过相对路径定位仓库，因此 App 本体不能脱离项目
+- launcher 自身与菜单回调异常写入 `logs/app_launcher.log`
 
 如果虚拟环境尚未创建，先运行一次 `./start_app.sh`。
 

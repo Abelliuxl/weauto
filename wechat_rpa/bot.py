@@ -25,6 +25,7 @@ import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
+from typing import TYPE_CHECKING
 
 import numpy as np
 import pyautogui
@@ -48,7 +49,12 @@ from .detached_window_receiver import (
 from .image_editing import ImageEditingError, ImageEditor
 from .image_generation import ImageGenerationError, ImageGenerator
 from .llm import LlmReplyGenerator, prepare_terminal_for_log_line
-from .long_bridge import LongBridgeClient, LongBridgeOutbound, LongBridgeResult
+from .long_bridge import (
+    LongBridgeClient,
+    LongBridgeDelivery,
+    LongBridgeOutbound,
+    LongBridgeResult,
+)
 from .message_handler import MessageHandler
 from .ocr import OcrEngine
 from .people_aliases import PersonAliasResolver
@@ -61,6 +67,10 @@ from .visible_message_parser import (
 )
 from .visible_message_state import VisibleMessageStateStore
 from .window import WindowNotFoundError, get_front_window_bounds, screenshot_region
+
+if TYPE_CHECKING:
+    from .config import RegionRatio
+    from .window import WindowBounds
 
 pyautogui.PAUSE = 0.1
 
@@ -582,6 +592,7 @@ class WeChatGuiRpaBot:
         self._memory_path = Path(self.cfg.memory_store_path)
         self._runtime_state_path = Path("data/runtime_state.json")
         self._session_index: dict[str, dict] = {}
+        self._long_bridge_titles_by_id: dict[str, str] = {}
         self._last_normal_reply_at = 0.0
         self._workspace = None
         self._cycle = 0
@@ -1322,20 +1333,56 @@ class WeChatGuiRpaBot:
                     focused_bounds=focused_bounds,
                 )
 
-    def _handle_long_bridge_outbound(self, outbound: LongBridgeOutbound) -> None:
-        title = outbound.conversation_title.strip()
+    def _sync_long_bridge_conversations(self, windows: list[DetachedWindowInfo]) -> None:
+        conversations: list[dict[str, object]] = []
+        titles_by_id: dict[str, str] = {}
+        for window in windows:
+            title = self._normalize_session_title_display(window.title)
+            conversation_id = self._canonical_session_key(
+                title,
+                0,
+                remember=False,
+            )
+            if not conversation_id or not title:
+                continue
+            is_group = any(
+                str(prefix or "") and title.startswith(str(prefix))
+                for prefix in self.cfg.group_title_prefixes
+            )
+            conversations.append(
+                {
+                    "id": conversation_id,
+                    "title": title,
+                    "kind": "group" if is_group else "direct",
+                }
+            )
+            titles_by_id[conversation_id] = title
+        with self._state_lock:
+            self._long_bridge_titles_by_id = titles_by_id
+        self.long_bridge_client.sync_conversations(conversations)
+
+    def _handle_long_bridge_outbound(
+        self,
+        outbound: LongBridgeOutbound,
+    ) -> LongBridgeDelivery:
+        with self._state_lock:
+            known_title = self._long_bridge_titles_by_id.get(
+                outbound.conversation_id.strip(),
+                "",
+            )
+        title = known_title or outbound.conversation_title.strip()
         if not title:
             print(
                 "[warn] long bridge proactive message has no conversation title; "
                 f"id={outbound.conversation_id!r}"
             )
-            return
+            return LongBridgeDelivery(False, "conversation_title_missing")
         if self.cfg.dry_run:
             if outbound.result.reply:
                 print(f"[dry-run] proactive to={title!r} msg={outbound.result.reply!r}")
             for file_path in outbound.result.attachments:
                 print(f"[dry-run] proactive to={title!r} file={file_path}")
-            return
+            return LongBridgeDelivery(False, "dry_run")
         with self._send_lock:
             self._pause_visual_scan(self.cfg.mention_pause_scan_sec)
             if outbound.result.reply:
@@ -1346,6 +1393,7 @@ class WeChatGuiRpaBot:
                         f"[warn] proactive long bridge send window not confirmed: "
                         f"{title!r}"
                     )
+                    return LongBridgeDelivery(False, "target_window_not_confirmed")
             for file_path in outbound.result.attachments:
                 sent = self.sender.paste_file_and_send_to_window(title, file_path)
                 if not sent:
@@ -1353,6 +1401,11 @@ class WeChatGuiRpaBot:
                         f"[warn] proactive long bridge file send not confirmed: "
                         f"{title!r} {file_path}"
                     )
+                    return LongBridgeDelivery(False, "file_send_not_confirmed")
+        print(
+            f"[delivered] proactive to={title!r} message_id={outbound.message_id!r}"
+        )
+        return LongBridgeDelivery(True)
 
     def close(self) -> None:
         self.long_bridge_client.close()
@@ -1498,9 +1551,6 @@ class WeChatGuiRpaBot:
         dst = self._get_or_create_session(dst_key)
         if dst_title:
             self._remember_session_title(dst_key, dst_title)
-        src_name = self._display_session_name(src_key)
-        dst_name = dst_title or self._display_session_name(dst_key)
-
         dst.short = (dst.short + src.short)[-max(4, self.cfg.memory_short_max_items) :]
         dst.history = self._sort_session_history(dst.history + src.history)
         hist_limit = max(0, int(self.cfg.memory_history_max_items))
@@ -6117,6 +6167,7 @@ class WeChatGuiRpaBot:
                 self._pause_visual_scan(self.cfg.mention_pause_scan_sec)
             if not raised:
                 print(f"[warn] detached send window raise not confirmed: {row.title!r}")
+                return ""
             msg_w = max(24, self._term_width() - 12)
             print(f"[sent] to={self._fit_col(row.title, 14)} msg={self._fit_col(send_text, msg_w)}")
             return message
@@ -7193,7 +7244,11 @@ class WeChatGuiRpaBot:
             else screen_capture_access_granted()
         )
         print("[start] WeChat detached-window receiver started")
-        print(f"[start] receiver=detached_windows poll={self.cfg.poll_interval_sec:.1f}s dry_run={self.cfg.dry_run}")
+        print(
+            f"[start] receiver=detached_windows poll={self.cfg.poll_interval_sec:.1f}s "
+            f"normal_reply={self.cfg.normal_reply_interval_sec:.1f}s "
+            f"dry_run={self.cfg.dry_run}"
+        )
         print(f"[start] capture-backend={self.cfg.detached_window_capture_backend}")
         if self.ocr_worker_enabled:
             print(
@@ -7219,7 +7274,7 @@ class WeChatGuiRpaBot:
         print(f"[start] image-dir={image_root}")
         print(f"[start] image-gen: {self._image_generation_status_text()}")
         print(f"[start] image-edit: {self._image_editing_status_text()}")
-        print(f"[start] memory-sqlite: disabled (archived)")
+        print("[start] memory-sqlite: disabled (archived)")
         self._resize_detached_windows_on_start()
         empty_window_diagnostic_logged = False
         while True:
@@ -7232,6 +7287,8 @@ class WeChatGuiRpaBot:
                 time.sleep(0.2)
                 continue
             windows = self._detached_windows()
+            if windows:
+                self._sync_long_bridge_conversations(windows)
             if windows:
                 empty_window_diagnostic_logged = False
             elif not empty_window_diagnostic_logged:
@@ -7912,7 +7969,7 @@ class WeChatGuiRpaBot:
                 self._recover_countdown(countdown_sec)
 
                 try:
-                    result = self._recover_capture_page(
+                    self._recover_capture_page(
                         page=page,
                         mode_tag="recover",
                         forced_is_group=forced_is_group,
@@ -8046,8 +8103,8 @@ class WeChatGuiRpaBot:
         print(f"[start] web-search: {self._web_search_status_text()}")
         print(f"[start] image-gen: {self._image_generation_status_text()}")
         print(f"[start] image-edit: {self._image_editing_status_text()}")
-        print(f"[start] memory-sqlite: disabled (archived)")
-        print(f"[start] rerank: disabled (archived)")
+        print("[start] memory-sqlite: disabled (archived)")
+        print("[start] rerank: disabled (archived)")
         print(f"        admin={self._fit_col(admin_titles, admin_w)}")
         while True:
             self._cycle += 1

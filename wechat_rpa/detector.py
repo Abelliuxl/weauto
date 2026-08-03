@@ -5,6 +5,7 @@ import hashlib
 import json
 from pathlib import Path
 import re
+from typing import TYPE_CHECKING
 
 import cv2
 import numpy as np
@@ -12,6 +13,9 @@ import numpy as np
 from .config import AppConfig
 from .ocr import OcrLine, OcrEngine
 from .window import WindowBounds
+
+if TYPE_CHECKING:
+    from .config import RegionRatio
 
 _TIME_RE = re.compile(r"^\d{1,2}:\d{2}$")
 _UNREAD_NUM_RE = re.compile(r"^\d{1,3}$")

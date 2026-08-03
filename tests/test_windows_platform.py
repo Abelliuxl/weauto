@@ -64,6 +64,48 @@ def test_windows_send_does_not_fall_through_to_wrong_chat(monkeypatch):
     assert sender.paste_and_send_to_window("missing", "hello") is False
 
 
+def test_macos_send_does_not_fall_through_to_wrong_chat(monkeypatch):
+    monkeypatch.setattr(sender_module, "IS_WINDOWS", False)
+    sender = WeChatGuiSender(SimpleNamespace())
+    monkeypatch.setattr(sender, "activate_chat_window", lambda _title: False)
+    monkeypatch.setattr(
+        sender,
+        "paste_and_send",
+        lambda _message: pytest.fail("must not send when the target window is missing"),
+    )
+
+    assert sender.paste_and_send_to_window("missing", "hello") is False
+
+
+def test_macos_file_send_does_not_fall_through_to_wrong_chat(monkeypatch, tmp_path):
+    monkeypatch.setattr(sender_module, "IS_WINDOWS", False)
+    sender = WeChatGuiSender(SimpleNamespace())
+    monkeypatch.setattr(sender, "activate_chat_window", lambda _title: False)
+    monkeypatch.setattr(
+        sender,
+        "paste_file_and_send",
+        lambda _path: pytest.fail("must not send when the target window is missing"),
+    )
+
+    assert sender.paste_file_and_send_to_window("missing", tmp_path / "file.txt") is False
+
+
+def test_macos_mention_does_not_fall_through_to_wrong_chat(monkeypatch):
+    monkeypatch.setattr(sender_module, "IS_WINDOWS", False)
+    sender = WeChatGuiSender(SimpleNamespace())
+    monkeypatch.setattr(sender, "click_chat_input_for_window", lambda _title: False)
+    monkeypatch.setattr(sender, "activate_chat_window", lambda _title: False)
+    monkeypatch.setattr(
+        sender,
+        "mention_and_send",
+        lambda _mention, _message: pytest.fail(
+            "must not send when the target window is missing"
+        ),
+    )
+
+    assert sender.mention_and_send_to_window("missing", "person", "hello") is False
+
+
 def test_windows_send_activates_without_clicking_input(monkeypatch):
     monkeypatch.setattr(sender_module, "IS_WINDOWS", True)
     events = []
